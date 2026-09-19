@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import os
 import weakref
 from collections.abc import Iterable, Sequence
 from typing import Any
@@ -16,6 +17,8 @@ import vllm.envs as envs
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import VllmConfig, replace, set_current_vllm_config
 from vllm.distributed import get_pp_group
+from vllm.distributed.communication_op import tensor_model_parallel_all_gather
+from vllm.logger import init_logger
 from vllm.model_executor.layers.linear import ReplicatedLinear
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.vocab_parallel_embedding import (
@@ -45,6 +48,8 @@ from vllm.utils.b12x import (
     get_b12x_mtp_feedback,
     register_b12x_layer,
 )
+
+logger = init_logger(__name__)
 from vllm.utils.torch_utils import (
     LayerNameType,
     _encode_layer_name,
@@ -733,6 +738,77 @@ class Qwen3_8FlashNextMTP(
             prefix=maybe_prefix(prefix, "mtp"),
         )
 
+        # --- reduced-vocab MTP draft head (lever 1, kernel-sweep-2026-09-18 §4) ---
+        # Dormant-but-inherited LocalArgmaxMixin.get_top_tokens() only saves
+        # cross-rank communication (O(vocab)->O(2*tp_size)) unless the draft
+        # head itself is shrunk and a draft_id_to_target_id table is
+        # registered; that also saves the lm_head weight-read bandwidth
+        # (1.18 GiB/rank at full vocab). Guarded hard: a reduced head with
+        # use_local_argmax_reduction left off would make the compute_logits()
+        # argmax fallback (speculator.py _greedy_sample_draft) return
+        # draft-space ids as target ids -- silent corruption -- so we refuse
+        # to boot rather than allow that combination.
+        draft_vocab_path = os.environ.get("VLLM_QWEN_MTP_DRAFT_VOCAB_PATH")
+        use_local_argmax_reduction = bool(
+            getattr(
+                vllm_config.speculative_config, "use_local_argmax_reduction", False
+            )
+        )
+        if draft_vocab_path and not use_local_argmax_reduction:
+            raise ValueError(
+                "VLLM_QWEN_MTP_DRAFT_VOCAB_PATH is set but --speculative-config "
+                "use_local_argmax_reduction is not true; a reduced-vocab draft "
+                "head is meaningless without local-argmax reduction (see "
+                "vllm/v1/worker/gpu/spec_decode/speculator.py "
+                "_greedy_sample_draft)."
+            )
+        self.draft_vocab_size = config.vocab_size
+        if draft_vocab_path:
+            if config.tie_word_embeddings:
+                raise NotImplementedError(
+                    "Reduced-vocab MTP draft head requires untied word "
+                    "embeddings (same restriction as the NVFP4 draft head)."
+                )
+            target_ids = torch.load(
+                draft_vocab_path, map_location="cpu", weights_only=True
+            )
+            target_ids = target_ids.to(torch.int64)
+            # boot5 fix: torch.load(map_location="cpu") leaves this on CPU
+            # permanently -- register_buffer() takes the device of the
+            # tensor handed to it, it does NOT move to the module's ambient
+            # device context. Move to this rank's real device (self.model's
+            # params are already placed by the surrounding `with
+            # target_device:` context in base_loader.py's initialize_model)
+            # before building the buffer.
+            _model_device = next(self.model.parameters()).device
+            target_ids = target_ids.to(_model_device)
+            self.draft_vocab_size = target_ids.numel()
+            self._draft_target_ids = target_ids
+            self.register_buffer(
+                "draft_id_to_target_id",
+                target_ids
+                - torch.arange(
+                    self.draft_vocab_size, dtype=torch.int64, device=target_ids.device
+                ),
+                persistent=False,
+            )
+            logger.info(
+                "Qwen3.8-Flash-Next MTP: reduced-vocab draft head enabled, "
+                "%d/%d vocab ids loaded from %s",
+                self.draft_vocab_size,
+                config.vocab_size,
+                draft_vocab_path,
+            )
+            # The reduced-vocab draft head fully replaces the primary
+            # lm_head on the decode hot path (get_top_tokens routes through
+            # draft_lm_head). Keeping the primary head quantized (e.g.
+            # NVFP4) breaks _populate_draft_lm_head: a quantized linear
+            # method packs multiple values per byte along the hidden dim,
+            # so its weight tensor's physical shape/dtype does not match
+            # the unquantized draft_lm_head. Force it off so both heads are
+            # plain bf16 with matching hidden dims.
+            self.has_own_lm_head = False
+
         if get_pp_group().is_last_rank:
             self.lm_head = ParallelLMHead(
                 config.vocab_size,
@@ -744,6 +820,20 @@ class Qwen3_8FlashNextMTP(
             self.has_own_lm_head = self.lm_head.runtime_lm_head_quantization == "nvfp4"
             if config.tie_word_embeddings:
                 self.lm_head = self.lm_head.tie_weights(self.model.embed_tokens)
+            # Separate reduced-vocab draft head (lever 1). Left at random init
+            # here -- the standard checkpoint loader never sees a
+            # 'draft_lm_head.weight' entry, so b12x's checkpoint router (which
+            # rejects any shape mismatch between a checkpoint tensor and its
+            # declared param -- the crash a resized *primary* lm_head hit) never
+            # touches it. load_weights() below populates it by index_select from
+            # the fully-loaded primary lm_head once weights are in.
+            if getattr(self, "_draft_target_ids", None) is not None:
+                self.draft_lm_head = ParallelLMHead(
+                    self.draft_vocab_size,
+                    config.hidden_size,
+                    quant_config=self.quant_config,
+                    prefix=maybe_prefix(prefix, "draft_lm_head"),
+                )
         else:
             self.lm_head = PPMissingLayer()
 
@@ -755,6 +845,20 @@ class Qwen3_8FlashNextMTP(
             self.model.make_empty_intermediate_tensors
         )
         self.set_moe_parameters(self.model.layers)
+
+    def get_top_tokens(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """Draft-vocab-aware override: route through draft_lm_head (populated
+        post-load in load_weights) instead of the full-vocab primary lm_head,
+        so the D2T remap math (k + draft_id_to_target_id[k]) in
+        LocalArgmaxMixin.get_top_tokens matches a draft_vocab_size-wide k."""
+        draft_head = getattr(self, "draft_lm_head", None)
+        if draft_head is None:
+            return super().get_top_tokens(hidden_states)
+        top = self.logits_processor.get_top_tokens(draft_head, hidden_states)
+        d2t = getattr(self, "draft_id_to_target_id", None)
+        if d2t is not None:
+            top = top + d2t[top]
+        return top
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.model.embed_input_ids(input_ids)
@@ -792,10 +896,20 @@ class Qwen3_8FlashNextMTP(
             for name, weight in weights:
                 remapped_name = _remap_mtp_weight_name(name)
                 if remapped_name is not None:
-                    yield (
-                        _remap_qsa_cache_scale_name(remapped_name, qsa_layer_ids),
-                        weight,
+                    remapped_name = _remap_qsa_cache_scale_name(
+                        remapped_name, qsa_layer_ids
                     )
+                    # Primary lm_head loads full-vocab, unmodified: b12x's
+                    # checkpoint router rejects any shape mismatch between a
+                    # checkpoint tensor and its declared param (that is what
+                    # made a *resized* primary lm_head crash with
+                    # 'checkpoint routing performed an unsupported data
+                    # transformation'). The reduced-vocab draft head is a
+                    # separate module (draft_lm_head, see __init__) that never
+                    # appears in this checkpoint stream at all, so b12x's
+                    # router never touches it; it is populated below, after
+                    # the primary lm_head is fully loaded.
+                    yield (remapped_name, weight)
 
         loader = AutoWeightsLoader(
             self,
@@ -803,7 +917,35 @@ class Qwen3_8FlashNextMTP(
                 _QWEN38_FLASH_NEXT_IGNORED_MISSING_SUFFIXES.copy()
             ),
         )
-        return loader.load_weights(remap_weight_names())
+        loaded = loader.load_weights(remap_weight_names())
+        self._populate_draft_lm_head()
+        return loaded
+
+    def _populate_draft_lm_head(self) -> None:
+        """Fill draft_lm_head.weight by selecting draft-vocab rows out of the
+        now-fully-loaded primary lm_head, then re-sharding for this rank's TP
+        slice of the (smaller) draft vocab. One-time cost at load, not on the
+        decode path."""
+        target_ids = getattr(self, "_draft_target_ids", None)
+        draft_head = getattr(self, "draft_lm_head", None)
+        if target_ids is None or draft_head is None:
+            return
+        full_weight = self.lm_head.weight.data
+        if self.lm_head.tp_size > 1:
+            full_weight = tensor_model_parallel_all_gather(full_weight, dim=0)
+        full_weight = full_weight[: self.config.vocab_size]
+        target_ids = target_ids.to(full_weight.device)
+        draft_rows = full_weight.index_select(0, target_ids)
+        start = draft_head.shard_indices.org_vocab_start_index
+        end = start + draft_head.weight.data.shape[0]
+        end = min(end, draft_rows.shape[0])
+        draft_head.weight.data[: end - start].copy_(
+            draft_rows[start:end].to(draft_head.weight.dtype)
+        )
+        logger.info(
+            "Qwen3.8-Flash-Next MTP: draft_lm_head populated, rows [%d:%d) of %d",
+            start, end, draft_rows.shape[0],
+        )
 
 
 __all__ = ["Qwen3_8FlashNextMTP", "Qwen3_8FlashNextMultiTokenPredictor"]
