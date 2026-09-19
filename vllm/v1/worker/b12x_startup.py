@@ -10,13 +10,51 @@ local work or enter model collectives.
 
 from __future__ import annotations
 
+import logging as _logging
 import os
 import pickle
 import time
 from contextlib import nullcontext
+from datetime import timedelta as _timedelta
 
 
 _CONTROL_GROUPS: dict[tuple[int, int], object] = {}
+
+# --- b12x-startup-boundedwait: fail-fast instead of silent-forever ---------
+# The round rendezvous below (`_exchange`) reads Store keys with plain
+# `.get()`, which blocks with no bound if the peer rank never publishes its
+# key -- observed as a 20+ minute silent hang with both ranks parked at
+# poll_schedule_timeout (results/kernel-pass/prep-deadlock/mechanism.md).
+# This does not change the protocol, payload, or decision format: it only
+# bounds each wait to 120s and retries (logging each timeout) instead of
+# blocking forever, so a genuine stall becomes visible progress in the log
+# instead of silence, and any transient slowness still resolves exactly as
+# before once the peer catches up.
+_trace_log = _logging.getLogger("b12x_startup_trace")
+if not _trace_log.handlers:
+    _trace_handler = _logging.StreamHandler()
+    _trace_handler.setFormatter(_logging.Formatter("%(asctime)s [b12x-trace] %(message)s"))
+    _trace_log.addHandler(_trace_handler)
+    _trace_log.setLevel(_logging.INFO)
+    _trace_log.propagate = False
+
+
+def _bounded_get(store, key: str, *, rank: int, round_num: int, timeout_s: int = 120):
+    """Like store.get(key), but never blocks silently forever."""
+    while True:
+        started = time.monotonic()
+        try:
+            store.wait([key], _timedelta(seconds=timeout_s))
+            elapsed = time.monotonic() - started
+            _trace_log.info(
+                "GOT rank=%s round=%s key=%s waited=%.1fs", rank, round_num, key, elapsed
+            )
+            return store.get(key)
+        except Exception:
+            _trace_log.info(
+                "WAIT round=%s key=%s rank=%s %ss", round_num, key, rank, timeout_s
+            )
+            continue
 
 
 def _scoped_key(key: str, ranks: tuple[int, ...]) -> str:
@@ -191,7 +229,12 @@ class B12xPreparationCoordinator:
         self._control.set(f"{prefix}/{self.global_rank}", pickle.dumps(payload))
         if self.global_rank == self.world_ranks[0]:
             gathered = [
-                pickle.loads(self._control.get(f"{prefix}/{rank}"))
+                pickle.loads(
+                    _bounded_get(
+                        self._control, f"{prefix}/{rank}",
+                        rank=self.global_rank, round_num=self._round,
+                    )
+                )
                 for rank in self.world_ranks
             ]
             try:
@@ -200,7 +243,12 @@ class B12xPreparationCoordinator:
                 self._record_error(error)
                 decision = dict(stop=True, error=self._error, collective=None, tuning=(), done=False)
             self._control.set(f"{prefix}/decision", pickle.dumps(decision))
-        return pickle.loads(self._control.get(f"{prefix}/decision"))
+        return pickle.loads(
+            _bounded_get(
+                self._control, f"{prefix}/decision",
+                rank=self.global_rank, round_num=self._round,
+            )
+        )
 
     def _decision(self, gathered):
         self._validate_domain(gathered)
