@@ -114,6 +114,22 @@ class ParserManager:
             HarmonyParser.tool_parser_cls = tool_parser_cls
             return HarmonyParser
 
+        reasoning_engine_cls = cls._get_parser_engine_cls(reasoning_parser_cls)
+        tool_engine_cls = cls._get_parser_engine_cls(tool_parser_cls)
+        if reasoning_engine_cls is not None and reasoning_engine_cls is tool_engine_cls:
+            # tc45-structag-fix: the collapsed engine class's tool_parser_cls
+            # was set once at import time by make_adapters() to the generic
+            # ParserEngineToolAdapter subclass, which does not carry
+            # structural_tag_model. Re-point it to the actually-resolved
+            # tool_parser_cls (e.g. Qwen3EngineToolParser) so
+            # ParserEngine.adjust_request() can build a tool_choice=required
+            # xgrammar structural tag.
+            if tool_parser_cls is not None:
+                reasoning_engine_cls.tool_parser_cls = tool_parser_cls
+            if reasoning_parser_cls is not None:
+                reasoning_engine_cls.reasoning_parser_cls = reasoning_parser_cls
+            return reasoning_engine_cls
+
         if reasoning_parser_name == "kimi_k3" or tool_parser_name == "kimi_k3":
             from vllm.parser.kimi_k3 import KimiK3Parser
 
