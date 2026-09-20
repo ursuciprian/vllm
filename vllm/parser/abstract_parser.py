@@ -375,25 +375,41 @@ class Parser:
 def needs_structural_tag(
     request: ChatCompletionRequest | ResponsesRequest,
 ) -> bool:
-    """Whether the request must be grammar-constrained into a tool call.
+    """Whether a structural tag could constrain this request at all.
 
-    Only ``required`` and named tool choices force one. ``auto`` leaves the
-    model free to answer in prose, so a structural tag changes nothing it is
-    allowed to emit -- but it does put the request on the engine's
-    structured-output path for its whole lifetime: a per-step grammar bitmask
-    fill, H2D copy and mask kernel
+    A cheap pre-filter in front of :func:`attach_structural_tag`, matching
+    what :func:`~vllm.tool_parsers.structural_tag_registry
+    .get_model_structural_tag` would decide anyway -- ``required`` and named
+    choices get a grammar, and ``auto`` gets one only when a tool opts into
+    strict schema enforcement. Answering that here means an ordinary agentic
+    request (tools + ``auto``, nothing strict) never constructs a tool parser
+    just to be handed ``None`` back; a tool parser is a
+    ``ParserEngineToolAdapter``, so building one builds a second parser
+    engine, tokenizer vocab included, on every request.
+
+    A grammar is not free once attached, either: the request is a
+    structured-output request for its whole lifetime, and the engine then
+    pays, every step, a grammar bitmask fill, H2D copy and mask kernel
     (:mod:`vllm.v1.worker.gpu.structured_outputs`), deferred sampling in
     :meth:`EngineCore.step_with_batch_queue` (which drops async-scheduling
-    overlap for the *whole* batch, not just this request), and grammar
-    rejection of speculative draft tokens. Keep the grammar for the case that
-    actually needs it.
+    overlap for the *whole* batch, not just this request), the draft-token
+    D2H copy async scheduling otherwise skips, and grammar rejection of
+    speculative draft tokens.
     """
-    if not getattr(request, "tools", None):
+    tools = getattr(request, "tools", None)
+    if not tools:
         return False
     tool_choice = getattr(request, "tool_choice", None)
-    return tool_choice == "required" or isinstance(
+    if tool_choice == "required" or isinstance(
         tool_choice, ChatCompletionNamedToolChoiceParam | ToolChoiceFunction
-    )
+    ):
+        return True
+    if tool_choice != "auto":
+        return False
+    # Imported here so the common paths above never touch the registry.
+    from vllm.tool_parsers.structural_tag_registry import _any_tool_strict
+
+    return _any_tool_strict(tools)
 
 
 def attach_structural_tag(
