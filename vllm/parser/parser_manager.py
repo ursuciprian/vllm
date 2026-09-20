@@ -20,6 +20,27 @@ class ParserManager:
     Provides a unified Parser by composing reasoning and tool parser adapters.
     """
 
+    @staticmethod
+    def _get_parser_engine_cls(parser_cls):
+        # Restored from vllm.git 8e1f1e58 (upstream 1a20d23dab) -- dropped
+        # somewhere in KK's integration history despite the adapters
+        # machinery it reads still being present. Without it,
+        # get_parser() below raises AttributeError for every model that
+        # sets both a reasoning and a tool parser.
+        if parser_cls is None:
+            return None
+        parser_engine_cls = getattr(parser_cls, "_parser_engine_cls", None)
+        if parser_engine_cls is None:
+            return None
+
+        from vllm.parser.engine.parser_engine import ParserEngine
+
+        if not isinstance(parser_engine_cls, type) or not issubclass(
+            parser_engine_cls, ParserEngine
+        ):
+            return None
+        return parser_engine_cls
+
     @classmethod
     def get_tool_parser(
         cls,
@@ -117,18 +138,24 @@ class ParserManager:
         reasoning_engine_cls = cls._get_parser_engine_cls(reasoning_parser_cls)
         tool_engine_cls = cls._get_parser_engine_cls(tool_parser_cls)
         if reasoning_engine_cls is not None and reasoning_engine_cls is tool_engine_cls:
-            # tc45-structag-fix: the collapsed engine class's tool_parser_cls
-            # was set once at import time by make_adapters() to the generic
+            # tc45-cheap: the collapsed engine class's tool_parser_cls was set
+            # once at import time by make_adapters() to the generic
             # ParserEngineToolAdapter subclass, which does not carry
-            # structural_tag_model. Re-point it to the actually-resolved
-            # tool_parser_cls (e.g. Qwen3EngineToolParser) so
-            # ParserEngine.adjust_request() can build a tool_choice=required
-            # xgrammar structural tag.
+            # structural_tag_model. Point a per-call SUBCLASS at the
+            # actually-resolved classes instead of mutating
+            # reasoning_engine_cls in place -- that class is process-wide
+            # state every other model backed by the same shared engine would
+            # inherit.
+            class _CollapsedParserEngine(reasoning_engine_cls):  # type: ignore[misc,valid-type]
+                pass
+
+            _CollapsedParserEngine.__name__ = reasoning_engine_cls.__name__
+            _CollapsedParserEngine.__qualname__ = reasoning_engine_cls.__qualname__
             if tool_parser_cls is not None:
-                reasoning_engine_cls.tool_parser_cls = tool_parser_cls
+                _CollapsedParserEngine.tool_parser_cls = tool_parser_cls
             if reasoning_parser_cls is not None:
-                reasoning_engine_cls.reasoning_parser_cls = reasoning_parser_cls
-            return reasoning_engine_cls
+                _CollapsedParserEngine.reasoning_parser_cls = reasoning_parser_cls
+            return _CollapsedParserEngine
 
         if reasoning_parser_name == "kimi_k3" or tool_parser_name == "kimi_k3":
             from vllm.parser.kimi_k3 import KimiK3Parser
