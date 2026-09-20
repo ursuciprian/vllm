@@ -23,8 +23,12 @@ from vllm.entrypoints.openai.engine.protocol import (
     ToolCall,
 )
 from vllm.logger import init_logger
-from vllm.parser.abstract_parser import Parser, StreamState
-from vllm.sampling_params import StructuredOutputsParams
+from vllm.parser.abstract_parser import (
+    Parser,
+    StreamState,
+    attach_structural_tag,
+    needs_structural_tag,
+)
 from vllm.parser.engine.events import EventType, SemanticEvent
 from vllm.parser.engine.parser_engine_config import ParserEngineConfig, ParserState
 from vllm.parser.engine.streaming_parser_engine import StreamingParserEngine
@@ -206,54 +210,26 @@ class ParserEngine(Parser):
         self, request: ChatCompletionRequest | ResponsesRequest
     ) -> ChatCompletionRequest | ResponsesRequest:
         request.skip_special_tokens = False
-        self._apply_structural_tag(request)
-        return request
-
-    def _apply_structural_tag(
-        self, request: ChatCompletionRequest | ResponsesRequest
-    ) -> None:
-        # tc45-structag-fix: mirrors DelegatingParser._apply_structural_tag(),
-        # which this engine-based (collapsed) Parser path never inherited
-        # (ParserEngine.__init__ always sets self._tool_parser = None).
+        # This engine-based ("collapsed") Parser path never inherited
+        # DelegatingParser's structural-tag step, because ParserEngine.__init__
+        # always leaves self._tool_parser None -- so tool_choice=required was a
+        # silent no-op for every model that collapses onto a shared
+        # ParserEngine. Build the tool parser only when a request actually
+        # forces a call: instantiating it constructs a second parser engine,
+        # and the grammar itself is not free at decode time
+        # (see needs_structural_tag).
         tool_parser_cls = type(self).tool_parser_cls
-        if tool_parser_cls is None or getattr(
-            tool_parser_cls, "structural_tag_model", None
-        ) is None:
-            return
-        tools = getattr(request, "tools", None) or self._tools
-        if not tools:
-            return
-        from vllm.entrypoints.openai.chat_completion.protocol import (
-            ChatCompletionNamedToolChoiceParam,
-        )
-        from openai.types.responses import ToolChoiceFunction
-
-        tool_choice = getattr(request, "tool_choice", None)
-        need_tool_calling = (
-            tool_choice == "auto"
-            or tool_choice == "required"
-            or isinstance(
-                tool_choice,
-                (ChatCompletionNamedToolChoiceParam, ToolChoiceFunction),
+        if (
+            tool_parser_cls is not None
+            and getattr(tool_parser_cls, "structural_tag_model", None) is not None
+            and needs_structural_tag(request)
+        ):
+            attach_structural_tag(
+                request,
+                tool_parser_cls(self.model_tokenizer, request.tools),
+                reasoning=self._has_reasoning,
             )
-        )
-        if not need_tool_calling:
-            return
-        if getattr(request, "structured_outputs", None) is not None and getattr(
-            request.structured_outputs, "structural_tag", None
-        ) is not None:
-            return
-        tool_parser = tool_parser_cls(self.model_tokenizer, tools)
-        structure_tag = tool_parser.get_structural_tag(
-            request, reasoning=self._has_reasoning
-        )
-        if structure_tag is None:
-            return
-        request.structured_outputs = StructuredOutputsParams(
-            structural_tag=json.dumps(structure_tag.model_dump())
-        )
-        if hasattr(request, "response_format"):
-            request.response_format = None
+        return request
 
     def _preprocess_feed(
         self,
