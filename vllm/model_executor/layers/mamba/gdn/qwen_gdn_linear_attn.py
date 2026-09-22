@@ -81,6 +81,7 @@ from vllm.utils.torch_utils import (
     direct_register_custom_op,
 )
 from vllm.v1.attention.backends.gdn_attn import GDNAttentionMetadata
+from vllm.v1.worker import gdn_deferred_commit
 from vllm.v1.worker.workspace import (
     retain_cuda_graph_capture_resource,
     use_preallocated_workspace,
@@ -832,11 +833,28 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         self._b12x_state_index_columns = state_index_columns
         self._b12x_local_key_heads = local_key_heads
         self._b12x_local_value_heads = local_value_heads
+        # Raises when the env var asks for something this configuration cannot
+        # do, rather than silently running the shipped checkpoint path.
+        self._b12x_gdn_deferred_checkpoints = gdn_deferred_commit.resolve(
+            vllm_config
+        )
         # Caps are immutable declaration metadata.  Inspect geometry directly
         # instead of constructing an executable declaration.
         caps = self._make_b12x_gdn_caps(max_state_slots=1)
         self._b12x_packed_qkv_width = caps.packed_qkv_width
         self._b12x_decode_staging = None
+
+    # Read by vllm.v1.worker.gdn_deferred_commit through the forward context,
+    # so it must exist on every GDN layer, not only the b12x ones.
+    _b12x_gdn_deferred_checkpoints: bool = False
+
+    @property
+    def b12x_gdn_deferred_checkpoints(self) -> bool:
+        return bool(self._b12x_gdn_deferred_checkpoints)
+
+    @property
+    def b12x_gdn_state_index_columns(self) -> int:
+        return int(self._b12x_state_index_columns)
 
     def _make_b12x_gdn_caps(self, max_state_slots: int):
         api = self._b12x_gdn_api
@@ -856,6 +874,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             state_dtype=self.get_state_dtype()[1],
             gate_activation=self.norm.activation,
             qk_l2norm=True,
+            deferred_checkpoints=self._b12x_gdn_deferred_checkpoints,
         )
 
     def _make_b12x_gdn_plan(self, max_state_slots: int):
@@ -1227,6 +1246,12 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         b: torch.Tensor | None = None,
         z: torch.Tensor | None = None,
         output: torch.Tensor | None = None,
+        # Metadata overrides. The deferred-checkpoint commit runs outside the
+        # forward pass, where the staged metadata still describes the previous
+        # step, so it supplies its own window instead.
+        state_indices: torch.Tensor | None = None,
+        num_accepted_tokens: torch.Tensor | None = None,
+        num_seqs: torch.Tensor | None = None,
     ):
         plan = self._b12x_decode_plan
         staging = self._b12x_decode_staging
@@ -1246,12 +1271,58 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             norm_weight=self.norm.weight,
             recurrent_state=self.kv_cache[1],
             query_start_loc=staging.query_start_loc,
-            num_accepted_tokens=staging.num_accepted_tokens,
-            state_indices=staging.state_indices,
-            num_seqs=staging.num_seqs,
+            num_accepted_tokens=(
+                staging.num_accepted_tokens
+                if num_accepted_tokens is None
+                else num_accepted_tokens
+            ),
+            state_indices=(
+                staging.state_indices if state_indices is None else state_indices
+            ),
+            num_seqs=staging.num_seqs if num_seqs is None else num_seqs,
             num_tokens=staging.num_tokens,
             output=staging.output if output is None else output,
         )
+
+    def commit_b12x_gdn_deferred(
+        self,
+        *,
+        state_indices: torch.Tensor,
+        num_accepted_tokens: torch.Tensor,
+        num_seqs: torch.Tensor,
+        destination_indices: torch.Tensor,
+    ) -> None:
+        """Materialize this layer's accepted-prefix state in place.
+
+        ``state_indices[r, 0]`` is the base checkpoint and ``[r, 1:]`` are that
+        step's record blocks; the destination is column 0 again, so the commit
+        is in place and the caller's block copy then moves it with a zero
+        temporal bias.
+        """
+        if not self._b12x_gdn_deferred_checkpoints:
+            return
+        self._b12x_gdn_api.commit_deferred_checkpoints(
+            self._bind_b12x_gdn_decode(
+                state_indices=state_indices,
+                num_accepted_tokens=num_accepted_tokens,
+                num_seqs=num_seqs,
+            ),
+            destination_indices,
+        )
+
+    def precompile_b12x_gdn_deferred_commit(self) -> None:
+        """Best-effort warm-up; the commit compiles lazily on first use."""
+        if not self._b12x_gdn_deferred_checkpoints:
+            return
+        try:
+            self._b12x_gdn_api.precompile_deferred_commit(
+                self._bind_b12x_gdn_decode()
+            )
+        except PreparationResourceUnavailableError:
+            logger.debug(
+                "b12x GDN deferred commit not precompiled yet; it will "
+                "compile on first use."
+            )
 
     def unbind_kv_cache(self) -> None:
         self._b12x_decode_plan = None
