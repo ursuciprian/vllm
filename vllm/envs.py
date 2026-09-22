@@ -129,6 +129,7 @@ if TYPE_CHECKING:
     VLLM_USE_HW_AGNOSTIC: bool = False
     VLLM_ENABLE_FLA_PACKED_RECURRENT_DECODE: bool = True
     VLLM_GDN_DECODE_KERNEL: Literal["b12x", "cuda", "triton"] = "cuda"
+    VLLM_GDN_DEFERRED_CHECKPOINTS: bool = False
     VLLM_DISABLE_PYNCCL: bool = False
     VLLM_USE_OINK_OPS: bool = False
     VLLM_MXFP8_EMULATION_DEQUANT_AT_LOAD: bool = True
@@ -1247,6 +1248,16 @@ environment_variables: dict[str, Callable[[], Any]] = {
         "cuda",
         ["b12x", "cuda", "triton"],
         case_sensitive=False,
+    ),
+    # Trade the b12x GDN decode kernel's per-verified-token state checkpoints
+    # for one base checkpoint plus compact per-token records, replaying the
+    # accepted prefix instead of selecting a checkpoint column. Requires the
+    # b12x branch that implements Caps(deferred_checkpoints=...), the b12x GDN
+    # decode kernel, align mamba cache mode, and no request-boundary
+    # checkpoints. Off by default.
+    "VLLM_GDN_DEFERRED_CHECKPOINTS": lambda: (
+        os.getenv("VLLM_GDN_DEFERRED_CHECKPOINTS", "0").lower()
+        in ("true", "1", "yes", "on")
     ),
     # Disable pynccl (using torch.distributed instead)
     "VLLM_DISABLE_PYNCCL": lambda: (
