@@ -58,7 +58,12 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 
-def refuse_reasons(vllm_config: "VllmConfig") -> list[str]:
+def refuse_reasons(
+    vllm_config: "VllmConfig",
+    *,
+    decode_kernel: str | None = "b12x",
+    prefill_backend: str | None = "b12x",
+) -> list[str]:
     """Why deferred GDN checkpoints cannot be used for this configuration.
 
     Empty means usable. This is deliberately fail-closed: the caller raises on
@@ -67,6 +72,16 @@ def refuse_reasons(vllm_config: "VllmConfig") -> list[str]:
     state pool means and a silent downgrade would be invisible in a benchmark.
     """
     reasons: list[str] = []
+    if decode_kernel != "b12x":
+        reasons.append(
+            f"requires the b12x GDN decode kernel (got {decode_kernel!r}); "
+            "only it writes and replays the per-token records"
+        )
+    if prefill_backend != "b12x":
+        reasons.append(
+            f"requires the b12x GDN prefill backend (got {prefill_backend!r}); "
+            "another prefill kernel could read a record block as a state"
+        )
     cache_config = vllm_config.cache_config
     if getattr(cache_config, "mamba_cache_mode", "none") != "align":
         reasons.append(
@@ -97,11 +112,22 @@ def requested() -> bool:
     return bool(envs.VLLM_GDN_DEFERRED_CHECKPOINTS)
 
 
-def resolve(vllm_config: "VllmConfig") -> bool:
-    """Return whether deferred checkpoints are on, raising if asked and unusable."""
+def resolve(
+    vllm_config: "VllmConfig",
+    *,
+    decode_kernel: str | None,
+    prefill_backend: str | None,
+) -> bool:
+    """Return whether deferred checkpoints are on, raising if asked and unusable.
+
+    Called for every Qwen GDN layer, b12x or not, so the flag can never be
+    silently ignored.
+    """
     if not requested():
         return False
-    reasons = refuse_reasons(vllm_config)
+    reasons = refuse_reasons(
+        vllm_config, decode_kernel=decode_kernel, prefill_backend=prefill_backend
+    )
     if reasons:
         raise ValueError(
             "VLLM_GDN_DEFERRED_CHECKPOINTS=1 but the deferred GDN checkpoint "
@@ -115,50 +141,70 @@ def resolve(vllm_config: "VllmConfig") -> bool:
     return True
 
 
-@triton.jit(do_not_specialize=["num_reqs"])
+@triton.jit
 def gather_gdn_commit_windows_kernel(
-    commit_src_col_ptr,  # [max_reqs] pre-advance running column, -1 = skip
-    commit_dst_col_ptr,  # [max_reqs] block-table column the commit writes
-    block_table_ptr,  # [max_reqs, max_blocks] int32, the GDN group's table
+    commit_src_col_ptr,  # [MAX_REQS] pre-advance running column, -1 = none
+    commit_dst_col_ptr,  # [MAX_REQS] block-table column the commit writes
+    block_table_ptr,  # [>= MAX_REQS, max_blocks] int32, one mamba group
     block_table_stride_req,
-    out_state_indices_ptr,  # [max_reqs, COLUMNS] int32
-    out_destination_ptr,  # [max_reqs] int32, -1 = skip
-    num_reqs,
+    out_state_indices_ptr,  # [MAX_REQS, COLUMNS] int32
+    out_destination_ptr,  # [MAX_REQS] int32, -1 = skip
+    out_num_seqs_ptr,  # [1] int32: MAX_REQS if any row commits, else 0
+    MAX_REQS: tl.constexpr,
+    BLOCK: tl.constexpr,
     COLUMNS: tl.constexpr,
 ):
-    """Shape one request's state window the way b12x's commit expects it.
+    """Shape one mamba group's commit windows the way b12x's commit expects.
 
-    ``out_state_indices[r, j] = block_table[r, src_col + j]`` so column 0 is the
-    base checkpoint and columns 1.. are that step's record blocks, exactly the
-    window the decode kernel wrote. The destination is ``block_table[r,
-    dst_col]``: the aligned block itself for the post-sampler copy (so the
-    running window keeps its base and records when the two differ), and
-    ``src_col`` (in place) for the pre-forward migration, whose old window is
-    dead afterwards. ``dst_col <= src_col`` always, so it never names one of
-    the request's record blocks, which b12x would refuse.
+    One program over every request row, so the launch never depends on the
+    live batch size and can sit in a CUDA graph. Rows are in batch order, the
+    order the decision kernels write and the block table uses.
+    ``out_state_indices[r, j] = block_table[r, src_col + j]`` (column 0 is the
+    base, 1.. are that step's record blocks) and the destination is
+    ``block_table[r, dst_col]``. With no committing row, ``num_seqs`` is 0 and
+    b12x's commit exits without touching the pool.
     """
-    req_idx = tl.program_id(0)
-    if req_idx >= num_reqs:
-        return
-    src_col = tl.load(commit_src_col_ptr + req_idx)
-    columns = tl.arange(0, COLUMNS)
-    if src_col < 0:
-        tl.store(out_destination_ptr + req_idx, -1)
-        tl.store(out_state_indices_ptr + req_idx * COLUMNS + columns, 0)
-        return
-    row = block_table_ptr + req_idx.to(tl.int64) * block_table_stride_req
-    blocks = tl.load(row + src_col + columns)
-    tl.store(out_state_indices_ptr + req_idx * COLUMNS + columns, blocks)
-    dst_col = tl.load(commit_dst_col_ptr + req_idx)
-    tl.store(out_destination_ptr + req_idx, tl.load(row + dst_col))
+    rows = tl.arange(0, BLOCK)
+    in_range = rows < MAX_REQS
+    src = tl.load(commit_src_col_ptr + rows, mask=in_range, other=-1)
+    dst = tl.load(commit_dst_col_ptr + rows, mask=in_range, other=-1)
+    live = in_range & (src >= 0)
+    row_base = block_table_ptr + rows.to(tl.int64) * block_table_stride_req
+    for column in tl.static_range(COLUMNS):
+        block = tl.load(row_base + src + column, mask=live, other=0)
+        tl.store(out_state_indices_ptr + rows * COLUMNS + column, block, mask=in_range)
+    destination = tl.load(row_base + dst, mask=live, other=-1)
+    tl.store(
+        out_destination_ptr + rows, tl.where(live, destination, -1), mask=in_range
+    )
+    any_live = tl.max(live.to(tl.int32), axis=0)
+    tl.store(out_num_seqs_ptr, any_live * MAX_REQS)
+
+
+class _GroupCommit:
+    """Per mamba block-table group: its own table, windows and layers."""
+
+    def __init__(self, block_table, layers, max_num_reqs, columns, device):
+        factory = dict(dtype=torch.int32, device=device)
+        self.block_table = block_table
+        self.layers = layers
+        self.state_indices = torch.zeros((max_num_reqs, columns), **factory)
+        self.destination = torch.full((max_num_reqs,), -1, **factory)
+        self.num_seqs = torch.zeros((1,), **factory)
 
 
 class GdnDeferredCommit:
-    """Per-step buffers and the commit call for one GDN mamba group.
+    """Commit buffers and the commit call for every GDN mamba group.
 
-    The buffers are allocated once and never reallocated, so their addresses
-    are stable for CUDA graph capture, exactly like the other align-mode
-    per-request buffers.
+    A hybrid model splits its GDN layers over several mamba block-table groups
+    (Qwen3.8-Flash-Next: 36 GDN + attention layers give three), each with its
+    own physical block ids. The copy decision is per request and shared; the
+    windows, destinations and layers are per group.
+
+    Per step the drivers launch one decision kernel and then call
+    :meth:`commit`, which replays one CUDA graph holding every group's gather,
+    every layer's commit and the decision-buffer reset. All buffers have fixed
+    addresses, and the live batch size never enters a launch.
     """
 
     def __init__(
@@ -167,70 +213,117 @@ class GdnDeferredCommit:
         max_num_reqs: int,
         state_index_columns: int,
         device: torch.device,
+        groups: list[tuple[torch.Tensor, list[Any]]],
     ) -> None:
         self.max_num_reqs = int(max_num_reqs)
         self.state_index_columns = int(state_index_columns)
         factory = dict(dtype=torch.int32, device=device)
+        # Decision buffers, batch-row order, shared by every group. The commit
+        # resets them to -1 after use, so rows the decision kernel does not
+        # write never commit.
         self.src_col = torch.full((self.max_num_reqs,), -1, **factory)
         self.dst_col = torch.full((self.max_num_reqs,), -1, **factory)
         self.accepted = torch.ones((self.max_num_reqs,), **factory)
-        self.state_indices = torch.zeros(
-            (self.max_num_reqs, self.state_index_columns), **factory
-        )
-        self.destination = torch.full((self.max_num_reqs,), -1, **factory)
-        self.num_seqs = torch.zeros((1,), **factory)
-        self._layers: list[Any] = []
-
-    def bind_layers(self, layers: list[Any]) -> None:
-        """Record the GDN layers whose state must be committed."""
-        self._layers = [
-            layer
-            for layer in layers
-            if getattr(layer, "b12x_gdn_deferred_checkpoints", False)
+        self.groups = [
+            _GroupCommit(
+                table,
+                [
+                    layer
+                    for layer in layers
+                    if getattr(layer, "b12x_gdn_deferred_checkpoints", False)
+                ],
+                self.max_num_reqs,
+                self.state_index_columns,
+                device,
+            )
+            for table, layers in groups
         ]
+        self._graph: torch.cuda.CUDAGraph | None = None
+        self._graph_failed = False
 
     @property
     def active(self) -> bool:
-        return bool(self._layers)
+        return any(group.layers for group in self.groups)
 
-    def reset(self, num_reqs: int) -> None:
-        self.src_col[:num_reqs].fill_(-1)
-        self.dst_col[:num_reqs].fill_(-1)
-        self.accepted[:num_reqs].fill_(1)
-        self.num_seqs.fill_(int(num_reqs))
-
-    def commit(
-        self,
-        *,
-        num_reqs: int,
-        block_table: torch.Tensor,
-    ) -> None:
-        """Replay each boundary request's accepted prefix into its own block.
-
-        ``block_table`` is the GDN group's device block table in request-slot
-        order, i.e. the same rows ``commit_src_col`` was written with.
-        """
-        if not self.active or num_reqs == 0:
-            return
-        gather_gdn_commit_windows_kernel[(num_reqs,)](
-            self.src_col,
-            self.dst_col,
-            block_table,
-            block_table.stride(0),
-            self.state_indices,
-            self.destination,
-            num_reqs,
-            COLUMNS=self.state_index_columns,
-        )
-        for layer in self._layers:
-            layer.commit_b12x_gdn_deferred(
-                state_indices=self.state_indices,
-                num_accepted_tokens=self.accepted,
-                num_seqs=self.num_seqs,
-                destination_indices=self.destination,
+    def _launch(self) -> None:
+        block = triton.next_power_of_2(self.max_num_reqs)
+        for group in self.groups:
+            if not group.layers:
+                continue
+            gather_gdn_commit_windows_kernel[(1,)](
+                self.src_col,
+                self.dst_col,
+                group.block_table,
+                group.block_table.stride(0),
+                group.state_indices,
+                group.destination,
+                group.num_seqs,
+                MAX_REQS=self.max_num_reqs,
+                BLOCK=block,
+                COLUMNS=self.state_index_columns,
             )
+            for layer in group.layers:
+                layer.commit_b12x_gdn_deferred(
+                    state_indices=group.state_indices,
+                    num_accepted_tokens=self.accepted,
+                    num_seqs=group.num_seqs,
+                    destination_indices=group.destination,
+                )
+        self.src_col.fill_(-1)
+        self.dst_col.fill_(-1)
 
-    def precompile(self) -> None:
-        """Warm the commit kernel so it may be used inside a graph capture."""
-        for layer in self._layers:
+    def commit(self) -> None:
+        """Replay each committing request's accepted prefix, then reset."""
+        if not self.active:
+            return
+        if self._graph is not None:
+            self._graph.replay()
+            return
+        # First use runs eagerly (compiles the gather, warms the commit), then
+        # captures the same launches for every later step.
+        self._launch()
+        self._capture()
+
+    def _capture(self) -> None:
+        if self._graph_failed or torch.cuda.is_current_stream_capturing():
+            return
+        import gc
+
+        graph = torch.cuda.CUDAGraph()
+        stream = torch.cuda.Stream()
+        stream.wait_stream(torch.cuda.current_stream())
+        gc_enabled = gc.isenabled()
+        gc.collect()
+        gc.disable()
+        try:
+            with torch.cuda.graph(graph, stream=stream):
+                self._launch()
+        except Exception:
+            # Correctness does not depend on the graph; only host time does.
+            self._graph_failed = True
+            logger.warning(
+                "GDN deferred commit could not be captured in a CUDA graph; "
+                "running it eagerly every step.",
+                exc_info=True,
+            )
+            return
+        finally:
+            if gc_enabled:
+                gc.enable()
+        torch.cuda.current_stream().wait_stream(stream)
+        self._graph = graph
+
+
+def precompile_all(forward_context: dict[str, Any]) -> int:
+    """Compile and warm every deferred GDN layer's commit before serving.
+
+    Strict: a layer that cannot compile its commit fails the boot, instead of
+    compiling lazily on the first boundary crossing (possibly under a frozen
+    b12x session). Returns the number of layers warmed.
+    """
+    count = 0
+    for layer in forward_context.values():
+        if getattr(layer, "b12x_gdn_deferred_checkpoints", False):
             layer.precompile_b12x_gdn_deferred_commit()
+            count += 1
+    return count

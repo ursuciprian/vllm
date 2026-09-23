@@ -740,7 +740,9 @@ def precopy_mamba_align_fused_kernel(
         # Batch-row order (the copy below reads block-table row batch_idx).
         # The old window is dead after this migration, so the commit is in
         # place at bt[src_col] and the copy moves it with a zero bias.
-        if state_idx == 0 and tile_idx == 0:
+        # token_bias == 0 replays nothing: bt[src_col] already is the state,
+        # and rewriting it would touch a possibly shared prefix block.
+        if state_idx == 0 and tile_idx == 0 and token_bias > 0:
             tl.store(commit_src_col_ptr + batch_idx, src_col)
             tl.store(commit_accepted_ptr + batch_idx, token_bias + 1)
             tl.store(commit_dst_col_ptr + batch_idx, src_col)
@@ -1040,12 +1042,11 @@ class MambaSpecDecodeGPUContext:
     precopy_src_col_buf: CpuGpuBuffer | None = None
     precopy_token_bias_buf: CpuGpuBuffer | None = None
 
-    # Deferred GDN checkpoints (VLLM_GDN_DEFERRED_CHECKPOINTS). Both stay None
+    # Deferred GDN checkpoints (VLLM_GDN_DEFERRED_CHECKPOINTS). Stays None
     # unless the feature resolved on, which keeps every driver below on its
-    # shipped path. ``gdn_block_table`` is the GDN group's block table in
-    # request-slot order, the rows the commit metadata is gathered from.
+    # shipped path. It holds one commit window per mamba block-table group;
+    # the tables are in batch-row order, the rows the decision kernels write.
     gdn_deferred_commit: Any | None = None
-    gdn_block_table: torch.Tensor | None = None
 
     # Flag to track if metadata has been populated
     is_initialized: bool = False
@@ -1318,10 +1319,8 @@ class MambaSpecDecodeGPUContext:
         for i, bt in enumerate(block_tables):
             self.block_table_ptrs[i] = _reinterpret_u64_as_i64(bt.data_ptr())
 
-        # Deferred GDN checkpoints gather their commit window out of the GDN
-        # group's table. Hybrid models put every GDN layer in one mamba group,
-        # so a second group here means the feature has nothing well-defined to
-        # commit and is refused rather than guessed at.
+        # Deferred GDN checkpoints gather each group's commit window out of
+        # that group's own block table (block ids differ per group).
         self._initialize_gdn_deferred_commit(forward_context, block_tables)
 
         self.is_initialized = True
@@ -1333,38 +1332,46 @@ class MambaSpecDecodeGPUContext:
     ) -> None:
         from vllm.v1.worker.gdn_deferred_commit import GdnDeferredCommit
 
-        layers = [
-            layer
-            for layer in forward_context.values()
-            if getattr(layer, "b12x_gdn_deferred_checkpoints", False)
-        ]
-        if not layers:
+        groups = []
+        deferred_layers = []
+        for group, block_table in zip(self.layer_groups, block_tables):
+            layers = [
+                forward_context[name]
+                for name in group.layer_specs
+                if getattr(
+                    forward_context.get(name), "b12x_gdn_deferred_checkpoints", False
+                )
+            ]
+            groups.append((block_table, layers))
+            deferred_layers.extend(layers)
+        if not deferred_layers:
             return
-        if len(block_tables) != 1:
+        columns = {int(layer.b12x_gdn_state_index_columns) for layer in deferred_layers}
+        if len(columns) != 1:
             raise ValueError(
-                "deferred GDN checkpoints require a single mamba block-table "
-                f"group, got {len(block_tables)}"
+                f"deferred GDN checkpoints: layers disagree on columns {columns}"
             )
-        block_table = block_tables[0]
-        columns = int(layers[0].b12x_gdn_state_index_columns)
         # block_table may be a [:num_reqs] view of the first step's batch; size
         # the commit buffers by the planned request capacity instead.
         max_num_reqs = int(self.num_accepted_tokens_out.shape[0])
-        max_seqs = min(int(layer.b12x_gdn_max_seqs) for layer in layers)
+        max_seqs = min(int(layer.b12x_gdn_max_seqs) for layer in deferred_layers)
         if max_num_reqs > max_seqs:
             raise ValueError(
                 "deferred GDN checkpoints: runner max_num_reqs "
                 f"{max_num_reqs} exceeds the b12x GDN plan's max_seqs {max_seqs}"
             )
-        commit = GdnDeferredCommit(
+        self.gdn_deferred_commit = GdnDeferredCommit(
             max_num_reqs=max_num_reqs,
-            state_index_columns=columns,
-            device=block_table.device,
+            state_index_columns=next(iter(columns)),
+            device=block_tables[0].device,
+            groups=groups,
         )
-        commit.bind_layers(layers)
-        commit.precompile()
-        self.gdn_deferred_commit = commit
-        self.gdn_block_table = block_table
+        logger.info(
+            "GDN deferred checkpoints: %d mamba block-table groups, %s deferred "
+            "GDN layers per group",
+            len(groups),
+            [len(layers) for _, layers in groups],
+        )
 
     def compute_aligned_state_indices(
         self,
@@ -1463,7 +1470,6 @@ class MambaSpecDecodeGPUContext:
         deferred = self.gdn_deferred_commit
         if deferred is not None and deferred.active:
             # Decide, commit, then copy. See vllm/v1/worker/gdn_deferred_commit.
-            deferred.reset(num_reqs)
             postprocess_mamba_fused_kernel[(num_reqs, 1, 1)](
                 *args,
                 **kwargs,
@@ -1473,7 +1479,7 @@ class MambaSpecDecodeGPUContext:
                 commit_accepted_ptr=deferred.accepted,
                 commit_dst_col_ptr=deferred.dst_col,
             )
-            deferred.commit(num_reqs=num_reqs, block_table=self.gdn_block_table)
+            deferred.commit()
         postprocess_mamba_fused_kernel[grid](
             *args,
             **kwargs,
@@ -1505,7 +1511,6 @@ class MambaSpecDecodeGPUContext:
         grid = (num_reqs, self.total_states, _TEMPORAL_TILES)
         deferred = self.gdn_deferred_commit
         if deferred is not None and deferred.active:
-            deferred.reset(num_reqs)
             precopy_mamba_align_fused_kernel[(num_reqs, 1, 1)](
                 state_idx_gpu,
                 src_col_gpu,
@@ -1531,9 +1536,7 @@ class MambaSpecDecodeGPUContext:
                 commit_accepted_ptr=deferred.accepted,
                 commit_dst_col_ptr=deferred.dst_col,
             )
-            deferred.commit(
-                num_reqs=num_reqs, block_table=self.gdn_block_table
-            )
+            deferred.commit()
         precopy_mamba_align_fused_kernel[grid](
             state_idx_gpu,
             src_col_gpu,
@@ -1640,7 +1643,6 @@ class MambaSpecDecodeGPUContext:
         deferred = self.gdn_deferred_commit
         if deferred is not None and deferred.active:
             # Decide, commit, then copy. See vllm/v1/worker/gdn_deferred_commit.
-            deferred.reset(num_reqs)
             postprocess_mamba_fused_kernel[(num_reqs, 1, 1)](
                 num_accepted_tokens_snapshot,
                 state_idx_gpu,
@@ -1671,9 +1673,7 @@ class MambaSpecDecodeGPUContext:
                 commit_accepted_ptr=deferred.accepted,
                 commit_dst_col_ptr=deferred.dst_col,
             )
-            deferred.commit(
-                num_reqs=num_reqs, block_table=self.gdn_block_table
-            )
+            deferred.commit()
         postprocess_mamba_fused_kernel[grid](
             num_accepted_tokens_snapshot,
             state_idx_gpu,
@@ -1949,11 +1949,20 @@ def preprocess_mamba(
 
         if prev_state_idx != -1 and prev_state_idx != curr_state_idx:
             accept_token_bias = int(input_batch.num_accepted_tokens_cpu[i]) - 1
-            if deferred_columns:
-                window = req_state.block_ids[mamba_group_ids[0]][
-                    prev_state_idx : prev_state_idx + deferred_columns
-                ]
-                if len(set(window)) != len(window):
+            if deferred_columns and accept_token_bias > 0:
+                # Only the base and the records the commit will replay
+                # (columns 0..bias) must be distinct; null blocks (id 0, e.g.
+                # after a prefix hit followed by a long chunk) carry nothing.
+                for gid in mamba_group_ids:
+                    window = [
+                        block
+                        for block in req_state.block_ids[gid][
+                            prev_state_idx : prev_state_idx + accept_token_bias + 1
+                        ]
+                        if block != 0
+                    ]
+                    if len(set(window)) == len(window):
+                        continue
                     raise ValueError(
                         "deferred GDN checkpoints require a request's state "
                         "window to hold distinct blocks; the running block "

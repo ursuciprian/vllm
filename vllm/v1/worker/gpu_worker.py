@@ -901,6 +901,13 @@ class Worker(WorkerBase):
         # cuda graph capture.
         kernel_warmup(self)
 
+        # Deferred GDN checkpoints: compile every layer's commit now, before
+        # capture freezes kernel resolution, instead of on the first boundary
+        # crossing. No-op unless VLLM_GDN_DEFERRED_CHECKPOINTS resolved on.
+        from vllm.v1.worker.gdn_deferred_commit import precompile_all
+
+        precompile_all(self.vllm_config.compilation_config.static_forward_context)
+
         cuda_graph_memory_bytes = 0
         if not self.model_config.enforce_eager:
             # Under capture the b12x session refuses kernel resolution and an

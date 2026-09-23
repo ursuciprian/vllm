@@ -796,6 +796,14 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         self._b12x_prefill_plans: dict[int, object] = {}
         self._b12x_prefill_staging = None
         self._b12x_prefill = None
+        # Every Qwen GDN layer resolves the flag, b12x or not: asking for it
+        # with any other decode kernel or prefill backend raises instead of
+        # silently running the shipped checkpoint path.
+        self._b12x_gdn_deferred_checkpoints = gdn_deferred_commit.resolve(
+            vllm_config,
+            decode_kernel=self.gdn_decode_kernel,
+            prefill_backend=self.gdn_prefill_backend,
+        )
         if self.gdn_decode_kernel == "b12x":
             self._initialize_b12x_gdn_decode(vllm_config)
         if self.gdn_prefill_backend == "b12x":
@@ -833,11 +841,6 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         self._b12x_state_index_columns = state_index_columns
         self._b12x_local_key_heads = local_key_heads
         self._b12x_local_value_heads = local_value_heads
-        # Raises when the env var asks for something this configuration cannot
-        # do, rather than silently running the shipped checkpoint path.
-        self._b12x_gdn_deferred_checkpoints = gdn_deferred_commit.resolve(
-            vllm_config
-        )
         # Caps are immutable declaration metadata.  Inspect geometry directly
         # instead of constructing an executable declaration.
         caps = self._make_b12x_gdn_caps(max_state_slots=1)
@@ -1327,18 +1330,10 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         )
 
     def precompile_b12x_gdn_deferred_commit(self) -> None:
-        """Best-effort warm-up; the commit compiles lazily on first use."""
+        """Compile and warm the commit before serving; failures fail the boot."""
         if not self._b12x_gdn_deferred_checkpoints:
             return
-        try:
-            self._b12x_gdn_api.precompile_deferred_commit(
-                self._bind_b12x_gdn_decode()
-            )
-        except PreparationResourceUnavailableError:
-            logger.debug(
-                "b12x GDN deferred commit not precompiled yet; it will "
-                "compile on first use."
-            )
+        self._b12x_gdn_api.precompile_deferred_commit(self._bind_b12x_gdn_decode())
 
     def unbind_kv_cache(self) -> None:
         self._b12x_deferred_commit_key = None
