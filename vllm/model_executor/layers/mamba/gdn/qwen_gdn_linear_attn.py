@@ -1305,13 +1305,25 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         """
         if not self._b12x_gdn_deferred_checkpoints:
             return
-        self._b12x_gdn_api.commit_deferred_checkpoints(
-            self._bind_b12x_gdn_decode(
+        # Runs every step with fixed commit buffers (all-skip when no request
+        # crosses a block boundary), so rebinding each call would only add
+        # host time. Rebind when the plan, staging or buffers change.
+        key = (
+            id(self._b12x_decode_plan),
+            id(self._b12x_decode_staging),
+            state_indices.data_ptr(),
+            num_accepted_tokens.data_ptr(),
+            num_seqs.data_ptr(),
+        )
+        if getattr(self, "_b12x_deferred_commit_key", None) != key:
+            self._b12x_deferred_commit_binding = self._bind_b12x_gdn_decode(
                 state_indices=state_indices,
                 num_accepted_tokens=num_accepted_tokens,
                 num_seqs=num_seqs,
-            ),
-            destination_indices,
+            )
+            self._b12x_deferred_commit_key = key
+        self._b12x_gdn_api.commit_deferred_checkpoints(
+            self._b12x_deferred_commit_binding, destination_indices
         )
 
     def precompile_b12x_gdn_deferred_commit(self) -> None:
@@ -1329,6 +1341,8 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             )
 
     def unbind_kv_cache(self) -> None:
+        self._b12x_deferred_commit_key = None
+        self._b12x_deferred_commit_binding = None
         self._b12x_decode_plan = None
         self._b12x_prefill_plans = {}
         self._b12x_prefill = None
