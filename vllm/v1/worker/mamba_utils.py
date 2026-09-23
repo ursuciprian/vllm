@@ -366,6 +366,11 @@ def _copy_mamba_state_block(
         return
 
     # Temporal: copy state[bt[src_col + temporal_bias]] -> state[bt[dst_col]]
+    # A negative temporal_bias means the b12x deferred-checkpoint commit has
+    # already written the committed state into bt[dst_col]; copying anything
+    # over it would undo that.
+    if temporal_bias < 0:
+        return
     # Body u64 range is partitioned across TEMPORAL_TILES CTAs to keep the
     # SMs filled at small batch.
     actual_src_block_id = tl.load(
@@ -514,6 +519,7 @@ def postprocess_mamba_fused_kernel(
     DECISION_ONLY: tl.constexpr = False,
     commit_src_col_ptr=None,
     commit_accepted_ptr=None,
+    commit_dst_col_ptr=None,
 ):
     """
     Fused GPU kernel for postprocess_mamba that computes decisions AND performs
@@ -577,17 +583,22 @@ def postprocess_mamba_fused_kernel(
     if src_block_idx == dest_block_idx and accept_token_bias == 0:
         return
 
+    bt_row_idx = batch_idx if HAS_IDX_MAPPING else req_idx
     if DECISION_ONLY:
+        # Batch-row order, the rows of the block table the commit gathers
+        # from. The commit writes the accepted prefix straight into the
+        # destination block: when src != dest the running window keeps its
+        # uncommitted base and records for the next decode step, exactly as
+        # the shipped copy leaves bt[src + bias] untouched.
         if state_idx == 0 and tile_idx == 0:
-            tl.store(commit_src_col_ptr + req_idx, src_block_idx)
-            tl.store(commit_accepted_ptr + req_idx, accept_token_bias + 1)
+            tl.store(commit_src_col_ptr + bt_row_idx, src_block_idx)
+            tl.store(commit_accepted_ptr + bt_row_idx, accept_token_bias + 1)
+            tl.store(commit_dst_col_ptr + bt_row_idx, dest_block_idx)
         return
 
-    bt_row_idx = batch_idx if HAS_IDX_MAPPING else req_idx
-    # With deferred checkpoints the speculative columns hold records, so the
-    # accepted prefix has already been replayed into bt[src_block_idx] by
-    # GdnDeferredCommit and the temporal half is a plain block copy.
-    temporal_bias = 0 if DEFERRED_TEMPORAL else accept_token_bias
+    # With deferred checkpoints the commit already wrote bt[dest_block_idx]
+    # (-1 skips the temporal copy); the conv half still shifts by the bias.
+    temporal_bias = -1 if DEFERRED_TEMPORAL else accept_token_bias
     _copy_mamba_state_block(
         state_idx,
         bt_row_idx,
@@ -688,6 +699,7 @@ def precopy_mamba_align_fused_kernel(
     DECISION_ONLY: tl.constexpr = False,
     commit_src_col_ptr=None,
     commit_accepted_ptr=None,
+    commit_dst_col_ptr=None,
 ):
     """Pre-copy mamba "align" state across block boundaries.
 
@@ -725,9 +737,13 @@ def precopy_mamba_align_fused_kernel(
 
     token_bias = tl.load(token_bias_ptr + req_idx)
     if DECISION_ONLY:
+        # Batch-row order (the copy below reads block-table row batch_idx).
+        # The old window is dead after this migration, so the commit is in
+        # place at bt[src_col] and the copy moves it with a zero bias.
         if state_idx == 0 and tile_idx == 0:
-            tl.store(commit_src_col_ptr + req_idx, src_col)
-            tl.store(commit_accepted_ptr + req_idx, token_bias + 1)
+            tl.store(commit_src_col_ptr + batch_idx, src_col)
+            tl.store(commit_accepted_ptr + batch_idx, token_bias + 1)
+            tl.store(commit_dst_col_ptr + batch_idx, src_col)
         return
     temporal_bias = 0 if DEFERRED_TEMPORAL else token_bias
     _copy_mamba_state_block(
@@ -1331,8 +1347,17 @@ class MambaSpecDecodeGPUContext:
             )
         block_table = block_tables[0]
         columns = int(layers[0].b12x_gdn_state_index_columns)
+        # block_table may be a [:num_reqs] view of the first step's batch; size
+        # the commit buffers by the planned request capacity instead.
+        max_num_reqs = int(self.num_accepted_tokens_out.shape[0])
+        max_seqs = min(int(layer.b12x_gdn_max_seqs) for layer in layers)
+        if max_num_reqs > max_seqs:
+            raise ValueError(
+                "deferred GDN checkpoints: runner max_num_reqs "
+                f"{max_num_reqs} exceeds the b12x GDN plan's max_seqs {max_seqs}"
+            )
         commit = GdnDeferredCommit(
-            max_num_reqs=int(block_table.shape[0]),
+            max_num_reqs=max_num_reqs,
             state_index_columns=columns,
             device=block_table.device,
         )
@@ -1410,8 +1435,7 @@ class MambaSpecDecodeGPUContext:
         )
 
         grid = (num_reqs, self.total_states, _TEMPORAL_TILES)
-
-        postprocess_mamba_fused_kernel[grid](
+        args = (
             num_accepted_tokens_gpu,
             mamba_state_idx_gpu,
             num_scheduled_tokens_gpu,
@@ -1430,10 +1454,31 @@ class MambaSpecDecodeGPUContext:
             self.num_accepted_tokens_out,
             None,  # idx_mapping: V1 decision arrays are already in req order
             num_reqs,
+        )
+        kwargs = dict(
             block_size=self.block_size,
             COPY_BLOCK_SIZE=1024,
             CONV_STATE_DIM_FIRST=is_conv_state_dim_first(),
+        )
+        deferred = self.gdn_deferred_commit
+        if deferred is not None and deferred.active:
+            # Decide, commit, then copy. See vllm/v1/worker/gdn_deferred_commit.
+            deferred.reset(num_reqs)
+            postprocess_mamba_fused_kernel[(num_reqs, 1, 1)](
+                *args,
+                **kwargs,
+                TEMPORAL_TILES=1,
+                DECISION_ONLY=True,
+                commit_src_col_ptr=deferred.src_col,
+                commit_accepted_ptr=deferred.accepted,
+                commit_dst_col_ptr=deferred.dst_col,
+            )
+            deferred.commit(num_reqs=num_reqs, block_table=self.gdn_block_table)
+        postprocess_mamba_fused_kernel[grid](
+            *args,
+            **kwargs,
             TEMPORAL_TILES=_TEMPORAL_TILES,
+            DEFERRED_TEMPORAL=deferred is not None and deferred.active,
         )
 
     def run_fused_precopy(
@@ -1484,6 +1529,7 @@ class MambaSpecDecodeGPUContext:
                 DECISION_ONLY=True,
                 commit_src_col_ptr=deferred.src_col,
                 commit_accepted_ptr=deferred.accepted,
+                commit_dst_col_ptr=deferred.dst_col,
             )
             deferred.commit(
                 num_reqs=num_reqs, block_table=self.gdn_block_table
@@ -1623,6 +1669,7 @@ class MambaSpecDecodeGPUContext:
                 DECISION_ONLY=True,
                 commit_src_col_ptr=deferred.src_col,
                 commit_accepted_ptr=deferred.accepted,
+                commit_dst_col_ptr=deferred.dst_col,
             )
             deferred.commit(
                 num_reqs=num_reqs, block_table=self.gdn_block_table

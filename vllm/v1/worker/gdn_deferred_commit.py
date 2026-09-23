@@ -118,6 +118,7 @@ def resolve(vllm_config: "VllmConfig") -> bool:
 @triton.jit(do_not_specialize=["num_reqs"])
 def gather_gdn_commit_windows_kernel(
     commit_src_col_ptr,  # [max_reqs] pre-advance running column, -1 = skip
+    commit_dst_col_ptr,  # [max_reqs] block-table column the commit writes
     block_table_ptr,  # [max_reqs, max_blocks] int32, the GDN group's table
     block_table_stride_req,
     out_state_indices_ptr,  # [max_reqs, COLUMNS] int32
@@ -129,9 +130,12 @@ def gather_gdn_commit_windows_kernel(
 
     ``out_state_indices[r, j] = block_table[r, src_col + j]`` so column 0 is the
     base checkpoint and columns 1.. are that step's record blocks, exactly the
-    window the decode kernel wrote. The destination is column 0 again: the
-    commit runs in place and the existing block copy then moves the committed
-    state to the new window with a zero temporal bias.
+    window the decode kernel wrote. The destination is ``block_table[r,
+    dst_col]``: the aligned block itself for the post-sampler copy (so the
+    running window keeps its base and records when the two differ), and
+    ``src_col`` (in place) for the pre-forward migration, whose old window is
+    dead afterwards. ``dst_col <= src_col`` always, so it never names one of
+    the request's record blocks, which b12x would refuse.
     """
     req_idx = tl.program_id(0)
     if req_idx >= num_reqs:
@@ -145,7 +149,8 @@ def gather_gdn_commit_windows_kernel(
     row = block_table_ptr + req_idx.to(tl.int64) * block_table_stride_req
     blocks = tl.load(row + src_col + columns)
     tl.store(out_state_indices_ptr + req_idx * COLUMNS + columns, blocks)
-    tl.store(out_destination_ptr + req_idx, tl.load(row + src_col))
+    dst_col = tl.load(commit_dst_col_ptr + req_idx)
+    tl.store(out_destination_ptr + req_idx, tl.load(row + dst_col))
 
 
 class GdnDeferredCommit:
@@ -167,6 +172,7 @@ class GdnDeferredCommit:
         self.state_index_columns = int(state_index_columns)
         factory = dict(dtype=torch.int32, device=device)
         self.src_col = torch.full((self.max_num_reqs,), -1, **factory)
+        self.dst_col = torch.full((self.max_num_reqs,), -1, **factory)
         self.accepted = torch.ones((self.max_num_reqs,), **factory)
         self.state_indices = torch.zeros(
             (self.max_num_reqs, self.state_index_columns), **factory
@@ -189,6 +195,7 @@ class GdnDeferredCommit:
 
     def reset(self, num_reqs: int) -> None:
         self.src_col[:num_reqs].fill_(-1)
+        self.dst_col[:num_reqs].fill_(-1)
         self.accepted[:num_reqs].fill_(1)
         self.num_seqs.fill_(int(num_reqs))
 
@@ -207,6 +214,7 @@ class GdnDeferredCommit:
             return
         gather_gdn_commit_windows_kernel[(num_reqs,)](
             self.src_col,
+            self.dst_col,
             block_table,
             block_table.stride(0),
             self.state_indices,

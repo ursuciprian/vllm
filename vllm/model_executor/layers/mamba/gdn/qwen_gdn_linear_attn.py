@@ -856,6 +856,10 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
     def b12x_gdn_state_index_columns(self) -> int:
         return int(self._b12x_state_index_columns)
 
+    @property
+    def b12x_gdn_max_seqs(self) -> int:
+        return int(self._b12x_max_seqs)
+
     def _make_b12x_gdn_caps(self, max_state_slots: int):
         api = self._b12x_gdn_api
         if api is None:
