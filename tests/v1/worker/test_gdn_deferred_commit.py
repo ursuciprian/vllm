@@ -242,6 +242,7 @@ def test_commit_then_copy_matches_the_shipped_copy_across_three_groups():
             accepted.clone(), idx_mapping, 3,
             block_size=block_size, COPY_BLOCK_SIZE=16, CONV_STATE_DIM_FIRST=False,
             HAS_IDX_MAPPING=True, PRECOMPUTED_NEW_COMPUTED=True, TEMPORAL_TILES=1,
+            state_temporal_deferred_ptr=torch.ones(1, **i32),
             **extra,
         )
 
@@ -339,6 +340,7 @@ def test_precopy_driver_commits_in_place_then_migrates_like_the_shipped_copy():
             state_group_indices=torch.arange(groups, **i32),
             state_dim_row_count=torch.zeros(groups, **i32),
             state_dim_row_stride=torch.zeros(groups, **i64),
+            state_temporal_deferred=torch.ones(groups, **i32),
             gdn_deferred_commit=commit,
         )
 
@@ -365,3 +367,129 @@ def test_precopy_driver_commits_in_place_then_migrates_like_the_shipped_copy():
                     group, b, deferred[group][dest], shipped[group][dest])
     assert commit._graph is not None, "commit graph capture failed"
     assert int(commit.alias_errors) == 0
+
+
+def _mixed_group_case(device):
+    """One mamba group holding a deferred GDN layer (conv + temporal state), a
+    PLE-like conv-only layer and a non-deferred temporal state, all sharing one
+    block table. Only the GDN temporal state may take the deferred path; every
+    other state must match the shipped copy bit for bit.
+    """
+    from types import SimpleNamespace as NS
+
+    from vllm.model_executor.layers.mamba.mamba_utils import is_conv_state_dim_first
+    from vllm.v1.worker.mamba_utils import MambaSpecDecodeGPUContext
+
+    i32 = dict(dtype=torch.int32, device=device)
+    i64 = dict(dtype=torch.int64, device=device)
+    max_reqs, blocks = 4, 64
+    idx_mapping = torch.tensor([2, 0, 1], **i32)
+    src_col = torch.tensor([2, 3, 1, -1], **i32)
+    dst_col = torch.tensor([3, 3, 2, 0], **i32)
+    token_bias = torch.tensor([2, 1, 0, 0], **i32)
+    base = [10.0, 20.0, 30.0]
+    generator = torch.Generator().manual_seed(7)
+    table = (
+        torch.randperm(blocks - 1, generator=generator)[: max_reqs * 12]
+        .view(max_reqs, 12).to(torch.int32).to(device)
+    )
+    ds = is_conv_state_dim_first()
+    conv_shape = (blocks, 6, 4) if ds else (blocks, 4, 6)  # width 4, dim 6
+
+    def conv_state():
+        return torch.randn(conv_shape, generator=generator).to(device)
+
+    shipped = {
+        "gdn_conv": conv_state(),
+        "gdn_temporal": torch.full((blocks, 2), -7.0, device=device),
+        "ple_conv": conv_state(),
+        "other_temporal": torch.randn((blocks, 2), generator=generator).to(device),
+    }
+    for b in range(3):
+        src = int(src_col[int(idx_mapping[b])])
+        for j in range(5):
+            shipped["gdn_temporal"][int(table[b, src + j])] = base[b] + j
+    initial = {k: v.clone() for k, v in shipped.items()}
+    for b in range(3):
+        src = int(src_col[int(idx_mapping[b])])
+        for j in range(1, 5):
+            initial["gdn_temporal"][int(table[b, src + j])] = 1000.0 + j
+    deferred = {k: v.clone() for k, v in initial.items()}
+    order = ["gdn_conv", "gdn_temporal", "ple_conv", "other_temporal"]
+
+    def ctx(pools, commit, flags):
+        conv = [name.endswith("_conv") for name in order]
+        t = [pools[name] for name in order]
+        return NS(
+            is_initialized=True,
+            total_states=len(order),
+            block_table_ptrs=torch.tensor([table.data_ptr()], **i64),
+            block_table_stride_req=table.stride(0),
+            state_base_addrs=torch.tensor([x.data_ptr() for x in t], **i64),
+            state_block_strides=torch.tensor(
+                [x.stride(0) * x.element_size() for x in t], **i64
+            ),
+            state_elem_sizes=torch.tensor([x.element_size() for x in t], **i32),
+            state_inner_sizes=torch.tensor(
+                [(1 if ds else x.stride(1)) if c else x[0].numel()
+                 for x, c in zip(t, conv)], **i64
+            ),
+            state_conv_widths=torch.tensor(
+                [(x.size(2) if ds else x.size(1)) if c else 0
+                 for x, c in zip(t, conv)], **i32
+            ),
+            state_group_indices=torch.zeros(len(order), **i32),
+            state_dim_row_count=torch.tensor(
+                [x.size(1) if (c and ds) else 0 for x, c in zip(t, conv)], **i32
+            ),
+            state_dim_row_stride=torch.tensor(
+                [x.stride(1) * x.element_size() if (c and ds) else 0
+                 for x, c in zip(t, conv)], **i64
+            ),
+            state_temporal_deferred=torch.tensor(flags, **i32),
+            gdn_deferred_commit=commit,
+        )
+
+    run = MambaSpecDecodeGPUContext.run_fused_precopy
+    run(ctx(shipped, None, [0, 0, 0, 0]), 3, dst_col, src_col, token_bias,
+        idx_mapping)
+    gdn_layer = _FakeGdnLayer(deferred["gdn_temporal"])
+    ple_layer = SimpleNamespace(b12x_gdn_deferred_checkpoints=False)
+    commit = gdc.GdnDeferredCommit(
+        max_num_reqs=max_reqs, state_index_columns=5, device=device,
+        groups=[(table, [gdn_layer, ple_layer])],
+    )
+    run(ctx(deferred, commit, [0, 1, 0, 0]), 3, dst_col, src_col, token_bias,
+        idx_mapping)
+    if device.type == "cuda":
+        torch.cuda.synchronize()
+    for name in ("gdn_conv", "ple_conv", "other_temporal"):
+        assert torch.equal(deferred[name], shipped[name]), name
+    for b in range(3):
+        r = int(idx_mapping[b])
+        if int(src_col[r]) == int(dst_col[r]):
+            continue
+        dest = int(table[b, int(dst_col[r])])
+        assert torch.equal(
+            deferred["gdn_temporal"][dest], shipped["gdn_temporal"][dest]
+        ), b
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+def test_mixed_gdn_and_ple_group_keeps_the_shipped_copy_for_non_gdn_states():
+    _mixed_group_case(torch.device("cuda"))
+
+
+def test_mixed_gdn_and_ple_group_under_the_triton_interpreter():
+    pytest.importorskip("triton")
+    code = (
+        "import torch, tests.v1.worker.test_gdn_deferred_commit as t;"
+        "t._mixed_group_case(torch.device('cpu')); print('ok')"
+    )
+    env = {**os.environ, "TRITON_INTERPRET": "1"}
+    result = subprocess.run(
+        [sys.executable, "-c", code], env=env, capture_output=True, text=True,
+        timeout=900,
+    )
+    assert result.returncode == 0, result.stderr[-4000:]
+    assert result.stdout.strip().endswith("ok")

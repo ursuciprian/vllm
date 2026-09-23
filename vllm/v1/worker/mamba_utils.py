@@ -520,6 +520,9 @@ def postprocess_mamba_fused_kernel(
     commit_src_col_ptr=None,
     commit_accepted_ptr=None,
     commit_dst_col_ptr=None,
+    # int32[total_states]: 1 for temporal states of deferred GDN layers. Only
+    # read under DEFERRED_TEMPORAL; every other state keeps the shipped copy.
+    state_temporal_deferred_ptr=None,
 ):
     """
     Fused GPU kernel for postprocess_mamba that computes decisions AND performs
@@ -596,9 +599,13 @@ def postprocess_mamba_fused_kernel(
             tl.store(commit_dst_col_ptr + bt_row_idx, dest_block_idx)
         return
 
-    # With deferred checkpoints the commit already wrote bt[dest_block_idx]
-    # (-1 skips the temporal copy); the conv half still shifts by the bias.
-    temporal_bias = -1 if DEFERRED_TEMPORAL else accept_token_bias
+    # For a deferred GDN temporal state the commit already wrote
+    # bt[dest_block_idx] (-1 skips the temporal copy). Conv states and other
+    # layers' temporal states keep the shipped copy.
+    temporal_bias = accept_token_bias
+    if DEFERRED_TEMPORAL:
+        if tl.load(state_temporal_deferred_ptr + state_idx) != 0:
+            temporal_bias = -1
     _copy_mamba_state_block(
         state_idx,
         bt_row_idx,
@@ -700,6 +707,9 @@ def precopy_mamba_align_fused_kernel(
     commit_src_col_ptr=None,
     commit_accepted_ptr=None,
     commit_dst_col_ptr=None,
+    # int32[total_states]: 1 for temporal states of deferred GDN layers. Only
+    # read under DEFERRED_TEMPORAL; every other state keeps the shipped copy.
+    state_temporal_deferred_ptr=None,
 ):
     """Pre-copy mamba "align" state across block boundaries.
 
@@ -747,7 +757,10 @@ def precopy_mamba_align_fused_kernel(
             tl.store(commit_accepted_ptr + batch_idx, token_bias + 1)
             tl.store(commit_dst_col_ptr + batch_idx, src_col)
         return
-    temporal_bias = 0 if DEFERRED_TEMPORAL else token_bias
+    temporal_bias = token_bias
+    if DEFERRED_TEMPORAL:
+        if tl.load(state_temporal_deferred_ptr + state_idx) != 0:
+            temporal_bias = 0
     _copy_mamba_state_block(
         state_idx,
         batch_idx,
@@ -1047,6 +1060,10 @@ class MambaSpecDecodeGPUContext:
     # shipped path. It holds one commit window per mamba block-table group;
     # the tables are in batch-row order, the rows the decision kernels write.
     gdn_deferred_commit: Any | None = None
+    # int32[total_states], 1 for the temporal state of a deferred GDN layer.
+    state_temporal_deferred: torch.Tensor | None = None
+    # Mamba group ids that hold deferred GDN layers (V1 host window check).
+    gdn_deferred_group_ids: list[int] = dataclasses.field(default_factory=list)
 
     # Flag to track if metadata has been populated
     is_initialized: bool = False
@@ -1104,6 +1121,9 @@ class MambaSpecDecodeGPUContext:
                 total_states, dtype=torch.int32, device=device
             ),
             state_dim_row_count=torch.zeros(
+                total_states, dtype=torch.int32, device=device
+            ),
+            state_temporal_deferred=torch.zeros(
                 total_states, dtype=torch.int32, device=device
             ),
             state_dim_row_stride=torch.zeros(
@@ -1271,6 +1291,13 @@ class MambaSpecDecodeGPUContext:
                         # state tensor is as_strided with padded page strides
                         # (state_block_stride would be the page size, too big).
                         self.state_conv_widths[idx] = 0
+                        self.state_temporal_deferred[idx] = int(
+                            bool(
+                                getattr(
+                                    attention, "b12x_gdn_deferred_checkpoints", False
+                                )
+                            )
+                        )
                         self.state_inner_sizes[idx] = (
                             state[0].numel() if state.dim() > 1 else 1
                         )
@@ -1344,22 +1371,39 @@ class MambaSpecDecodeGPUContext:
             ]
             groups.append((block_table, layers))
             deferred_layers.extend(layers)
+            if layers:
+                self.gdn_deferred_group_ids.append(group.group_id)
         if not deferred_layers:
             return
-        # DEFERRED_TEMPORAL is a launch-wide constexpr: it changes every
-        # temporal copy in the fused copy kernels, so a mamba layer that is not
-        # a deferred GDN layer would silently lose its temporal state copy.
+        # Log the real layout: which mamba types share which block table.
+        logger.info(
+            "GDN deferred checkpoints: %d mamba block-table groups: %s",
+            len(self.layer_groups),
+            [
+                {
+                    t.name: sum(1 for spec in g.layer_specs.values() if spec.mamba_type == t)
+                    for t in {spec.mamba_type for spec in g.layer_specs.values()}
+                }
+                for g in self.layer_groups
+            ],
+        )
+        # Deferred temporal copies are per state (state_temporal_deferred), so
+        # conv-only layers (e.g. PLE short conv) and other mamba types keep the
+        # shipped copy. What is unsupported is a GDN layer on the shipped path
+        # while others are deferred: resolve() is process-wide, so that means a
+        # non-b12x GDN layer slipped through.
         not_deferred = [
             name
             for group in self.layer_groups
-            for name in group.layer_specs
-            if not getattr(
+            for name, spec in group.layer_specs.items()
+            if spec.mamba_type == MambaAttentionBackendEnum.GDN_ATTN
+            and not getattr(
                 forward_context.get(name), "b12x_gdn_deferred_checkpoints", False
             )
         ]
         if not_deferred:
             raise ValueError(
-                "deferred GDN checkpoints require every mamba layer to be a "
+                "deferred GDN checkpoints require every GDN layer to be a "
                 f"deferred b12x GDN layer; not deferred: {not_deferred[:4]}"
                 f"{' ...' if len(not_deferred) > 4 else ''}"
             )
@@ -1502,6 +1546,7 @@ class MambaSpecDecodeGPUContext:
             **kwargs,
             TEMPORAL_TILES=_TEMPORAL_TILES,
             DEFERRED_TEMPORAL=deferred is not None and deferred.active,
+            state_temporal_deferred_ptr=self.state_temporal_deferred,
         )
 
     def run_fused_precopy(
@@ -1575,6 +1620,7 @@ class MambaSpecDecodeGPUContext:
             HAS_IDX_MAPPING=idx_mapping is not None,
             TEMPORAL_TILES=_TEMPORAL_TILES,
             DEFERRED_TEMPORAL=deferred is not None and deferred.active,
+            state_temporal_deferred_ptr=self.state_temporal_deferred,
         )
 
     def checkpoint_request_boundaries(
@@ -1717,6 +1763,7 @@ class MambaSpecDecodeGPUContext:
             PRECOMPUTED_NEW_COMPUTED=True,
             TEMPORAL_TILES=_TEMPORAL_TILES,
             DEFERRED_TEMPORAL=deferred is not None and deferred.active,
+            state_temporal_deferred_ptr=self.state_temporal_deferred,
         )
 
 
@@ -1934,8 +1981,10 @@ def preprocess_mamba(
     # of host comparisons per step, which is worth paying for a failure mode
     # that would otherwise be silent corrupted output.
     deferred_columns = 0
+    deferred_group_ids: list[int] = []
     if fused is not None and fused.ctx.gdn_deferred_commit is not None:
         deferred_columns = fused.ctx.gdn_deferred_commit.state_index_columns
+        deferred_group_ids = fused.ctx.gdn_deferred_group_ids
 
     for i, req_id in enumerate(input_batch.req_ids):
         req_state = requests[req_id]
@@ -1970,7 +2019,7 @@ def preprocess_mamba(
                 # The base and the records the commit will replay (columns
                 # 0..bias) must be real, distinct blocks. Columns past the
                 # bias are not read and may be null (prefix hit + long chunk).
-                for gid in mamba_group_ids:
+                for gid in deferred_group_ids:
                     window = req_state.block_ids[gid][
                         prev_state_idx : prev_state_idx + accept_token_bias + 1
                     ]

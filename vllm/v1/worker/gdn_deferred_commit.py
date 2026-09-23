@@ -41,9 +41,10 @@ Both run decide -> commit -> copy; they differ in where the commit writes:
      bias 0.
 
    The conv half keeps its accepted-token bias either way, which is why the
-   shared copy helper takes the two biases separately. ``DEFERRED_TEMPORAL``
-   applies to every temporal state in the launch, so every mamba layer must be
-   a deferred GDN layer (checked at init).
+   shared copy helper takes the two biases separately. Only temporal states
+   flagged in ``state_temporal_deferred`` (deferred GDN layers) change; conv
+   states and other mamba layers (e.g. the PLE short conv) keep the shipped
+   copy, so they behave identically with the flag on or off.
 
 A third reader exists and is refused rather than handled:
 ``checkpoint_mamba_states_kernel`` (request-boundary checkpoints) can ask for
@@ -310,7 +311,11 @@ class GdnDeferredCommit:
         self._capture()
 
     def _capture(self) -> None:
-        if self._graph_failed or torch.cuda.is_current_stream_capturing():
+        if (
+            self._graph_failed
+            or self.src_col.device.type != "cuda"
+            or torch.cuda.is_current_stream_capturing()
+        ):
             return
         import gc
 
