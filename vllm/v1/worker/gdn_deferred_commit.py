@@ -18,21 +18,32 @@ block-boundary state copies:
 * ``postprocess_mamba_fused_kernel`` -- same step, right after the sampler.
 * ``precopy_mamba_align_fused_kernel`` -- next step, the CPU-metadata fallback.
 
-Both are handled the same way, and the ordering is what makes it correct:
+Both run decide -> commit -> copy; they differ in where the commit writes:
 
-1. Run the copy kernel with ``DECISION_ONLY=True``. It emits, per request, the
-   pre-advance running column and the accepted count, and copies nothing. The
-   copy decision therefore still lives in exactly one place.
-2. Gather that request's 1 + num_spec block ids into a b12x-shaped state-index
-   table, and set each boundary request's commit destination to its own
-   running block (an in-place commit).
+1. Run the copy kernel with ``DECISION_ONLY=True``. It emits, per request in
+   batch-row order, the pre-advance running column, the accepted count and
+   the destination column, and copies nothing. The copy decision therefore
+   still lives in exactly one place.
+2. Gather each mamba group's 1 + num_spec block ids into a b12x-shaped
+   state-index table and resolve the destination block:
+
+   * post-sampler: the aligned block ``bt[dest]`` (``dest <= src``), so a
+     running window that stays live keeps its base and records;
+   * pre-forward: ``bt[src]`` in place (the old window is dead afterwards),
+     skipped when the bias is 0 because nothing needs replaying.
 3. Ask every GDN layer to commit. b12x reads the base from column 0, replays
-   ``accepted - 1`` records out of columns 1.., and writes the result back to
-   column 0.
-4. Run the copy kernel for real with ``DEFERRED_TEMPORAL=True``, so its
-   temporal half copies the now-committed running block with bias 0. The conv
-   half keeps its accepted-token bias, which is why the shared copy helper
-   takes the two biases separately.
+   ``accepted - 1`` records out of columns 1.. and writes the destination.
+4. Run the copy kernel for real with ``DEFERRED_TEMPORAL=True``:
+
+   * post-sampler: the temporal copy is skipped (``temporal_bias < 0``), since
+     the commit already wrote ``bt[dest]``;
+   * pre-forward: the temporal half copies the committed ``bt[src]`` with
+     bias 0.
+
+   The conv half keeps its accepted-token bias either way, which is why the
+   shared copy helper takes the two biases separately. ``DEFERRED_TEMPORAL``
+   applies to every temporal state in the launch, so every mamba layer must be
+   a deferred GDN layer (checked at init).
 
 A third reader exists and is refused rather than handled:
 ``checkpoint_mamba_states_kernel`` (request-boundary checkpoints) can ask for
@@ -150,6 +161,7 @@ def gather_gdn_commit_windows_kernel(
     out_state_indices_ptr,  # [MAX_REQS, COLUMNS] int32
     out_destination_ptr,  # [MAX_REQS] int32, -1 = skip
     out_num_seqs_ptr,  # [1] int32: MAX_REQS if any row commits, else 0
+    alias_errors_ptr,  # [1] int32, accumulated: destinations naming a record
     MAX_REQS: tl.constexpr,
     BLOCK: tl.constexpr,
     COLUMNS: tl.constexpr,
@@ -174,6 +186,15 @@ def gather_gdn_commit_windows_kernel(
         block = tl.load(row_base + src + column, mask=live, other=0)
         tl.store(out_state_indices_ptr + rows * COLUMNS + column, block, mask=in_range)
     destination = tl.load(row_base + dst, mask=live, other=-1)
+    # b12x refuses (silently skips) a destination that names one of the
+    # row's record blocks. dst <= src makes that impossible unless the block
+    # table repeats an id; count it on device so it is observable without a
+    # host sync on the hot path (GdnDeferredCommit.alias_errors).
+    aliased = tl.zeros([BLOCK], dtype=tl.int32)
+    for column in tl.static_range(1, COLUMNS):
+        record = tl.load(row_base + src + column, mask=live, other=-2)
+        aliased += (live & (record == destination)).to(tl.int32)
+    tl.atomic_add(alias_errors_ptr, tl.sum(aliased, axis=0))
     tl.store(
         out_destination_ptr + rows, tl.where(live, destination, -1), mask=in_range
     )
@@ -224,6 +245,9 @@ class GdnDeferredCommit:
         self.src_col = torch.full((self.max_num_reqs,), -1, **factory)
         self.dst_col = torch.full((self.max_num_reqs,), -1, **factory)
         self.accepted = torch.ones((self.max_num_reqs,), **factory)
+        # Device-side count of commits b12x would refuse; read it when
+        # debugging, never on the hot path.
+        self.alias_errors = torch.zeros((1,), **factory)
         self.groups = [
             _GroupCommit(
                 table,
@@ -258,6 +282,7 @@ class GdnDeferredCommit:
                 group.state_indices,
                 group.destination,
                 group.num_seqs,
+                self.alias_errors,
                 MAX_REQS=self.max_num_reqs,
                 BLOCK=block,
                 COLUMNS=self.state_index_columns,
@@ -296,7 +321,11 @@ class GdnDeferredCommit:
         gc.collect()
         gc.disable()
         try:
-            with torch.cuda.graph(graph, stream=stream):
+            # thread_local: other threads (async output, RoCE allreduce
+            # helper) may make CUDA calls while this mid-serving capture runs.
+            with torch.cuda.graph(
+                graph, stream=stream, capture_error_mode="thread_local"
+            ):
                 self._launch()
         except Exception:
             # Correctness does not depend on the graph; only host time does.

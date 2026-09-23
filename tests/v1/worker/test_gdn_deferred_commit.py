@@ -131,18 +131,25 @@ _INTERPRETED = textwrap.dedent(
         windows = torch.zeros((4, 5), **i32)
         destination = torch.zeros(4, **i32)
         num_seqs = torch.zeros(1, **i32)
+        alias = torch.zeros(1, **i32)
         gather_gdn_commit_windows_kernel[(1,)](
             src, dst, table, table.stride(0), windows, destination, num_seqs,
-            MAX_REQS=4, BLOCK=4, COLUMNS=5)
+            alias, MAX_REQS=4, BLOCK=4, COLUMNS=5)
         assert windows[0].tolist() == table[0, 2:7].tolist()
         assert windows[2].tolist() == table[2, 4:9].tolist()
         assert destination.tolist() == [int(table[0, 1]), -1, int(table[2, 4]), -1]
-        assert int(num_seqs) == 4
+        assert int(num_seqs) == 4 and int(alias) == 0
     none = torch.full((4,), -1, **i32)
     gather_gdn_commit_windows_kernel[(1,)](
         none, none, table, table.stride(0), windows, destination, num_seqs,
-        MAX_REQS=4, BLOCK=4, COLUMNS=5)
+        alias, MAX_REQS=4, BLOCK=4, COLUMNS=5)
     assert int(num_seqs) == 0 and destination.tolist() == [-1] * 4
+    # A table that repeats a block id makes the destination name a record.
+    table[0, 4] = table[0, 1]
+    gather_gdn_commit_windows_kernel[(1,)](
+        src, dst, table, table.stride(0), windows, destination, num_seqs,
+        alias, MAX_REQS=4, BLOCK=4, COLUMNS=5)
+    assert int(alias) == 1, alias
     print("ok")
     """
 )
@@ -278,4 +285,83 @@ def test_commit_then_copy_matches_the_shipped_copy_across_three_groups():
                     assert float(deferred[group][src_block, 0]) == base[b]
                 checked += 1
         assert checked == 2 * groups
-    assert commit._graph is not None or commit._graph_failed
+    assert commit._graph is not None, "commit graph capture failed"
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+def test_precopy_driver_commits_in_place_then_migrates_like_the_shipped_copy():
+    from types import SimpleNamespace as NS
+
+    from vllm.v1.worker.mamba_utils import MambaSpecDecodeGPUContext
+
+    device = torch.device("cuda")
+    i32 = dict(dtype=torch.int32, device=device)
+    i64 = dict(dtype=torch.int64, device=device)
+    max_reqs, groups, blocks = 4, 3, 64
+    idx_mapping = torch.tensor([2, 0, 1], **i32)       # batch row -> slot
+    src_col = torch.tensor([2, 3, 1, -1], **i32)       # slot order
+    dst_col = torch.tensor([3, 3, 2, 0], **i32)        # slot 1: no migration
+    token_bias = torch.tensor([2, 1, 0, 0], **i32)     # slot 2: bias 0
+    base = [10.0, 20.0, 30.0]                          # batch-row order
+
+    tables, shipped, initial = [], [], []
+    for _ in range(groups):
+        table = (
+            torch.randperm(blocks - 1, device=device)[: max_reqs * 12]
+            .view(max_reqs, 12)
+            .to(torch.int32)
+        )
+        ship = torch.full((blocks, 2), -7.0, device=device)
+        defer = ship.clone()
+        for b in range(3):
+            src = int(src_col[int(idx_mapping[b])])
+            for j in range(5):
+                ship[int(table[b, src + j])] = base[b] + j
+                defer[int(table[b, src + j])] = base[b] if j == 0 else 1000.0 + j
+        tables.append(table)
+        shipped.append(ship)
+        initial.append(defer)
+    deferred = [p.clone() for p in initial]
+
+    def ctx(pools, commit):
+        return NS(
+            is_initialized=True,
+            total_states=groups,
+            block_table_ptrs=torch.tensor([t.data_ptr() for t in tables], **i64),
+            block_table_stride_req=tables[0].stride(0),
+            state_base_addrs=torch.tensor([p.data_ptr() for p in pools], **i64),
+            state_block_strides=torch.tensor(
+                [p.stride(0) * p.element_size() for p in pools], **i64
+            ),
+            state_elem_sizes=torch.tensor([4] * groups, **i32),
+            state_inner_sizes=torch.tensor([2] * groups, **i64),
+            state_conv_widths=torch.zeros(groups, **i32),
+            state_group_indices=torch.arange(groups, **i32),
+            state_dim_row_count=torch.zeros(groups, **i32),
+            state_dim_row_stride=torch.zeros(groups, **i64),
+            gdn_deferred_commit=commit,
+        )
+
+    run = MambaSpecDecodeGPUContext.run_fused_precopy
+    run(ctx(shipped, None), 3, dst_col, src_col, token_bias, idx_mapping)
+    commit = gdc.GdnDeferredCommit(
+        max_num_reqs=max_reqs,
+        state_index_columns=5,
+        device=device,
+        groups=[(tables[g], [_FakeGdnLayer(deferred[g])]) for g in range(groups)],
+    )
+    for _step in range(2):  # eager first use, then the captured graph
+        for group in range(groups):
+            deferred[group].copy_(initial[group])
+        run(ctx(deferred, commit), 3, dst_col, src_col, token_bias, idx_mapping)
+        torch.cuda.synchronize()
+        for group in range(groups):
+            for b in range(3):
+                r = int(idx_mapping[b])
+                if int(src_col[r]) == int(dst_col[r]):
+                    continue
+                dest = int(tables[group][b, int(dst_col[r])])
+                assert torch.equal(deferred[group][dest], shipped[group][dest]), (
+                    group, b, deferred[group][dest], shipped[group][dest])
+    assert commit._graph is not None, "commit graph capture failed"
+    assert int(commit.alias_errors) == 0

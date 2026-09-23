@@ -1346,6 +1346,23 @@ class MambaSpecDecodeGPUContext:
             deferred_layers.extend(layers)
         if not deferred_layers:
             return
+        # DEFERRED_TEMPORAL is a launch-wide constexpr: it changes every
+        # temporal copy in the fused copy kernels, so a mamba layer that is not
+        # a deferred GDN layer would silently lose its temporal state copy.
+        not_deferred = [
+            name
+            for group in self.layer_groups
+            for name in group.layer_specs
+            if not getattr(
+                forward_context.get(name), "b12x_gdn_deferred_checkpoints", False
+            )
+        ]
+        if not_deferred:
+            raise ValueError(
+                "deferred GDN checkpoints require every mamba layer to be a "
+                f"deferred b12x GDN layer; not deferred: {not_deferred[:4]}"
+                f"{' ...' if len(not_deferred) > 4 else ''}"
+            )
         columns = {int(layer.b12x_gdn_state_index_columns) for layer in deferred_layers}
         if len(columns) != 1:
             raise ValueError(
@@ -1950,23 +1967,19 @@ def preprocess_mamba(
         if prev_state_idx != -1 and prev_state_idx != curr_state_idx:
             accept_token_bias = int(input_batch.num_accepted_tokens_cpu[i]) - 1
             if deferred_columns and accept_token_bias > 0:
-                # Only the base and the records the commit will replay
-                # (columns 0..bias) must be distinct; null blocks (id 0, e.g.
-                # after a prefix hit followed by a long chunk) carry nothing.
+                # The base and the records the commit will replay (columns
+                # 0..bias) must be real, distinct blocks. Columns past the
+                # bias are not read and may be null (prefix hit + long chunk).
                 for gid in mamba_group_ids:
-                    window = [
-                        block
-                        for block in req_state.block_ids[gid][
-                            prev_state_idx : prev_state_idx + accept_token_bias + 1
-                        ]
-                        if block != 0
+                    window = req_state.block_ids[gid][
+                        prev_state_idx : prev_state_idx + accept_token_bias + 1
                     ]
-                    if len(set(window)) == len(window):
+                    if 0 not in window and len(set(window)) == len(window):
                         continue
                     raise ValueError(
-                        "deferred GDN checkpoints require a request's state "
-                        "window to hold distinct blocks; the running block "
-                        f"would be overwritten by a record. window={window}"
+                        "deferred GDN checkpoints require the base and replayed "
+                        "record blocks of a request to be distinct non-null "
+                        f"blocks; window={window}"
                     )
             if fused is not None:
                 assert accept_token_bias >= 0
