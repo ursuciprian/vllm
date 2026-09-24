@@ -227,7 +227,7 @@ class ParserEngine(Parser):
             attach_structural_tag(
                 request,
                 tool_parser_cls(self.model_tokenizer, request.tools),
-                reasoning=self._has_reasoning,
+                reasoning=False,
             )
         return request
 

@@ -2021,4 +2021,11 @@ def test_collapsed_qwen3_engine_forces_a_tool_call_grammar(tool_choice, forced):
         return
     tag = json.loads(request.structured_outputs.structural_tag)
     assert tag["type"] == "structural_tag" and "calculator" in json.dumps(tag)
+    # The grammar is only applied after StructuredOutputManager sees the
+    # reasoning end (should_fill_bitmask): the built tag itself must never
+    # carry a leading "</think>\n\n" reasoning section (xgrammar's builtin
+    # qwen template only adds that sequence wrapper when reasoning=True), or
+    # the bitmask would be filled while the model is still emitting
+    # <think>...</think>.
+    assert tag["format"]["type"] != "sequence"
     assert request.response_format is None
