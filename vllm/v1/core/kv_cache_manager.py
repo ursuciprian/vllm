@@ -321,6 +321,10 @@ class KVCacheManager:
         )
         computed_blocks, num_new_computed_tokens, num_uncached = (
             self.coordinator.find_longest_cache_hit(
+                request.block_hashes, max_cache_hit_length, request.all_token_ids
+            )
+            if self.coordinator.prefix_drop_exact
+            else self.coordinator.find_longest_cache_hit(
                 request.block_hashes, max_cache_hit_length
             )
         )

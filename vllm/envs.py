@@ -199,6 +199,7 @@ if TYPE_CHECKING:
     VLLM_B12X_MXFP8_ACTIVATION_MODE: Literal["auto", "a16", "quantized"] | None = None
     VLLM_B12X_BLOCKSCALED_WORKSPACE_MAX_BYTES: int = 2_000_000_000
     VLLM_MXFP8_LM_HEAD: bool = False
+    VLLM_PREFIX_DROP_EXACT: bool = False
     VLLM_LM_HEAD_A16: bool = True
     VLLM_QWEN3_8_FLASH_NEXT_MTP_COMPACT: bool = True
     VLLM_GDN_SPEC_DECODE_METADATA_FASTPATH: bool = True
@@ -1691,6 +1692,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     # Quantize eligible unquantized LM heads on b12x only when explicitly enabled.
     "VLLM_MXFP8_LM_HEAD": lambda: bool(int(os.getenv("VLLM_MXFP8_LM_HEAD", "0"))),
+    # EAGLE/MTP prefix caching: keep the last matched full block when the
+    # request's token after it equals the token the cached drafter KV was
+    # written with, instead of always dropping that block. Scheduler-only.
+    "VLLM_PREFIX_DROP_EXACT": lambda: bool(
+        int(os.getenv("VLLM_PREFIX_DROP_EXACT", "0"))
+    ),
     # Preserve BF16 activations in runtime-quantized NVFP4/MXFP8 LM heads.
     "VLLM_LM_HEAD_A16": lambda: bool(int(os.getenv("VLLM_LM_HEAD_A16", "1"))),
     "VLLM_QWEN3_8_FLASH_NEXT_MTP_COMPACT": lambda: bool(
@@ -2400,6 +2407,8 @@ def compile_factors() -> dict[str, object]:
         "VLLM_CACHE_ROOT",
         # Runtime memory-plan persistence; does not affect compiled graphs.
         "VLLM_ENABLE_STARTUP_PLAN",
+        # Scheduler-only prefix-cache policy; does not affect compiled graphs.
+        "VLLM_PREFIX_DROP_EXACT",
         # Location-only derived paths: where a cache/config directory lives
         # cannot affect compiled artifacts, and hashing them means relocating
         # HOME or the XDG roots silently invalidates every compile cache

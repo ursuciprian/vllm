@@ -4,6 +4,7 @@ from abc import ABC, abstractmethod
 from collections.abc import Sequence
 from typing import NamedTuple
 
+from vllm import envs
 from vllm.logger import init_logger
 from vllm.utils.math_utils import cdiv, round_down
 from vllm.v1.core.block_pool import BlockPool
@@ -69,6 +70,8 @@ class KVCacheCoordinator(ABC):
     """
 
     enable_partial_hash_hits = False
+    # VLLM_PREFIX_DROP_EXACT resolved for this coordinator (hybrid only).
+    prefix_drop_exact = False
 
     def __init__(
         self,
@@ -713,6 +716,18 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
             manager.hit_alignment_tokens = self._cache_hit_alignment_tokens
             manager.cache_internal_attention_anchors = has_internal_checkpoints
         self.verify_and_split_kv_cache_groups()
+        # Exact EAGLE drop: verify the one token after a full-block hit instead
+        # of always dropping the block. Covers a single prefill lookahead token
+        # (EAGLE, single-module MTP) and block-aligned hits only; multi-module
+        # MTP and fine-grained partial hits keep the unconditional drop.
+        self.prefix_drop_exact = (
+            envs.VLLM_PREFIX_DROP_EXACT
+            and enable_caching
+            and bool(self.eagle_group_ids)
+            and self.num_reprefillable_tokens == 0
+            and not self.enable_partial_hash_hits
+            and dcp_world_size == 1
+        )
 
     @property
     def _cache_hit_alignment_tokens(self) -> int:
@@ -827,17 +842,48 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
             # (``scheduler_block_size``); retention is passed separately so it
             # can keep both the coarse segment tails and the fine replay
             # boundary (which needs the fine value).
+            num_cached_before = manager.num_cached_block.get(request.request_id, 0)
             manager.cache_blocks(
                 request,
                 num_tokens_to_cache,
                 retention_interval=self.retention_interval,
                 alignment_tokens=self._cache_hit_alignment_tokens,
             )
+            if self.prefix_drop_exact and manager.use_eagle:
+                self._record_eagle_next_tokens(manager, request, num_cached_before)
+
+    @staticmethod
+    def _record_eagle_next_tokens(
+        manager: SingleTypeKVCacheManager, request: Request, num_cached_before: int
+    ) -> None:
+        """Stamp newly cached full blocks with the token that follows them.
+
+        The drafter wrote each block's last-position KV from that token (the
+        next prompt token at a chunk boundary, else the sampled token, which
+        becomes the next token). The previous last block is revisited because
+        its next token may have been unknown when it was cached. Never
+        overwrites: a block hit by another request carries its writer's token.
+        """
+        if type(manager) is not FullAttentionManager:
+            return
+        blocks = manager.req_to_blocks[request.request_id]
+        token_ids = request.all_token_ids
+        num_cached = manager.num_cached_block.get(request.request_id, 0)
+        for i in range(max(num_cached_before - 1, 0), num_cached):
+            end = (i + 1) * manager.block_size
+            block = blocks[i]
+            if (
+                end < len(token_ids)
+                and block.eagle_next_token is None
+                and block.block_hash is not None
+            ):
+                block.eagle_next_token = token_ids[end]
 
     def find_longest_cache_hit(
         self,
         block_hashes: list[BlockHash],
         max_cache_hit_length: int,
+        token_ids: Sequence[int] | None = None,
     ) -> tuple[tuple[list[KVCacheBlock], ...], int, int]:
         """
         Find the longest cache hit using an iterative fixed-point algorithm.
@@ -850,6 +896,9 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
         Args:
             block_hashes: The block hashes of the request.
             max_cache_hit_length: The maximum length of the cache hit.
+            token_ids: The request's tokens. With ``prefix_drop_exact``, a
+                full-attention EAGLE hit keeps its last block when the token
+                after it matches the block's ``eagle_next_token``.
 
         Returns:
             A tuple containing:
@@ -897,13 +946,23 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
                     continue
 
                 drop_eagle_block = use_eagle and idx not in eagle_verified
+                exact_drop = (
+                    drop_eagle_block
+                    and token_ids is not None
+                    and self.prefix_drop_exact
+                    and manager_cls is FullAttentionManager
+                )
 
                 _max_length = curr_hit_length
                 # EAGLE matches one extra drop unit (one hash unit for
                 # fine-grained managers, else one cache block) and then drops
                 # it, landing back at the candidate length. Managers whose
                 # finder does not drop receive no margin.
-                if drop_eagle_block and manager_cls.drops_eagle_block:
+                if (
+                    drop_eagle_block
+                    and manager_cls.drops_eagle_block
+                    and not exact_drop
+                ):
                     eagle_margin = (
                         self.hash_block_size
                         if self.enable_partial_hash_hits
@@ -920,7 +979,7 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
                     kv_cache_group_ids=group_ids,
                     block_pool=self.block_pool,
                     kv_cache_spec=spec,
-                    drop_eagle_block=drop_eagle_block,
+                    drop_eagle_block=drop_eagle_block and not exact_drop,
                     alignment_tokens=self._cache_hit_alignment_tokens,
                     dcp_world_size=(
                         self.dcp_world_size
@@ -928,6 +987,26 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
                         else 1
                     ),
                 )
+                if exact_drop and _new_hit_length > 0:
+                    assert token_ids is not None
+                    next_token = (
+                        token_ids[_new_hit_length]
+                        if _new_hit_length < len(token_ids)
+                        else None
+                    )
+                    if next_token is None or any(
+                        not blocks
+                        or blocks[-1].eagle_next_token != next_token
+                        or len(blocks) * group_block_size != _new_hit_length
+                        for blocks in hit_blocks
+                    ):
+                        # Unverified: same drop as the manager's EAGLE path.
+                        alignment = self._cache_hit_alignment_tokens
+                        _new_hit_length -= min(alignment, group_block_size)
+                        _new_hit_length -= _new_hit_length % alignment
+                        num_blocks = cdiv(_new_hit_length, group_block_size)
+                        for blocks in hit_blocks:
+                            del blocks[num_blocks:]
                 if drop_eagle_block:
                     eagle_verified.add(idx)
                 elif _new_hit_length < curr_hit_length:
