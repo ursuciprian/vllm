@@ -44,7 +44,8 @@ def test_flag_is_declared_and_feeds_the_compile_cache_key(monkeypatch):
 def test_refuse_reasons_cover_every_unsupported_mode():
     assert gdc.refuse_reasons(_config()) == []
     assert len(gdc.refuse_reasons(_config(mode="all"))) == 1
-    assert len(gdc.refuse_reasons(_config(boundary=True))) == 1
+    # Request-boundary checkpoints (policy auto) are served by the export.
+    assert gdc.refuse_reasons(_config(boundary=True)) == []
     assert len(gdc.refuse_reasons(_config(num_spec=0))) == 1
     assert len(gdc.refuse_reasons(_config(mode="none", num_spec=0))) == 2
     assert len(gdc.refuse_reasons(_config(), decode_kernel="triton")) == 1
@@ -485,6 +486,174 @@ def test_mixed_gdn_and_ple_group_under_the_triton_interpreter():
     code = (
         "import torch, tests.v1.worker.test_gdn_deferred_commit as t;"
         "t._mixed_group_case(torch.device('cpu')); print('ok')"
+    )
+    env = {**os.environ, "TRITON_INTERPRET": "1"}
+    result = subprocess.run(
+        [sys.executable, "-c", code], env=env, capture_output=True, text=True,
+        timeout=900,
+    )
+    assert result.returncode == 0, result.stderr[-4000:]
+    assert result.stdout.strip().endswith("ok")
+
+
+def _boundary_export_case(device):
+    """Request-boundary export with deferred checkpoints on, then the same
+    step's block-boundary postprocess, against the shipped path.
+
+    Rows (batch order): a response capture whose bias (2) differs from the
+    postprocess bias (1) of an in-place boundary commit; a response whose
+    accepted run ends exactly on the block boundary (capture bias 4 == the
+    in-place commit's bias); prompt + response captures at bias 0; and a
+    stop-truncated response (capture bias 1 < accepted - 1) next to a commit
+    into an earlier block. The export must equal the committed state at the
+    boundary, and must not disturb the window the postprocess commits from.
+    """
+    from types import SimpleNamespace as NS
+
+    from vllm.model_executor.layers.mamba.mamba_utils import is_conv_state_dim_first
+    from vllm.v1.core.boundary_checkpoint import (
+        NUM_BOUNDARY_CHECKPOINT_SLOTS as K,
+    )
+    from vllm.v1.core.boundary_checkpoint import (
+        PROMPT_CHECKPOINT_SLOT,
+        RESPONSE_CHECKPOINT_SLOT,
+    )
+    from vllm.v1.worker.mamba_utils import MambaSpecDecodeGPUContext
+
+    i32 = dict(dtype=torch.int32, device=device)
+    i64 = dict(dtype=torch.int64, device=device)
+    max_reqs, blocks, groups, block_size = 4, 64, 2, 8
+    idx_mapping = torch.tensor([1, 0, 3, 2], **i32)    # batch row -> slot
+    state_idx = torch.tensor([1, 1, 2, 2], **i32)      # slot order
+    accepted = torch.tensor([5, 3, 3, 1], **i32)
+    new_computed = torch.tensor([16, 17, 16, 9], **i32)
+    capture = {  # batch row -> {kind: (tokens, bias)}
+        0: {RESPONSE_CHECKPOINT_SLOT: (17, 2)},
+        1: {RESPONSE_CHECKPOINT_SLOT: (16, 4)},
+        2: {PROMPT_CHECKPOINT_SLOT: (9, 0), RESPONSE_CHECKPOINT_SLOT: (9, 0)},
+        3: {RESPONSE_CHECKPOINT_SLOT: (15, 1)},
+    }
+    capture_tokens = torch.zeros((4, K), **i32)
+    capture_bias = torch.zeros((4, K), **i32)
+    destination_blocks = torch.zeros((max_reqs, K, groups), **i32)
+    spare = iter(range(48, blocks))  # capture blocks, outside every table
+    for b, kinds in capture.items():
+        for kind, (tokens, bias) in kinds.items():
+            capture_tokens[b, kind], capture_bias[b, kind] = tokens, bias
+            for g in range(groups):
+                destination_blocks[int(idx_mapping[b]), kind, g] = next(spare)
+
+    generator = torch.Generator().manual_seed(11)
+    tables = [
+        torch.randperm(48, generator=generator)[: max_reqs * 12]
+        .view(max_reqs, 12).to(torch.int32).to(device)
+        for _ in range(groups)
+    ]
+    ds = is_conv_state_dim_first()
+    conv_shape = (blocks, 6, 4) if ds else (blocks, 4, 6)
+    shipped = {
+        "conv0": torch.randn(conv_shape, generator=generator).to(device),
+        "temporal0": torch.full((blocks, 2), -7.0, device=device),
+        "temporal1": torch.full((blocks, 2), -7.0, device=device),
+    }
+    deferred = {k: v.clone() for k, v in shipped.items()}
+    base = [10.0, 20.0, 30.0, 40.0]
+    for g in range(groups):
+        for b in range(4):
+            src = int(state_idx[int(idx_mapping[b])])
+            for j in range(5):
+                block = int(tables[g][b, src + j])
+                shipped[f"temporal{g}"][block] = base[b] + j
+                deferred[f"temporal{g}"][block] = base[b] if j == 0 else 1000 + j
+    order = ["conv0", "temporal0", "temporal1"]
+
+    def ctx(pools, commit, flags):
+        conv = [name.startswith("conv") for name in order]
+        t = [pools[name] for name in order]
+        return NS(
+            is_initialized=True,
+            num_groups=groups,
+            total_states=len(order),
+            block_size=block_size,
+            num_accepted_tokens_out=torch.zeros(max_reqs, **i32),
+            block_table_ptrs=torch.tensor([x.data_ptr() for x in tables], **i64),
+            block_table_stride_req=tables[0].stride(0),
+            state_base_addrs=torch.tensor([x.data_ptr() for x in t], **i64),
+            state_block_strides=torch.tensor(
+                [x.stride(0) * x.element_size() for x in t], **i64
+            ),
+            state_elem_sizes=torch.tensor([x.element_size() for x in t], **i32),
+            state_inner_sizes=torch.tensor(
+                [(1 if ds else x.stride(1)) if c else x[0].numel()
+                 for x, c in zip(t, conv)], **i64
+            ),
+            state_conv_widths=torch.tensor(
+                [(x.size(2) if ds else x.size(1)) if c else 0
+                 for x, c in zip(t, conv)], **i32
+            ),
+            state_group_indices=torch.tensor([0, 0, 1], **i32),
+            state_dim_row_count=torch.tensor(
+                [x.size(1) if (c and ds) else 0 for x, c in zip(t, conv)], **i32
+            ),
+            state_dim_row_stride=torch.tensor(
+                [x.stride(1) * x.element_size() if (c and ds) else 0
+                 for x, c in zip(t, conv)], **i64
+            ),
+            state_temporal_deferred=torch.tensor(flags, **i32),
+            gdn_deferred_commit=commit,
+        )
+
+    def step(context):
+        MambaSpecDecodeGPUContext.checkpoint_request_boundaries(
+            context, idx_mapping, state_idx, capture_tokens, capture_bias,
+            destination_blocks)
+        MambaSpecDecodeGPUContext.run_fused_postprocess_align(
+            context, 4, accepted.clone(), state_idx, new_computed, idx_mapping)
+
+    step(ctx(shipped, None, [0, 0, 0]))
+    commit = gdc.GdnDeferredCommit(
+        max_num_reqs=max_reqs, state_index_columns=5, device=device,
+        groups=[(tables[g], [_FakeGdnLayer(deferred[f"temporal{g}"])])
+                for g in range(groups)],
+    )
+    step(ctx(deferred, commit, [0, 1, 1]))
+    if device.type == "cuda":
+        torch.cuda.synchronize()
+
+    for name in order:
+        g = 0 if name == "conv0" else int(name[-1])
+        for b, kinds in capture.items():
+            for kind in kinds:
+                block = int(destination_blocks[int(idx_mapping[b]), kind, g])
+                assert torch.equal(deferred[name][block], shipped[name][block]), (
+                    name, b, kind, deferred[name][block], shipped[name][block])
+    for g in range(groups):
+        pool, ref = deferred[f"temporal{g}"], shipped[f"temporal{g}"]
+        for b in range(4):
+            r = int(idx_mapping[b])
+            running = int(new_computed[r]) - int(accepted[r]) + 1
+            aligned = int(new_computed[r]) // block_size * block_size
+            if aligned < running:
+                continue
+            dest = int(tables[g][b, aligned // block_size - 1])
+            assert torch.equal(pool[dest], ref[dest]), (g, b)
+            src = int(tables[g][b, int(state_idx[r])])
+            if src != dest:
+                assert float(pool[src, 0]) == base[b], (g, b)
+    assert int(commit.alias_errors) == 0
+    assert int((commit.src_col >= 0).sum()) == 0
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+def test_boundary_export_equals_the_committed_state():
+    _boundary_export_case(torch.device("cuda"))
+
+
+def test_boundary_export_under_the_triton_interpreter():
+    pytest.importorskip("triton")
+    code = (
+        "import torch, tests.v1.worker.test_gdn_deferred_commit as t;"
+        "t._boundary_export_case(torch.device('cpu')); print('ok')"
     )
     env = {**os.environ, "TRITON_INTERPRET": "1"}
     result = subprocess.run(

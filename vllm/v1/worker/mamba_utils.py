@@ -20,7 +20,10 @@ from vllm.triton_utils import tl, triton
 from vllm.utils.gpu_sync_debug import gpu_sync_allowed
 from vllm.utils.math_utils import cdiv
 from vllm.v1.attention.backends.registry import MambaAttentionBackendEnum
-from vllm.v1.core.boundary_checkpoint import NUM_BOUNDARY_CHECKPOINT_SLOTS
+from vllm.v1.core.boundary_checkpoint import (
+    NUM_BOUNDARY_CHECKPOINT_SLOTS,
+    RESPONSE_CHECKPOINT_SLOT,
+)
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.kv_cache_interface import (
     KVCacheConfig,
@@ -412,6 +415,8 @@ def checkpoint_mamba_states_kernel(
     NUM_CAPTURES: tl.constexpr,
     CONV_STATE_DIM_FIRST: tl.constexpr,
     TEMPORAL_TILES: tl.constexpr,
+    DEFERRED_TEMPORAL: tl.constexpr = False,
+    state_temporal_deferred_ptr=None,
 ):
     batch_idx = tl.program_id(0) // NUM_CAPTURES
     kind = tl.program_id(0) % NUM_CAPTURES
@@ -432,17 +437,20 @@ def checkpoint_mamba_states_kernel(
     )
     if destination <= 0:
         return
-    # Boundary checkpoints keep the checkpoint-column contract: deferred GDN
-    # checkpoints are refused when request-boundary checkpointing is on,
-    # because one capture can ask for several distinct biases per request and
-    # a single accepted-prefix commit cannot express that.
+    # Deferred GDN temporal states: column token_bias > 0 is a record, and the
+    # export commit has already written the destination (gdn_deferred_commit).
+    # Column 0 is a full state in both modes, so bias 0 keeps this copy.
+    temporal_bias = token_bias
+    if DEFERRED_TEMPORAL:
+        if token_bias > 0 and tl.load(state_temporal_deferred_ptr + state_idx) != 0:
+            temporal_bias = -1
     _copy_mamba_state_block(
         state_idx,
         batch_idx,
         src_col,
         0,
         token_bias,
-        token_bias,
+        temporal_bias,
         block_table_ptrs_ptr,
         block_table_stride_req,
         state_base_addrs_ptr,
@@ -1645,6 +1653,29 @@ class MambaSpecDecodeGPUContext:
         )
         if not num_reqs:
             return
+        deferred = self.gdn_deferred_commit
+        exporting = deferred is not None and deferred.active
+        if exporting:
+            # Commit-then-export; see vllm/v1/worker/gdn_deferred_commit.
+            from vllm.v1.worker.gdn_deferred_commit import (
+                boundary_export_decision_kernel,
+            )
+
+            boundary_export_decision_kernel[(num_reqs,)](
+                idx_mapping,
+                state_idx,
+                capture_tokens,
+                capture_bias,
+                destination_blocks,
+                deferred.src_col,
+                deferred.accepted,
+                deferred.export_destination,
+                MAX_REQS=deferred.max_num_reqs,
+                NUM_GROUPS=self.num_groups,
+                NUM_CAPTURES=NUM_BOUNDARY_CHECKPOINT_SLOTS,
+                KIND=RESPONSE_CHECKPOINT_SLOT,
+            )
+            deferred.commit(export=True)
         checkpoint_mamba_states_kernel[
             (
                 num_reqs * NUM_BOUNDARY_CHECKPOINT_SLOTS,
@@ -1671,6 +1702,8 @@ class MambaSpecDecodeGPUContext:
             NUM_CAPTURES=NUM_BOUNDARY_CHECKPOINT_SLOTS,
             CONV_STATE_DIM_FIRST=is_conv_state_dim_first(),
             TEMPORAL_TILES=_TEMPORAL_TILES,
+            DEFERRED_TEMPORAL=exporting,
+            state_temporal_deferred_ptr=self.state_temporal_deferred,
         )
 
     def run_fused_postprocess_align(

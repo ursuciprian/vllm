@@ -12,8 +12,8 @@ the six state snapshots the kernel moves per layer-step.
 The consequence for this file: **the running block is no longer the committed
 state**, and the speculative blocks are no longer checkpoints. Every reader
 outside the decode kernel must first ask b12x to materialize the accepted
-prefix. There are exactly two such readers under align mamba cache mode, both
-block-boundary state copies:
+prefix. There are three such readers under align mamba cache mode, two
+block-boundary state copies and one export:
 
 * ``postprocess_mamba_fused_kernel`` -- same step, right after the sampler.
 * ``precopy_mamba_align_fused_kernel`` -- next step, the CPU-metadata fallback.
@@ -46,11 +46,27 @@ Both run decide -> commit -> copy; they differ in where the commit writes:
    states and other mamba layers (e.g. the PLE short conv) keep the shipped
    copy, so they behave identically with the flag on or off.
 
-A third reader exists and is refused rather than handled:
-``checkpoint_mamba_states_kernel`` (request-boundary checkpoints) can ask for
-up to three different capture biases for one request in one launch, and a
-single accepted-prefix commit cannot express that. See
-:func:`refuse_reasons`.
+The third reader is ``checkpoint_mamba_states_kernel``: request-boundary
+checkpoints (``--recurrent-checkpoint-policy auto`` resolves to them for this
+model) export a request's committed state at the prompt, instruction and
+response endpoints into budgeted blocks outside its window. It runs right after
+the sampler, before the block-boundary postprocess, and exports without
+touching the window (commit-then-export):
+
+* Prompt and instruction captures always ask for bias 0 (they happen on a
+  prefill step, see ``prepare_boundary_capture``), and so does a response
+  that ends on the first verified token. Column 0 already holds exactly that
+  state in both modes -- prefill writes a full state there and the deferred
+  decode kernel writes its full base checkpoint there -- so the shipped copy
+  stays.
+* A response capture with bias ``b > 0`` would select speculative column
+  ``b``, which is a record now. :func:`boundary_export_decision_kernel` turns
+  those rows into commits of ``b + 1`` accepted tokens straight into the
+  capture's own destination block (one per mamba group), and the copy kernel
+  skips the temporal copy for deferred GDN states with ``b > 0``. The commit
+  reads the window and writes only the destination, so the window's base and
+  records are intact for the block-boundary commit that follows in the same
+  step, and for the next decode step.
 """
 
 from __future__ import annotations
@@ -99,12 +115,6 @@ def refuse_reasons(
         reasons.append(
             "requires --mamba-cache-mode align (the speculative columns are "
             "only exclusively owned in align mode)"
-        )
-    if getattr(vllm_config, "use_request_boundary_checkpoints", False):
-        reasons.append(
-            "is incompatible with request-boundary checkpoints: one capture "
-            "can request several distinct biases for the same request and a "
-            "single accepted-prefix commit cannot express that"
         )
     num_spec = 0
     speculative_config = getattr(vllm_config, "speculative_config", None)
@@ -166,6 +176,8 @@ def gather_gdn_commit_windows_kernel(
     MAX_REQS: tl.constexpr,
     BLOCK: tl.constexpr,
     COLUMNS: tl.constexpr,
+    EXPLICIT_DST: tl.constexpr = False,
+    explicit_destination_ptr=None,  # [MAX_REQS] block ids, read iff EXPLICIT_DST
 ):
     """Shape one mamba group's commit windows the way b12x's commit expects.
 
@@ -174,8 +186,10 @@ def gather_gdn_commit_windows_kernel(
     order the decision kernels write and the block table uses.
     ``out_state_indices[r, j] = block_table[r, src_col + j]`` (column 0 is the
     base, 1.. are that step's record blocks) and the destination is
-    ``block_table[r, dst_col]``. With no committing row, ``num_seqs`` is 0 and
-    b12x's commit exits without touching the pool.
+    ``block_table[r, dst_col]``, or ``explicit_destination[r]`` (a block id,
+    -1 = skip) under ``EXPLICIT_DST`` -- the boundary export, whose
+    destination is a capture block outside the table. With no committing row,
+    ``num_seqs`` is 0 and b12x's commit exits without touching the pool.
     """
     rows = tl.arange(0, BLOCK)
     in_range = rows < MAX_REQS
@@ -186,7 +200,11 @@ def gather_gdn_commit_windows_kernel(
     for column in tl.static_range(COLUMNS):
         block = tl.load(row_base + src + column, mask=live, other=0)
         tl.store(out_state_indices_ptr + rows * COLUMNS + column, block, mask=in_range)
-    destination = tl.load(row_base + dst, mask=live, other=-1)
+    if EXPLICIT_DST:
+        destination = tl.load(explicit_destination_ptr + rows, mask=live, other=-1)
+        live = live & (destination >= 0)
+    else:
+        destination = tl.load(row_base + dst, mask=live, other=-1)
     # b12x refuses (silently skips) a destination that names one of the
     # row's record blocks. dst <= src makes that impossible unless the block
     # table repeats an id; count it on device so it is observable without a
@@ -201,6 +219,50 @@ def gather_gdn_commit_windows_kernel(
     )
     any_live = tl.max(live.to(tl.int32), axis=0)
     tl.store(out_num_seqs_ptr, any_live * MAX_REQS)
+
+
+@triton.jit
+def boundary_export_decision_kernel(
+    idx_mapping_ptr,  # [num_reqs] batch row -> request slot, -1 = masked
+    state_idx_ptr,  # [max_reqs] running column per slot
+    capture_tokens_ptr,  # [num_reqs, NUM_CAPTURES]
+    capture_bias_ptr,  # [num_reqs, NUM_CAPTURES]
+    destination_blocks_ptr,  # [max_reqs, NUM_CAPTURES, NUM_GROUPS]
+    commit_src_col_ptr,  # [MAX_REQS] out
+    commit_accepted_ptr,  # [MAX_REQS] out
+    export_destination_ptr,  # [NUM_GROUPS, MAX_REQS] out
+    MAX_REQS: tl.constexpr,
+    NUM_GROUPS: tl.constexpr,
+    NUM_CAPTURES: tl.constexpr,
+    KIND: tl.constexpr,
+):
+    """Turn a capture of speculative column ``b > 0`` into an export commit.
+
+    One program per batch row. Only ``KIND`` (the response slot) can carry a
+    bias; the other captures are bias 0 and keep the shipped copy.
+    """
+    batch_idx = tl.program_id(0)
+    offset = batch_idx * NUM_CAPTURES + KIND
+    if tl.load(capture_tokens_ptr + offset) <= 0:
+        return
+    bias = tl.load(capture_bias_ptr + offset)
+    if bias <= 0:
+        return
+    req_idx = tl.load(idx_mapping_ptr + batch_idx)
+    if req_idx < 0:
+        return
+    tl.store(commit_src_col_ptr + batch_idx, tl.load(state_idx_ptr + req_idx))
+    tl.store(commit_accepted_ptr + batch_idx, bias + 1)
+    for group in tl.static_range(NUM_GROUPS):
+        block = tl.load(
+            destination_blocks_ptr
+            + (req_idx * NUM_CAPTURES + KIND) * NUM_GROUPS
+            + group
+        )
+        tl.store(
+            export_destination_ptr + group * MAX_REQS + batch_idx,
+            tl.where(block > 0, block, -1),
+        )
 
 
 class _GroupCommit:
@@ -226,7 +288,9 @@ class GdnDeferredCommit:
     Per step the drivers launch one decision kernel and then call
     :meth:`commit`, which replays one CUDA graph holding every group's gather,
     every layer's commit and the decision-buffer reset. All buffers have fixed
-    addresses, and the live batch size never enters a launch.
+    addresses, and the live batch size never enters a launch. The boundary
+    export uses the same buffers with explicit per-group destinations
+    (``export_destination``) and its own graph.
     """
 
     def __init__(
@@ -249,6 +313,10 @@ class GdnDeferredCommit:
         # Device-side count of commits b12x would refuse; read it when
         # debugging, never on the hot path.
         self.alias_errors = torch.zeros((1,), **factory)
+        # [group, row] capture block ids for commit(export=True), -1 = skip.
+        self.export_destination = torch.full(
+            (len(groups), self.max_num_reqs), -1, **factory
+        )
         self.groups = [
             _GroupCommit(
                 table,
@@ -263,16 +331,20 @@ class GdnDeferredCommit:
             )
             for table, layers in groups
         ]
-        self._graph: torch.cuda.CUDAGraph | None = None
+        self._graphs: dict[bool, torch.cuda.CUDAGraph] = {}
         self._graph_failed = False
 
     @property
     def active(self) -> bool:
         return any(group.layers for group in self.groups)
 
-    def _launch(self) -> None:
+    @property
+    def _graph(self) -> torch.cuda.CUDAGraph | None:
+        return self._graphs.get(False)
+
+    def _launch(self, export: bool) -> None:
         block = triton.next_power_of_2(self.max_num_reqs)
-        for group in self.groups:
+        for index, group in enumerate(self.groups):
             if not group.layers:
                 continue
             gather_gdn_commit_windows_kernel[(1,)](
@@ -287,6 +359,8 @@ class GdnDeferredCommit:
                 MAX_REQS=self.max_num_reqs,
                 BLOCK=block,
                 COLUMNS=self.state_index_columns,
+                EXPLICIT_DST=export,
+                explicit_destination_ptr=self.export_destination[index],
             )
             for layer in group.layers:
                 layer.commit_b12x_gdn_deferred(
@@ -298,19 +372,24 @@ class GdnDeferredCommit:
         self.src_col.fill_(-1)
         self.dst_col.fill_(-1)
 
-    def commit(self) -> None:
-        """Replay each committing request's accepted prefix, then reset."""
+    def commit(self, export: bool = False) -> None:
+        """Replay each committing request's accepted prefix, then reset.
+
+        ``export=True`` writes ``export_destination`` instead of the block
+        table's ``dst_col`` block and leaves the window untouched.
+        """
         if not self.active:
             return
-        if self._graph is not None:
-            self._graph.replay()
+        graph = self._graphs.get(export)
+        if graph is not None:
+            graph.replay()
             return
         # First use runs eagerly (compiles the gather, warms the commit), then
         # captures the same launches for every later step.
-        self._launch()
-        self._capture()
+        self._launch(export)
+        self._capture(export)
 
-    def _capture(self) -> None:
+    def _capture(self, export: bool) -> None:
         if (
             self._graph_failed
             or self.src_col.device.type != "cuda"
@@ -331,7 +410,7 @@ class GdnDeferredCommit:
             with torch.cuda.graph(
                 graph, stream=stream, capture_error_mode="thread_local"
             ):
-                self._launch()
+                self._launch(export)
         except Exception:
             # Correctness does not depend on the graph; only host time does.
             self._graph_failed = True
@@ -345,7 +424,7 @@ class GdnDeferredCommit:
             if gc_enabled:
                 gc.enable()
         torch.cuda.current_stream().wait_stream(stream)
-        self._graph = graph
+        self._graphs[export] = graph
 
 
 def precompile_all(forward_context: dict[str, Any]) -> int:

@@ -1253,8 +1253,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # for one base checkpoint plus compact per-token records, replaying the
     # accepted prefix instead of selecting a checkpoint column. Requires the
     # b12x branch that implements Caps(deferred_checkpoints=...), the b12x GDN
-    # decode kernel, align mamba cache mode, and no request-boundary
-    # checkpoints. Off by default.
+    # decode kernel and align mamba cache mode; request-boundary checkpoints
+    # (policy auto) export through an accepted-prefix commit. Off by default.
     "VLLM_GDN_DEFERRED_CHECKPOINTS": lambda: (
         os.getenv("VLLM_GDN_DEFERRED_CHECKPOINTS", "0").lower()
         in ("true", "1", "yes", "on")
