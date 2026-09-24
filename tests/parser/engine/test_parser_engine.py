@@ -912,7 +912,9 @@ def test_parser_manager_uses_shared_engine_directly(monkeypatch):
     )
 
     assert parser_cls is not None
-    assert parser_cls is _CombinedTestEngine
+    # A per-call subclass: the shared engine class is never mutated.
+    assert issubclass(parser_cls, _CombinedTestEngine)
+    assert parser_cls.tool_parser_cls is _CombinedToolAdapter
     parser = parser_cls(make_mock_tokenizer(_VOCAB))
     request = _make_delegating_request()
     reasoning, content, _ = parser.parse(
@@ -1962,3 +1964,61 @@ class TestDropSpecialTokens:
             e.value for e in events if e.type == EventType.REASONING_CHUNK
         )
         assert "<bos>" not in reasoning_text
+
+
+# ── tool_choice=required on the collapsed engine (TC-45) ────────────
+
+
+_CALCULATOR = {
+    "type": "function",
+    "function": {
+        "name": "calculator",
+        "description": "Evaluate an arithmetic expression",
+        "parameters": {
+            "type": "object",
+            "properties": {"expression": {"type": "string"}},
+            "required": ["expression"],
+        },
+    },
+}
+
+
+@pytest.mark.parametrize(
+    "tool_choice, forced",
+    [
+        ("required", True),
+        ({"type": "function", "function": {"name": "calculator"}}, True),
+        ("auto", False),
+        ("none", False),
+    ],
+)
+def test_collapsed_qwen3_engine_forces_a_tool_call_grammar(tool_choice, forced):
+    """Qwen3's reasoning + tool parsers collapse onto one ParserEngine, whose
+    adjust_request used to build no structural tag at all, so
+    tool_choice=required was silently unconstrained."""
+    from vllm.parser.qwen3 import Qwen3Parser
+
+    parser_cls = ParserManager.get_parser(
+        tool_parser_name="qwen3_xml",
+        reasoning_parser_name="qwen3",
+        enable_auto_tools=True,
+    )
+    assert issubclass(parser_cls, Qwen3Parser) and parser_cls is not Qwen3Parser
+    assert parser_cls.tool_parser_cls.structural_tag_model == "qwen_3_coder"
+    assert getattr(Qwen3Parser.tool_parser_cls, "structural_tag_model", None) is None
+
+    request = ChatCompletionRequest(
+        model="m",
+        messages=[{"role": "user", "content": "What is 7 times 8?"}],
+        tools=[_CALCULATOR],
+        tool_choice=tool_choice,
+        response_format={"type": "text"},
+    )
+    parser_cls(make_mock_tokenizer(_VOCAB)).adjust_request(request)
+
+    if not forced:
+        assert request.structured_outputs is None
+        return
+    tag = json.loads(request.structured_outputs.structural_tag)
+    assert tag["type"] == "structural_tag" and "calculator" in json.dumps(tag)
+    assert request.response_format is None
