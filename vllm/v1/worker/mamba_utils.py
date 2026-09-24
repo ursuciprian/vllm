@@ -1292,11 +1292,8 @@ class MambaSpecDecodeGPUContext:
                         # (state_block_stride would be the page size, too big).
                         self.state_conv_widths[idx] = 0
                         self.state_temporal_deferred[idx] = int(
-                            bool(
-                                getattr(
-                                    attention, "b12x_gdn_deferred_checkpoints", False
-                                )
-                            )
+                            getattr(attention, "b12x_gdn_deferred_checkpoints", None)
+                            is True
                         )
                         self.state_inner_sizes[idx] = (
                             state[0].numel() if state.dim() > 1 else 1
@@ -1367,7 +1364,7 @@ class MambaSpecDecodeGPUContext:
                 for name in group.layer_specs
                 if getattr(
                     forward_context.get(name), "b12x_gdn_deferred_checkpoints", False
-                )
+                ) is True
             ]
             groups.append((block_table, layers))
             deferred_layers.extend(layers)
@@ -1397,9 +1394,9 @@ class MambaSpecDecodeGPUContext:
             for group in self.layer_groups
             for name, spec in group.layer_specs.items()
             if spec.mamba_type == MambaAttentionBackendEnum.GDN_ATTN
-            and not getattr(
+            and getattr(
                 forward_context.get(name), "b12x_gdn_deferred_checkpoints", False
-            )
+            ) is not True
         ]
         if not_deferred:
             raise ValueError(

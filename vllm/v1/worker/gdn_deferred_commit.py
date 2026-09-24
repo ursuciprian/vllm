@@ -255,7 +255,7 @@ class GdnDeferredCommit:
                 [
                     layer
                     for layer in layers
-                    if getattr(layer, "b12x_gdn_deferred_checkpoints", False)
+                    if getattr(layer, "b12x_gdn_deferred_checkpoints", False) is True
                 ],
                 self.max_num_reqs,
                 self.state_index_columns,
@@ -357,7 +357,7 @@ def precompile_all(forward_context: dict[str, Any]) -> int:
     """
     count = 0
     for layer in forward_context.values():
-        if getattr(layer, "b12x_gdn_deferred_checkpoints", False):
+        if getattr(layer, "b12x_gdn_deferred_checkpoints", False) is True:
             layer.precompile_b12x_gdn_deferred_commit()
             count += 1
     return count
