@@ -366,6 +366,11 @@ class Scheduler(SchedulerInterface):
             max_concurrent_batches=vllm_config.max_concurrent_batches,
             num_lookahead_tokens=self.num_lookahead_tokens,
         )
+        # VLLM_PREFIX_DROP_EXACT: lookup keeps a hit's last block when the token
+        # after it matches, so prefill must materialize the recurrent state at
+        # the last full boundary rather than one block before it.
+        if self.kv_cache_manager.coordinator.prefix_drop_exact:
+            self.drop_last_prefix_cache_block = False
         # Bind GPU block pool to the KV connector. This must happen after
         # kv_cache_manager is constructed so block_pool is available.
         if self.connector is not None:

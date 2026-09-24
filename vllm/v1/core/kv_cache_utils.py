@@ -183,6 +183,12 @@ class KVCacheBlock:
     # Whether the block is a null block that should never be cached.
     is_null: bool = False
 
+    # EAGLE/MTP groups (VLLM_PREFIX_DROP_EXACT): the token that followed this
+    # full block in the request that wrote it. The drafter KV at the block's
+    # last position was computed from that token, so a hit ending here is
+    # exact only for a request with the same next token.
+    eagle_next_token: int | None = None
+
     @property
     def block_hash(self) -> BlockHashWithGroupId | None:
         return self._block_hash
@@ -206,6 +212,7 @@ class KVCacheBlock:
         """Reset the block hash when the block is evicted."""
         self._block_hash = None
         self._block_hash_num_tokens = None
+        self.eagle_next_token = None
 
     def __repr__(self) -> str:
         # Use block_id instead of KVCacheBlock object to avoid calling __repr__
