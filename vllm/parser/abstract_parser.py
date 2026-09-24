@@ -590,13 +590,9 @@ class DelegatingParser(Parser):
             and self._tool_parser.structural_tag_model is not None
             and needs_structural_tag(request)
         ):
-            # reasoning=True lets the grammar admit the <think> block a
-            # reasoning parser makes the model open every completion with.
-            attach_structural_tag(
-                request,
-                self._tool_parser,
-                reasoning=self._reasoning_parser is not None,
-            )
+            # reasoning=False as upstream: with a reasoning parser the grammar
+            # only applies once reasoning has ended (StructuredOutputManager).
+            attach_structural_tag(request, self._tool_parser, reasoning=False)
         return request
 
     def extract_reasoning_streaming(
