@@ -6,6 +6,7 @@ from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 from typing import Literal, overload
 
+from vllm import envs
 from vllm.distributed.kv_events import BlockStored, KVCacheEvent
 from vllm.logger import init_logger
 from vllm.utils.math_utils import cdiv
@@ -224,6 +225,17 @@ class KVCacheManager:
                 default=0,
             ),
         )
+        if envs.VLLM_PREFIX_DROP_EXACT and enable_caching:
+            if not isinstance(self.coordinator, HybridKVCacheCoordinator):
+                logger.info_once(
+                    "VLLM_PREFIX_DROP_EXACT resolved off (not a hybrid KV cache)."
+                )
+            elif self.boundary_checkpoints is not None:
+                logger.info_once(
+                    "VLLM_PREFIX_DROP_EXACT: request-boundary checkpoints are "
+                    "on; requests they support skip block lookup, so the flag "
+                    "applies only to the others."
+                )
         if self.boundary_checkpoints is not None:
             logger.info(
                 "Request-boundary recurrent checkpoint caching is enabled. "
@@ -319,12 +331,14 @@ class KVCacheManager:
         max_cache_hit_length = max(
             0, request.num_tokens - max(1, self.coordinator.prefill_replay_tokens)
         )
+        coordinator = self.coordinator
         computed_blocks, num_new_computed_tokens, num_uncached = (
-            self.coordinator.find_longest_cache_hit(
+            coordinator.find_longest_cache_hit(
                 request.block_hashes, max_cache_hit_length, request.all_token_ids
             )
-            if self.coordinator.prefix_drop_exact
-            else self.coordinator.find_longest_cache_hit(
+            if isinstance(coordinator, HybridKVCacheCoordinator)
+            and coordinator.prefix_drop_exact
+            else coordinator.find_longest_cache_hit(
                 request.block_hashes, max_cache_hit_length
             )
         )

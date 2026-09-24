@@ -609,12 +609,21 @@ class VllmConfig:
             and not model.enable_sleep_mode
             and not model.enable_return_routed_experts
             and self.lora_config is None
-            and model.hf_text_config.model_type
-            in (
-                "qwen3_8_flash_next_text",
-                "qwen3_8_flash_next",
-                "glm5_next_text",
-                "glm5_next",
+            and (
+                model.hf_text_config.model_type
+                in (
+                    "qwen3_8_flash_next_text",
+                    "qwen3_8_flash_next",
+                    "glm5_next_text",
+                    "glm5_next",
+                )
+                # Qwen3.8-Flash-Next checkpoints published as qwen4_exp load
+                # the same model; opt in explicitly until validated on GPU.
+                or (
+                    cache.recurrent_checkpoint_policy == "request_boundaries"
+                    and model.hf_text_config.model_type
+                    in ("qwen4_exp_text", "qwen4_exp")
+                )
             )
             and (
                 self.speculative_config is None

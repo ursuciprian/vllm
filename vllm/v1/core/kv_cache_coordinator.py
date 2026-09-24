@@ -720,14 +720,23 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
         # of always dropping the block. Covers a single prefill lookahead token
         # (EAGLE, single-module MTP) and block-aligned hits only; multi-module
         # MTP and fine-grained partial hits keep the unconditional drop.
-        self.prefix_drop_exact = (
-            envs.VLLM_PREFIX_DROP_EXACT
-            and enable_caching
-            and bool(self.eagle_group_ids)
-            and self.num_reprefillable_tokens == 0
-            and not self.enable_partial_hash_hits
-            and dcp_world_size == 1
-        )
+        if envs.VLLM_PREFIX_DROP_EXACT and enable_caching:
+            off = [
+                reason
+                for reason, applies in (
+                    ("no EAGLE/MTP drafter", not self.eagle_group_ids),
+                    ("multi-token prefill lookahead", self.num_reprefillable_tokens),
+                    ("fine-grained prefix hits", self.enable_partial_hash_hits),
+                    ("DCP", dcp_world_size > 1),
+                )
+                if applies
+            ]
+            self.prefix_drop_exact = not off
+            logger.info_once(
+                "VLLM_PREFIX_DROP_EXACT resolved %s%s.",
+                "off" if off else "on",
+                f" ({', '.join(off)})" if off else "",
+            )
 
     @property
     def _cache_hit_alignment_tokens(self) -> int:

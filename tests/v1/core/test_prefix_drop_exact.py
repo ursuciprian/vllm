@@ -22,6 +22,7 @@ from vllm.v1.kv_cache_interface import (
     KVCacheGroupSpec,
     MambaSpec,
 )
+from vllm.v1.request import RequestStatus
 
 from .test_prefix_caching import make_kv_cache_manager, make_request
 
@@ -90,7 +91,7 @@ def _prefill(manager, request, use_eagle: bool = True) -> list[int]:
     )
     computed, num_computed, _ = manager.get_computed_blocks(request)
     request.num_computed_tokens = num_computed
-    ends = []
+    ends: list[int] = []
     while request.num_computed_tokens < request.num_tokens:
         n = min(BUDGET, request.num_tokens - request.num_computed_tokens)
         n = Scheduler._mamba_block_aligned_split(stub, request, n)
@@ -205,3 +206,131 @@ def test_eviction_clears_next_token(monkeypatch):
     assert block.eagle_next_token == ctx[5 * B]
     block.reset_hash()
     assert block.eagle_next_token is None
+
+
+@pytest.mark.parametrize("exact", [False, True])
+def test_multi_turn_continuation(monkeypatch, exact):
+    """Turn 2 = turn 1 prompt + response + new user turn (aligned policy)."""
+    manager = _manager(monkeypatch, exact)
+    prompt = _context()
+    req = make_request("turn1", prompt, B, sha256)
+    _prefill(manager, req)
+    for token in range(300):
+        _decode_one(manager, req, 8000 + token)
+    history = list(req.all_token_ids)
+    manager.free(req)
+    # 16684 committed tokens: last full block ends at 14320 (inside the prompt).
+    assert _hit(manager, history + [9000] * 64, "turn2") == (5 * B if exact else 4 * B)
+
+
+@pytest.mark.parametrize("depth", [16384, 65536, 131072])
+def test_request_boundary_path_hits_instruction_boundary(monkeypatch, depth):
+    """Request-boundary policy: the depth request reuses the whole leading
+    system turn exactly. The checkpoint stores the boundary hidden state and
+    the reader replays the drafter at count - 1, so there is no EAGLE drop."""
+    monkeypatch.setenv("VLLM_PREFIX_DROP_EXACT", "1")
+    manager = make_kv_cache_manager(
+        KVCacheConfig(
+            num_blocks=4 * (depth // B + 8),
+            kv_cache_tensors=[],
+            kv_cache_groups=[
+                KVCacheGroupSpec(
+                    ["attn"],
+                    FullAttentionSpec(
+                        block_size=B, num_kv_heads=1, head_size=1, dtype=torch.float16
+                    ),
+                ),
+                KVCacheGroupSpec(
+                    ["gdn"],
+                    MambaSpec(
+                        block_size=B,
+                        shapes=((1, 1),),
+                        dtypes=(torch.float32,),
+                        mamba_cache_mode="align",
+                        num_speculative_blocks=4,
+                    ),
+                ),
+            ],
+        ),
+        max_model_len=262144,
+        enable_caching=True,
+        hash_block_size=B,
+        use_eagle=True,
+        num_prefill_lookahead=1,
+        enable_boundary_checkpoints=True,
+    )
+    # Warm = "<system>context</system><user>" + "." + generation prompt.
+    instruction = depth + 8
+    warm_tokens = [i % 5000 for i in range(instruction)] + [11, 12, 13, 14, 15]
+    warm = make_request("warm", warm_tokens, B, sha256)
+    warm.recurrent_instruction_boundary = instruction
+    warm.max_tokens = warm.sampling_params.max_tokens = 256
+    assert manager.get_computed_blocks(warm)[1] == 0
+    assert warm.use_boundary_checkpoints
+    for end in (instruction, len(warm_tokens)):
+        assert manager.allocate_slots(
+            warm, end - warm.num_computed_tokens, num_lookahead_tokens=4
+        )
+        warm.num_computed_tokens = end
+        manager.block_pool.free_blocks(manager.take_kv_cache_block_copies()[1])
+        kind = "instruction" if end == instruction else "prompt"
+        assert manager.publish_boundary_checkpoint(warm, end, kind=kind)
+    warm.append_output_token_ids([900, 901, 902])
+    assert manager.allocate_slots(warm, 2, num_lookahead_tokens=4)
+    warm.num_computed_tokens += 2
+    warm.status = RequestStatus.FINISHED_STOPPED
+    response = warm.num_tokens - 1
+    assert manager.publish_boundary_checkpoint(warm, response, kind="response")
+    history = list(warm.all_token_ids)
+    manager.free(warm)
+
+    depth_req = warm_tokens[:instruction] + [7000 + i for i in range(NEW)]
+    assert _hit(manager, depth_req, "depth") == instruction
+    # Multi-turn continuation reuses the committed response endpoint.
+    assert _hit(manager, history + [9000] * 64, "turn2") == response
+
+
+@pytest.mark.parametrize(
+    ("policy", "model_type", "expected"),
+    [
+        ("auto", "qwen3_8_flash_next_text", True),
+        # The shipped checkpoint (rev 7c4f1bc1) is published as qwen4_exp.
+        ("auto", "qwen4_exp_text", False),
+        ("request_boundaries", "qwen4_exp_text", True),
+        ("aligned", "qwen3_8_flash_next_text", False),
+    ],
+)
+def test_request_boundary_resolution(monkeypatch, policy, model_type, expected):
+    import vllm.platforms as platforms
+    from vllm.config.vllm import VllmConfig
+
+    monkeypatch.setattr(
+        platforms, "_current_platform", SimpleNamespace(is_cuda=lambda: True)
+    )
+    stub = SimpleNamespace(
+        cache_config=SimpleNamespace(
+            recurrent_checkpoint_policy=policy,
+            enable_prefix_caching=True,
+            mamba_cache_mode="align",
+            kv_cache_layout=None,
+            kv_offloading_size=None,
+        ),
+        model_config=SimpleNamespace(
+            enable_sleep_mode=False,
+            enable_return_routed_experts=False,
+            hf_text_config=SimpleNamespace(model_type=model_type),
+        ),
+        parallel_config=SimpleNamespace(
+            pipeline_parallel_size=1,
+            data_parallel_size=1,
+            decode_context_parallel_size=1,
+            prefill_context_parallel_size=1,
+        ),
+        use_v2_model_runner=True,
+        lora_config=None,
+        speculative_config=SimpleNamespace(
+            method="mtp", uses_dynamic_speculative_decoding=lambda: False
+        ),
+        external_boundary_checkpoint_adapter_available=True,
+    )
+    assert VllmConfig.use_request_boundary_checkpoints.fget(stub) is expected
