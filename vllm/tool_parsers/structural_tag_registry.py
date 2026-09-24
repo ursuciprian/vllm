@@ -30,6 +30,7 @@ from xgrammar.structural_tag import (
     TriggeredTagsFormat,
 )
 
+import vllm.envs as envs
 from vllm.entrypoints.openai.chat_completion.protocol import (
     ChatCompletionNamedToolChoiceParam,
     ChatCompletionToolsParam,
@@ -99,6 +100,17 @@ def _any_tool_strict(
     return False
 
 
+def auto_tools_need_grammar(
+    tools: Sequence[ChatCompletionToolsParam | ResponsesTool],
+) -> bool:
+    """Whether tool_choice="auto" gets a tool-call grammar for these tools.
+
+    Upstream: only when a tool opts into strict=true. VLLM_TOOL_GRAMMAR_ALL
+    extends it to every tool (strict=false tools still get syntax only).
+    """
+    return envs.VLLM_TOOL_GRAMMAR_ALL or _any_tool_strict(tools)
+
+
 def get_model_structural_tag(
     model: str,
     tools: Sequence[ChatCompletionToolsParam | ResponsesTool] | None,
@@ -110,7 +122,7 @@ def get_model_structural_tag(
     if not tools or tool_choice == "none":
         return None
 
-    if tool_choice == "auto" and not _any_tool_strict(tools):
+    if tool_choice == "auto" and not auto_tools_need_grammar(tools):
         return None
 
     dumped_tools = [_dump_tool_for_xgrammar(tool) for tool in tools]
@@ -137,6 +149,8 @@ def get_model_structural_tag(
         tools=dumped_tools,
         tool_choice=dumped_tool_choice,
         reasoning=reasoning,
+        # Non-strict tools never promised a parameter order.
+        any_order=envs.VLLM_TOOL_GRAMMAR_ALL,
     )
 
 

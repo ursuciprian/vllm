@@ -2029,3 +2029,79 @@ def test_collapsed_qwen3_engine_forces_a_tool_call_grammar(tool_choice, forced):
     # <think>...</think>.
     assert tag["format"]["type"] != "sequence"
     assert request.response_format is None
+
+
+# ── VLLM_TOOL_GRAMMAR_ALL: schema-held arguments under tool_choice=auto ──
+
+
+_GET_WEATHER = {
+    "type": "function",
+    "function": {
+        "name": "get_weather",
+        "description": "Get current weather for a location",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "location": {"type": "string"},
+                "units": {"type": "string", "enum": ["celsius", "fahrenheit"]},
+            },
+            "required": ["location"],
+            "additionalProperties": False,
+        },
+    },
+}
+
+
+def _weather_call(params: str) -> str:
+    return f"<tool_call>\n<function=get_weather>\n{params}</function>\n</tool_call>"
+
+
+_LOCATION = "<parameter=location>\nTokyo\n</parameter>\n"
+_UNITS = "<parameter=units>\ncelsius\n</parameter>\n"
+
+
+@pytest.mark.parametrize(
+    "flag, tool_choice, constrained",
+    [("1", "auto", True), ("0", "auto", False), ("1", "none", False)],
+)
+def test_tool_grammar_all_holds_auto_tool_arguments_to_the_schema(
+    monkeypatch, flag, tool_choice, constrained
+):
+    """Non-strict tools under auto get a triggered tag: free text stays open,
+    arguments are held to the schema (tool-eval-bench TC-42 injects extra
+    parameters that additionalProperties=false forbids)."""
+    import xgrammar as xgr
+    from xgrammar.testing import _is_grammar_accept_string
+
+    monkeypatch.setenv("VLLM_TOOL_GRAMMAR_ALL", flag)
+    parser_cls = ParserManager.get_parser(
+        tool_parser_name="qwen3_xml",
+        reasoning_parser_name="qwen3",
+        enable_auto_tools=True,
+    )
+    request = ChatCompletionRequest(
+        model="m",
+        messages=[{"role": "user", "content": "Weather in Tokyo?"}],
+        tools=[_GET_WEATHER],
+        tool_choice=tool_choice,
+    )
+    parser_cls(make_mock_tokenizer(_VOCAB)).adjust_request(request)
+
+    if not constrained:
+        assert request.structured_outputs is None
+        return
+    grammar = xgr.Grammar.from_structural_tag(request.structured_outputs.structural_tag)
+
+    def accepts(text: str) -> bool:
+        return _is_grammar_accept_string(grammar, text)
+
+    assert accepts("It is sunny in Tokyo.")
+    assert accepts("Checking.\n\n" + _weather_call(_LOCATION) + "\nDone.")
+    assert accepts(_weather_call(_UNITS + _LOCATION))
+    assert not accepts(
+        _weather_call(_LOCATION + "<parameter=debug>\ntrue\n</parameter>\n")
+    )
+    assert not accepts(
+        _weather_call("<parameter=units>\nkelvin\n</parameter>\n" + _LOCATION)
+    )
+    assert not accepts("<tool_call>\n<function=nope>\n</function>\n</tool_call>")

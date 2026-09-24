@@ -381,7 +381,8 @@ def needs_structural_tag(
     what :func:`~vllm.tool_parsers.structural_tag_registry
     .get_model_structural_tag` would decide anyway -- ``required`` and named
     choices get a grammar, and ``auto`` gets one only when a tool opts into
-    strict schema enforcement. Answering that here means an ordinary agentic
+    strict schema enforcement (or for every tool with VLLM_TOOL_GRAMMAR_ALL,
+    at the cost below). Answering that here means an ordinary agentic
     request (tools + ``auto``, nothing strict) never constructs a tool parser
     just to be handed ``None`` back; a tool parser is a
     ``ParserEngineToolAdapter``, so building one builds a second parser
@@ -407,9 +408,9 @@ def needs_structural_tag(
     if tool_choice != "auto":
         return False
     # Imported here so the common paths above never touch the registry.
-    from vllm.tool_parsers.structural_tag_registry import _any_tool_strict
+    from vllm.tool_parsers.structural_tag_registry import auto_tools_need_grammar
 
-    return _any_tool_strict(tools)
+    return auto_tools_need_grammar(tools)
 
 
 def attach_structural_tag(

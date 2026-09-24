@@ -267,6 +267,7 @@ if TYPE_CHECKING:
     VLLM_MAX_TOKENS_PER_EXPERT_FP4_MOE: int = 163840
     VLLM_TOOL_PARSE_REGEX_TIMEOUT_SECONDS: int = 1
     VLLM_ENFORCE_STRICT_TOOL_CALLING: bool = True
+    VLLM_TOOL_GRAMMAR_ALL: bool = False
     VLLM_MQ_MAX_CHUNK_BYTES_MB: int = 16
     VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS: int = 300
     VLLM_WORKER_SHUTDOWN_TIMEOUT_SECONDS: int = 5
@@ -1868,6 +1869,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_ENFORCE_STRICT_TOOL_CALLING": lambda: (
         os.getenv("VLLM_ENFORCE_STRICT_TOOL_CALLING", "True").lower() in ("true", "1")
     ),
+    # Constrain tool-call arguments to each tool's schema under
+    # tool_choice="auto" even when no tool sets strict=true. The grammar is an
+    # xgrammar triggered tag, so free text and reasoning stay unconstrained,
+    # but every tools request becomes a structured-output request (no async
+    # scheduling overlap for its batch while it runs). Off by default.
+    "VLLM_TOOL_GRAMMAR_ALL": lambda: (
+        os.getenv("VLLM_TOOL_GRAMMAR_ALL", "0").lower() in ("true", "1", "yes", "on")
+    ),
     # Control the max chunk bytes (in MB) for the rpc message queue.
     # Object larger than this threshold will be broadcast to worker
     # processes via zmq.
@@ -2469,6 +2478,8 @@ def compile_factors() -> dict[str, object]:
         "VLLM_ENABLE_CUDA_COMPATIBILITY",
         "VLLM_CUDA_COMPATIBILITY_PATH",
         "VLLM_SKIP_MODEL_NAME_VALIDATION",
+        # Request-level tool grammar; never reaches compiled graphs.
+        "VLLM_TOOL_GRAMMAR_ALL",
         "LOCAL_RANK",
         "CUDA_VISIBLE_DEVICES",
         "NO_COLOR",
