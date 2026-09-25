@@ -47,13 +47,15 @@ class _Job:
         self.events_session = None
         self.keys = []
         self.tunings = []
+        self.caches = []
 
     def cancel(self):
         self.events.append("cancel")
 
-    def advance(self, *, collective_key=None, tuning=None):
+    def advance(self, *, collective_key=None, tuning=None, cache=None):
         self.keys.append(collective_key)
         self.tunings.append(tuning)
+        self.caches.append(cache)
         self.events.append("advance")
         return next(self.progress)
 
@@ -91,11 +93,11 @@ def test_tuning_authorization_selects_once_across_disjoint_rank_shards() -> None
     gathered = [
         {
             "global_rank": 0,
-            "tuning": (("query", (0, 1), {"width": 4}, 3.0, 0),),
+            "tuning": (("query", (0, 1), {"width": 4}, 3.0, 0, 0),),
         },
         {
             "global_rank": 1,
-            "tuning": (("query", (0, 1), {"width": 2}, 1.0, 1),),
+            "tuning": (("query", (0, 1), {"width": 2}, 1.0, 1, 0),),
         },
     ]
 
@@ -105,6 +107,7 @@ def test_tuning_authorization_selects_once_across_disjoint_rank_shards() -> None
         {"width": 2},
         1.0,
         1,
+        0,
     ),)
 
 
@@ -332,11 +335,13 @@ def test_attention_tuning_rendezvous_ignores_rank_local_device_ordinal(variant):
         key = PreparationJob._choice_key(None, obligation, {})
         gathered.append({
             "global_rank": rank,
-            "tuning": ((key, ranks, {"tile_m": 128, "tile_n": 64}, 10.0 + rank, rank),),
+            "tuning": (
+                (key, ranks, {"tile_m": 128, "tile_n": 64}, 10.0 + rank, rank, 0),
+            ),
         })
     authorized = _authorize_tuning(gathered, ranks)
     assert authorized is not None
-    assert authorized[0][1:] == (ranks, {"tile_m": 128, "tile_n": 64}, 10.0, 0)
+    assert authorized[0][1:] == (ranks, {"tile_m": 128, "tile_n": 64}, 10.0, 0, 0)
 
 
 
@@ -412,6 +417,86 @@ def test_all_local_winners_consolidate_once_with_empty_world_rank():
         assert all(winner.assignment["width"] == 2 for winner in winners)
     decision = pickle.loads(store.get("stage-0/round-0/decision"))
     assert len(decision["tuning"]) == 2
+
+
+@pytest.mark.parametrize("all_rejected", (False, True))
+def test_rejected_shards_finish_with_a_peer_winner_or_an_explicit_error(all_rejected):
+    from b12x.preparation import TuningRequirement
+
+    progress = [_tuning_progress(rank, keys=("query",)) for rank in (0, 1)]
+    progress[0].ready_tuning = (
+        TuningRequirement("query", (0, 1), None, None, None, rejected_count=2),
+    )
+    progress[1].ready_tuning = (
+        TuningRequirement(
+            "query",
+            (0, 1),
+            None if all_rejected else {"width": 2},
+            None if all_rejected else 1.0,
+            None if all_rejected else 1,
+            rejected_count=1,
+        ),
+    )
+    coordinators, jobs, _ = _coordinators(
+        [[item, _progress(done=True)] for item in progress]
+    )
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        outcomes = list(pool.map(_finish, coordinators))
+    assert all(outcome["done"] for outcome in outcomes)
+    if all_rejected:
+        assert all(
+            "no launchable candidates" in outcome["error"]["message"]
+            for outcome in outcomes
+        )
+    else:
+        assert all(not outcome["error"] for outcome in outcomes)
+        for job in jobs:
+            (winner,) = job.tunings[1]
+            assert winner.assignment["width"] == 2
+            assert winner.rejected_count == 3
+
+
+@pytest.mark.parametrize("cancel", (False, True))
+def test_tuning_caches_exchange_before_races_with_empty_world_rank(cancel):
+    # b12x master blocks autotuned multi-rank preparation on a tuning-cache
+    # snapshot exchange; without it both ranks spin forever at startup.
+    from b12x.preparation import PreparationProgress, TuningCacheRequirement
+
+    caches = tuple(
+        TuningCacheRequirement((0, 1), {"model": "test"}, {str(rank): {}})
+        for rank in range(2)
+    )
+    coordinators, jobs, store = _coordinators(
+        [
+            [
+                PreparationProgress(False, False, (), False, ready_cache=cache),
+                _progress(done=True),
+            ]
+            for cache in caches
+        ]
+        + [[]]
+    )
+    if cancel:
+        store.set("stage-0/stop", b"1")
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        outcomes = list(pool.map(_finish, coordinators))
+    assert all(item["done"] and not item["error"] for item in outcomes)
+    for job in jobs[:2]:
+        assert job.caches[1] == (() if cancel else caches)
+
+
+def test_missing_cache_participant_fails_all_ranks_without_hanging():
+    from b12x.preparation import PreparationProgress, TuningCacheRequirement
+
+    cache = TuningCacheRequirement((0, 1), {}, {})
+    coordinators, _, _ = _coordinators(
+        [[PreparationProgress(False, False, (), False, ready_cache=cache)], []]
+    )
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        outcomes = list(pool.map(_finish, coordinators))
+    assert all(
+        "tuning cache boundaries" in item["error"]["message"] for item in outcomes
+    )
 
 
 def test_fixed_collective_authorization_waits_for_every_participant():

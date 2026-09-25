@@ -109,6 +109,7 @@ class B12xPreparationCoordinator:
             self._control = dist.PrefixStore(f"stage-{sequence}", group.store)
         self._authorized_key: str | None = None
         self._authorized_tuning = None
+        self._authorized_cache = None
         self._stop = False
         self._error: dict[str, object] | None = None
         self._last_progress = None
@@ -182,7 +183,13 @@ class B12xPreparationCoordinator:
             self._round += 1
             return self._outcome()
 
-        if not (self._local_done or self._error or self._ready() or self._ready_tuning()):
+        if not (
+            self._local_done
+            or self._error
+            or self._ready()
+            or self._ready_tuning()
+            or self._ready_cache()
+        ):
             return self._outcome()
 
         with (self._timing.span("control_exchange") if self._timing else nullcontext()):
@@ -200,6 +207,11 @@ class B12xPreparationCoordinator:
             self._stop = True
             self._safe_close()
         else:
+            cache = self._ready_cache()
+            if cache is not None:
+                self._authorized_cache = (
+                    () if self._stop else decision["caches"][cache.ranks]
+                )
             authorization = decision["collective"]
             self._authorized_key = (
                 authorization[0]
@@ -210,8 +222,12 @@ class B12xPreparationCoordinator:
                 from b12x.preparation import TuningRequirement
 
                 self._authorized_tuning = tuple(
-                    TuningRequirement(_unscoped_key(key), ranks, assignment, latency, index)
-                    for key, ranks, assignment, latency, index in decision["tuning"]
+                    TuningRequirement(
+                        _unscoped_key(key), ranks, assignment, latency, index, rejected
+                    )
+                    for key, ranks, assignment, latency, index, rejected in decision[
+                        "tuning"
+                    ]
                     if self.global_rank in ranks
                 )
         self._global_done = decision["done"]
@@ -241,7 +257,14 @@ class B12xPreparationCoordinator:
                 decision = self._decision(gathered)
             except Exception as error:
                 self._record_error(error)
-                decision = dict(stop=True, error=self._error, collective=None, tuning=(), done=False)
+                decision = dict(
+                    stop=True,
+                    error=self._error,
+                    collective=None,
+                    tuning=(),
+                    caches={},
+                    done=False,
+                )
             self._control.set(f"{prefix}/decision", pickle.dumps(decision))
         return pickle.loads(
             _bounded_get(
@@ -258,6 +281,7 @@ class B12xPreparationCoordinator:
         if self._control is not None:
             stop |= self._control.check(["stop"])
         tuning = () if stop else _authorize_tuning(gathered, self.world_ranks)
+        caches = {} if stop else _authorize_caches(gathered, self.world_ranks)
         if not stop:
             authorized = {item[0] for item in tuning}
             pending = {item[0] for entry in gathered for item in entry["tuning"]}
@@ -268,6 +292,7 @@ class B12xPreparationCoordinator:
             error=error,
             collective=None if error else _authorize_ready(gathered, self.world_ranks),
             tuning=tuning,
+            caches=caches,
             done=all(entry["local_done"] for entry in gathered)
             and (error is None or all(entry["cleanup_complete"] for entry in gathered)),
         )
@@ -291,12 +316,15 @@ class B12xPreparationCoordinator:
             raise RuntimeError("active preparation has no job")
         if self._stop:
             job.session.cancel_tuning()
-        progress = job.advance(
-            collective_key=self._authorized_key,
-            tuning=self._authorized_tuning,
+        kwargs = dict(
+            collective_key=self._authorized_key, tuning=self._authorized_tuning
         )
+        if self._authorized_cache is not None:
+            kwargs["cache"] = self._authorized_cache
+        progress = job.advance(**kwargs)
         self._authorized_key = None
         self._authorized_tuning = None
+        self._authorized_cache = None
         self._last_progress = progress
         if progress.pending_compilation:
             pool = job.session._pool
@@ -340,9 +368,13 @@ class B12xPreparationCoordinator:
                 None if item.assignment is None else item.assignment.to_dict(),
                 item.latency_us,
                 item.candidate_index,
+                item.rejected_count,
             )
             for item in getattr(self._last_progress, "ready_tuning", ())
         )
+
+    def _ready_cache(self):
+        return getattr(self._last_progress, "ready_cache", None)
 
     def _payload(self) -> dict[str, object]:
         return {
@@ -352,6 +384,7 @@ class B12xPreparationCoordinator:
             "stop": self._stop,
             "ready": self._ready(),
             "tuning": self._ready_tuning(),
+            "cache": self._ready_cache(),
             "local_done": self._local_done,
             "error": self._error,
             "cleanup_complete": self._cleanup_complete,
@@ -511,15 +544,37 @@ def _authorize_ready(
     return key, participants_by_key[key]
 
 
+def _authorize_caches(gathered, world_ranks):
+    groups: dict[tuple[int, ...], dict[int, object]] = {}
+    for entry in gathered:
+        cache = entry.get("cache")
+        if cache is None:
+            continue
+        rank = int(entry["global_rank"])
+        if rank not in cache.ranks or not set(cache.ranks) <= set(world_ranks):
+            raise RuntimeError("preparation tuning cache has an invalid rank set")
+        groups.setdefault(cache.ranks, {})[rank] = cache
+    for ranks, snapshots in groups.items():
+        if set(snapshots) != set(ranks):
+            raise RuntimeError(
+                "preparation ranks reached incompatible tuning cache boundaries"
+            )
+    return {
+        ranks: tuple(snapshots[rank] for rank in ranks)
+        for ranks, snapshots in groups.items()
+    }
+
+
 def _authorize_tuning(
     gathered: list[dict[str, object]], world_ranks: tuple[int, ...]
 ) -> tuple[tuple[object, ...], ...]:
     contributions: dict[str, list[tuple[float, int, int, object]]] = {}
     ready_by_key: dict[str, set[int]] = {}
     participants_by_key: dict[str, tuple[int, ...]] = {}
+    rejected_by_key: dict[str, int] = {}
     for entry in gathered:
         rank = int(entry["global_rank"])
-        for key, ranks, assignment, latency_us, candidate_index in entry.get(
+        for key, ranks, assignment, latency_us, candidate_index, rejected in entry.get(
             "tuning", ()
         ):
             ranks = tuple(ranks)
@@ -535,6 +590,7 @@ def _authorize_tuning(
                     "preparation tuning participants disagree for one key"
                 )
             ready_by_key.setdefault(key, set()).add(rank)
+            rejected_by_key[key] = rejected_by_key.get(key, 0) + rejected
             if assignment is not None:
                 contributions.setdefault(key, []).append(
                     (float(latency_us), int(candidate_index), rank, assignment)
@@ -542,14 +598,29 @@ def _authorize_tuning(
     choices = [
         key
         for key, ranks in participants_by_key.items()
-        if ready_by_key.get(key) == set(ranks) and contributions.get(key)
+        if ready_by_key.get(key) == set(ranks)
     ]
     winners = []
     for key in sorted(choices):
+        if not contributions.get(key):
+            raise RuntimeError(
+                f"no launchable candidates for preparation tuning {key}: "
+                f"{rejected_by_key[key]} candidates rejected across ranks "
+                f"{participants_by_key[key]}"
+            )
         candidates = contributions[key]
         indices = [candidate[1] for candidate in candidates]
         if len(indices) != len(set(indices)):
             raise RuntimeError("preparation tuning shards overlap")
         latency_us, candidate_index, _, assignment = min(candidates)
-        winners.append((key, participants_by_key[key], assignment, latency_us, candidate_index))
+        winners.append(
+            (
+                key,
+                participants_by_key[key],
+                assignment,
+                latency_us,
+                candidate_index,
+                rejected_by_key[key],
+            )
+        )
     return tuple(winners)
