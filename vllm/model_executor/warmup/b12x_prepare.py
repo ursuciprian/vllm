@@ -479,8 +479,10 @@ def get_b12x_session(worker: Worker):
         # Compile workers are host processes that never touch CUDA, so the pool
         # is sized against host cores rather than against the device. The count
         # is per rank: a node runs this many compiler processes for each local
-        # rank it hosts.
-        compile_workers=16,
+        # rank it hosts. B12X_COMPILE_WORKERS overrides it: on unified-memory
+        # hosts (DGX Spark) 16 workers per rank plus the weights can exhaust
+        # host RAM during a cold autotune.
+        compile_workers=int(os.environ.get("B12X_COMPILE_WORKERS", "16")),
     )
     if session.autotune and os.environ.get("B12X_AUTOTUNE", "1") != "0":
         from vllm.distributed.parallel_state import get_tp_group
