@@ -266,6 +266,14 @@ def _stage_b12x_gdn_metadata_kernel(
     tl.store(out_num_tokens, tl.load(query_start_loc + num_requests * query_stride))
 
 
+def is_flash_next_text_model_type(model_type: object) -> bool:
+    """Qwen3.8-Flash-Next text model, including the qwen4_exp checkpoint alias
+    when VLLM_QWEN4_EXP_AS_FLASH_NEXT is set."""
+    return model_type == "qwen3_8_flash_next_text" or (
+        envs.VLLM_QWEN4_EXP_AS_FLASH_NEXT and model_type == "qwen4_exp_text"
+    )
+
+
 def _resolve_gdn_backend_selection(
     vllm_config: VllmConfig,
 ) -> tuple[str, str, bool]:
@@ -307,7 +315,7 @@ def _resolve_gdn_backend_selection(
     if (
         prefill == "auto"
         and decode is None
-        and getattr(text_config, "model_type", None) == "qwen3_8_flash_next_text"
+        and is_flash_next_text_model_type(getattr(text_config, "model_type", None))
     ):
         return "b12x", "b12x", False
     return prefill, decode or "cuda", explicitly_configured
