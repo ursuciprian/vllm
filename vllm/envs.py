@@ -201,6 +201,7 @@ if TYPE_CHECKING:
     VLLM_B12X_BLOCKSCALED_WORKSPACE_MAX_BYTES: int = 2_000_000_000
     VLLM_MXFP8_LM_HEAD: bool = False
     VLLM_PREFIX_DROP_EXACT: bool = False
+    VLLM_QWEN4_EXP_AS_FLASH_NEXT: bool = False
     VLLM_LM_HEAD_A16: bool = True
     VLLM_QWEN3_8_FLASH_NEXT_MTP_COMPACT: bool = True
     VLLM_GDN_SPEC_DECODE_METADATA_FASTPATH: bool = True
@@ -1704,6 +1705,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # written with, instead of always dropping that block. Scheduler-only.
     "VLLM_PREFIX_DROP_EXACT": lambda: bool(
         int(os.getenv("VLLM_PREFIX_DROP_EXACT", "0"))
+    ),
+    # Treat model_type qwen4_exp_text (Qwen3.8-Flash-Next checkpoints published
+    # under that name) as qwen3_8_flash_next_text in the GDN b12x auto-select
+    # and GDN CUDA-graph support gates. Part of the compile-cache key.
+    "VLLM_QWEN4_EXP_AS_FLASH_NEXT": lambda: bool(
+        int(os.getenv("VLLM_QWEN4_EXP_AS_FLASH_NEXT", "0"))
     ),
     # Preserve BF16 activations in runtime-quantized NVFP4/MXFP8 LM heads.
     "VLLM_LM_HEAD_A16": lambda: bool(int(os.getenv("VLLM_LM_HEAD_A16", "1"))),

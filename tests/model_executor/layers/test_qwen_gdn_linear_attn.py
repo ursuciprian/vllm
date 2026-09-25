@@ -103,6 +103,42 @@ def test_gdn_b12x_selection_couples_execution_and_graph_metadata(
     assert config.additional_config == before
 
 
+@pytest.mark.parametrize("alias", [False, True])
+@pytest.mark.parametrize(
+    "model_type", ["qwen3_8_flash_next_text", "qwen4_exp_text", "qwen3_next"]
+)
+@pytest.mark.parametrize("decode", [None, "b12x"])
+def test_qwen4_exp_alias_gates(monkeypatch, alias, model_type, decode):
+    """VLLM_QWEN4_EXP_AS_FLASH_NEXT: qwen4_exp_text gets the Flash-Next GDN
+    auto-select and full-CUDA-graph support; nothing else changes."""
+    from vllm.v1.attention.backend import AttentionCGSupport
+    from vllm.v1.attention.backends.gdn_attn import GDNAttentionMetadataBuilder
+
+    monkeypatch.setenv("VLLM_QWEN4_EXP_AS_FLASH_NEXT", "1" if alias else "0")
+    monkeypatch.delenv("VLLM_GDN_DECODE_KERNEL", raising=False)
+    platform = MagicMock()
+    platform.is_cuda.return_value = True
+    platform.is_device_capability.return_value = False
+    platform.is_device_capability_family.side_effect = lambda cap: cap == 120
+    platform.get_cuda_runtime_major.return_value = 13
+    monkeypatch.setattr(qwen_gdn_linear_attn, "current_platform", platform)
+    config = _make_config(None, model_type=model_type)
+    config.additional_config["gdn_decode_kernel"] = decode
+
+    flash_next = model_type == "qwen3_8_flash_next_text" or (
+        alias and model_type == "qwen4_exp_text"
+    )
+    b12x = flash_next or decode == "b12x"
+    assert qwen_gdn_linear_attn._resolve_gdn_prefill_backend(config)[1] == (
+        "b12x" if b12x else "flashinfer"
+    )
+    assert GDNAttentionMetadataBuilder.get_cudagraph_support(config, None) == (
+        AttentionCGSupport.ALWAYS
+        if flash_next and b12x
+        else AttentionCGSupport.UNIFORM_BATCH
+    )
+
+
 @pytest.mark.parametrize(
     "prefill,decode,env_decode",
     [
