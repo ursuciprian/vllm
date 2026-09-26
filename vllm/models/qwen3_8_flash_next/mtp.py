@@ -732,6 +732,16 @@ class Qwen3_8FlashNextMTP(
             vllm_config=vllm_config,
             prefix=maybe_prefix(prefix, "mtp"),
         )
+        # Opt-in (VLLM_QWEN38_HC_MXFP8 contains "mtp"): online MXFP8 for the
+        # draft layer BF16 linears. fc_embedding/fc_hidden stay BF16: the
+        # b12x mtp_feedback kernel reads their weights directly.
+        from vllm.model_executor.layers.linear import LinearBase
+
+        from .hyperconnection import maybe_route_hc_mxfp8
+
+        for _name, _module in self.model.named_modules():
+            if isinstance(_module, LinearBase) and ".fc_" not in f".{_name}":
+                maybe_route_hc_mxfp8(_module, "mtp")
 
         if get_pp_group().is_last_rank:
             self.lm_head = ParallelLMHead(

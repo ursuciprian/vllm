@@ -1728,7 +1728,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_QWEN38_HC_MXFP8": env_with_choices(
         "VLLM_QWEN38_HC_MXFP8",
         "off",
-        ["hc,gate", "gate,hc", "hc", "gate", "off"],
+        ["hc,gate", "gate,hc", "hc", "gate", "mtp", "hc,mtp", "off"],
         case_sensitive=False,
     ),
     # Overlap independent small-batch projections in Qwen3.8-Flash-Next graphs.
