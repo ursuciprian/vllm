@@ -78,6 +78,7 @@ from .hyperconnection import (
     GatedResidual,
     HyperConnectionConfig,
     HyperConnectionWorkspace,
+    maybe_route_hc_mxfp8,
 )
 from .ple_layer import Qwen3_8FlashNextPLELayer, _resolve_ple_table_memory
 
@@ -155,6 +156,9 @@ class Qwen3_8FlashNextSparseMoeBlock(Qwen3NextSparseMoeBlock):
         super().__init__(vllm_config=vllm_config, prefix=prefix)
         config = vllm_config.model_config.hf_text_config
         self.n_shared_experts = int(config.shared_expert_intermediate_size > 0)
+        # Router gate: [512, 2560] BF16, one GEMM per layer per decode step.
+        # See hyperconnection.py for the online MXFP8 route and its env gate.
+        maybe_route_hc_mxfp8(self.gate, "gate")
 
 
 class Qwen3_8FlashNextDecoderLayer(nn.Module):

@@ -205,6 +205,7 @@ if TYPE_CHECKING:
     VLLM_QWEN3_8_FLASH_NEXT_MTP_COMPACT: bool = True
     VLLM_GDN_SPEC_DECODE_METADATA_FASTPATH: bool = True
     VLLM_MTP_NVFP4_LM_HEAD: bool = True
+    VLLM_QWEN38_HC_MXFP8: str = "off"
     VLLM_QWEN3_8_FLASH_NEXT_OVERLAP: bool = True
     VLLM_B12X_MLA_CKV_GATHER: bool = False
     VLLM_B12X_MLA_CKV_GATHER_MIN_TOKENS: int = 16
@@ -1716,6 +1717,19 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     "VLLM_MTP_NVFP4_LM_HEAD": lambda: bool(
         int(os.getenv("VLLM_MTP_NVFP4_LM_HEAD", "1"))
+    ),
+    # Which Qwen3.8-Flash-Next BF16 projections are quantized to MXFP8 online.
+    # MUST live here rather than behind a bare os.getenv: it changes how many
+    # b12x plans a boot creates, and b12x plan handles are a process-local
+    # counter baked into AOT-compiled graphs as integer constants. Only
+    # environment_variables entries reach envs.compile_factors(), so a gate
+    # read outside this dict lets two different target sets share one AOT
+    # cache entry and dereference each other's plan handles.
+    "VLLM_QWEN38_HC_MXFP8": env_with_choices(
+        "VLLM_QWEN38_HC_MXFP8",
+        "off",
+        ["hc,gate", "gate,hc", "hc", "gate", "off"],
+        case_sensitive=False,
     ),
     # Overlap independent small-batch projections in Qwen3.8-Flash-Next graphs.
     "VLLM_QWEN3_8_FLASH_NEXT_OVERLAP": lambda: bool(

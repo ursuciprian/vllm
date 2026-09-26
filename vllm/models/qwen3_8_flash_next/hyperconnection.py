@@ -11,9 +11,12 @@ from typing import Any
 import torch
 from torch import nn
 
+import vllm.envs as envs
+from vllm.logger import init_logger
 from vllm.model_executor.layers.linear import (
     MergedColumnParallelLinear,
     ReplicatedLinear,
+    UnquantizedLinearMethod,
 )
 from vllm.model_executor.models.utils import maybe_prefix
 from vllm.model_executor.weight_transfer import allocate_weights
@@ -26,6 +29,8 @@ from vllm.utils.b12x import (
     get_b12x_hyperconnection,
 )
 
+logger = init_logger(__name__)
+
 
 def _hyperconnection_api() -> Any:
     api = get_b12x_hyperconnection()
@@ -35,6 +40,184 @@ def _hyperconnection_api() -> Any:
             "install the b12x serving extra"
         )
     return api
+
+
+
+# ---------------------------------------------------------------------------
+# Online MXFP8 weights for the hyper-connection mixers and the MoE router gate
+# (lever B2, results/kernel-pass/lmhead-hc-design.md section 5).
+#
+# The HC mixer streams the largest dense weight bucket in the model: two
+# replicated BF16 projections per GatedResidual,
+#
+#   input_mix_weight_down_block_inject  [336, 10240]  6.88 MB  (merged, 12 pad)
+#   input_mix_weight_up                 [10240, 320]  6.55 MB
+#
+# x 97 instances/step = 1303 MB/node/step, measured at 8.22 ms, i.e. 158 GB/s
+# against a 273 GB/s LPDDR5x roofline. The MoE router gate adds [512, 2560]
+# x 48 = 126 MB at 0.85 ms. Quantizing those weights to MXFP8 g32 once at load
+# halves the stream with zero extra collectives and zero extra launches.
+#
+# Weight loading is untouched. ``create_weights`` still comes from
+# ``UnquantizedLinearMethod``, so the ``MergedColumnParallelLinear`` shard
+# loaders, the 12 alignment pad rows and ``_HC_WEIGHTS_MAPPER`` see exactly the
+# parameter they saw before. The in-tree ``Mxfp8OnlineLinearMethod`` quantizes
+# that loaded BF16 weight once, in ``process_weights_after_loading``, and hands
+# the packed weight to b12x's block-scaled linear -- the same kernel that
+# already serves this model's MXFP8 linear-attention projections.
+#
+# Activation precision is left to b12x (``VLLM_B12X_MXFP8_ACTIVATION_MODE`` /
+# ``VLLM_B12X_DENSE_ACTIVATION_MODE``, default "auto"), which resolves it per
+# exact-M regime: BF16 activations (W8A16) for the decode regimes at M <= 8
+# where ``in_features == padded_in_features``, and the quantized-activation
+# path at prefill capacity. Pinning "a16" here would pin the 16-row A16 tile
+# for prefill too, so it is an operator choice, not a patch decision.
+#
+# NOT bit-identical: MXFP8 rounding is ~2^-8 relative per weight, so logits
+# move by ~1e-2 and ``scripts/logits_equiv.py`` fails by construction. Judge on
+# behaviour. Gated by ``VLLM_QWEN38_HC_MXFP8`` (default "off"; "hc",
+# "gate" or "off"). Mutually exclusive with mods/vllm-qwen38-bf16-gemv, which
+# rebinds ``quant_method`` on the same modules.
+#
+# The gate is declared in ``vllm/envs.py`` and read through ``envs``, never
+# through a bare ``os.getenv``. Only ``environment_variables`` entries reach
+# ``envs.compile_factors()`` and therefore the AOT compile-cache key, and this
+# gate changes how many b12x plans a boot creates. b12x plan handles are a
+# process-local monotonic counter (``b12x/preparation/types.py``) that torch
+# bakes into the compiled graph as an integer constant, so two target sets
+# sharing one cache entry would dereference each other's plans -- which is
+# exactly the `plan belongs to gemm.blockscaled_precision, not
+# norm.hyperconnection` crash the "hc"-only arm hit on 2026-09-22.
+# ---------------------------------------------------------------------------
+
+_HC_MXFP8_TARGETS = frozenset(
+    part
+    for part in (envs.VLLM_QWEN38_HC_MXFP8 or "hc,gate").lower().replace(" ", "").split(",")
+    if part and part != "off"
+)
+
+# MXFP8 microscaling group, and b12x's A16 / workspace-quantization geometry
+# gates (b12x/gemm/blockscaled/_tuning.py::_validate_config).
+_MXFP8_GROUP = 32
+_MXFP8_N_ALIGN = 8
+
+_HC_MXFP8_LOGGED: set = set()
+
+
+def _hc_mxfp8_method() -> Any:
+    """An online MXFP8 linear method bound to b12x, or None when unavailable."""
+    try:
+        from vllm.model_executor.kernels.linear.mxfp8.b12x import (
+            B12xMxfp8LinearKernel,
+        )
+        from vllm.model_executor.layers.quantization.online.mxfp8 import (
+            Mxfp8OnlineLinearMethod,
+        )
+
+        method = Mxfp8OnlineLinearMethod()
+    except Exception:  # noqa: BLE001 - absence is a routing decision
+        return None
+    if not isinstance(method.kernel, B12xMxfp8LinearKernel):
+        return None
+    return method
+
+
+def _hc_mxfp8_admits(weight: torch.Tensor) -> bool:
+    """Whether b12x's block-scaled contract can serve this weight geometry."""
+    return (
+        weight.dim() == 2
+        and weight.is_cuda
+        and weight.dtype == torch.bfloat16
+        and weight.is_contiguous()
+        and int(weight.shape[1]) > 0
+        and int(weight.shape[1]) % _MXFP8_GROUP == 0
+        and int(weight.shape[0]) > 0
+        and int(weight.shape[0]) % _MXFP8_N_ALIGN == 0
+    )
+
+
+class HcMxfp8LinearMethod(UnquantizedLinearMethod):
+    """BF16 weight loading, MXFP8 weights, b12x block-scaled GEMM at run.
+
+    Rebound onto a constructed ``LinearBase`` *after* ``create_weights`` has
+    run, so the layer keeps its stock BF16 parameter and its stock loaders.
+    ``process_weights_after_loading`` then does the one-shot quantization; a
+    geometry b12x cannot serve keeps the stock cuBLAS path and says so.
+    """
+
+    def __init__(self, method: Any, target: str) -> None:
+        super().__init__()
+        self.mxfp8_method = method
+        self.target = target
+        self.engaged = False
+
+    def process_weights_after_loading(self, layer: nn.Module) -> None:
+        weight = getattr(layer, "weight", None)
+        prefix = str(getattr(layer, "prefix", "") or "?")
+        if weight is None or not _hc_mxfp8_admits(weight.data):
+            shape = None if weight is None else tuple(weight.shape)
+            logger.warning_once(
+                "qwen38 HC MXFP8: target=%s %s shape=%s is outside the b12x "
+                "block-scaled contract (K%%%d, N%%%d, contiguous BF16 on CUDA) "
+                "-- keeping BF16",
+                self.target, prefix, shape, _MXFP8_GROUP, _MXFP8_N_ALIGN,
+            )
+            return super().process_weights_after_loading(layer)
+        out_features, in_features = (int(value) for value in weight.shape)
+        self.mxfp8_method.process_weights_after_loading(layer)
+        self.engaged = True
+        key = (self.target, out_features, in_features)
+        if key not in _HC_MXFP8_LOGGED:
+            _HC_MXFP8_LOGGED.add(key)
+            logger.info(
+                "qwen38 HC MXFP8: target=%s shape=[%d,%d] -> mxfp8 g32, "
+                "activation_mode=%s, %.2f MB -> %.2f MB per instance",
+                self.target, out_features, in_features,
+                getattr(layer, "b12x_activation_mode", "?"),
+                out_features * in_features * 2 / 1e6,
+                _mxfp8_bytes(out_features, in_features) / 1e6,
+            )
+
+    def apply(
+        self,
+        layer: nn.Module,
+        x: torch.Tensor,
+        bias: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        if not self.engaged:
+            return super().apply(layer, x, bias)
+        return self.mxfp8_method.apply(layer, x, bias)
+
+
+def _mxfp8_bytes(out_features: int, in_features: int) -> int:
+    """Packed MXFP8 weight + swizzled UE8M0 scale bytes b12x actually streams.
+
+    ``blockscaled.pack_weight`` pads K up to 128 and stores the scales in the
+    F8_128x4 layout, so a K that is not a multiple of 128 (the HC
+    up-projection's 320) costs more than K/32 scale bytes.
+    """
+    padded_k = -(-in_features // 128) * 128
+    n_tiles = -(-out_features // 128)
+    k_tiles = -(-(padded_k // _MXFP8_GROUP) // 4)
+    return out_features * padded_k + n_tiles * k_tiles * 512
+
+
+def maybe_route_hc_mxfp8(linear: nn.Module, target: str) -> bool:
+    """Rebind ``linear`` to online MXFP8 weights when its target is enabled.
+
+    Called at construction time, after ``create_weights``. Only the method is
+    replaced, so the parameter, its loaders and its shard layout are the stock
+    unquantized ones; the weight is quantized once, at the end of loading.
+    """
+    if target not in _HC_MXFP8_TARGETS or not current_platform.is_cuda():
+        return False
+    if type(getattr(linear, "quant_method", None)) is not UnquantizedLinearMethod:
+        return False
+    method = _hc_mxfp8_method()
+    if method is None:
+        return False
+    linear.quant_method = HcMxfp8LinearMethod(method, target)
+    return True
 
 
 @dataclass(frozen=True)
@@ -166,6 +349,9 @@ class GatedResidual(nn.Module):
                 return_bias=False,
                 disable_tp=True,
             )
+            maybe_route_hc_mxfp8(
+                self.input_mix_weight_down_block_inject, "hc"
+            )
         else:
             self.input_mix_weight_down = ReplicatedLinear(
                 self.hyper_hidden_size,
@@ -176,6 +362,7 @@ class GatedResidual(nn.Module):
                 prefix=maybe_prefix(prefix, "input_mix_weight_down"),
                 return_bias=False,
             )
+            maybe_route_hc_mxfp8(self.input_mix_weight_down, "hc")
         self.input_mix_weight_up = ReplicatedLinear(
             self.lora_rank,
             self.hyper_hidden_size,
@@ -185,6 +372,7 @@ class GatedResidual(nn.Module):
             prefix=maybe_prefix(prefix, "input_mix_weight_up"),
             return_bias=False,
         )
+        maybe_route_hc_mxfp8(self.input_mix_weight_up, "hc")
         self._preparation_prefix = prefix or "qwen3_8_flash_next.hyperconnection"
         self._plans: dict[str, object] = {}
         if not getattr(self, "b12x_preparation_suppressed", False):
@@ -408,6 +596,8 @@ class GatedResidual(nn.Module):
 
 __all__ = [
     "GatedResidual",
+    "HcMxfp8LinearMethod",
+    "maybe_route_hc_mxfp8",
     "GroupedGemmaRMSNorm",
     "HyperConnectionConfig",
     "HyperConnectionWorkspace",
