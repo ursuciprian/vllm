@@ -188,6 +188,18 @@ class HcMxfp8LinearMethod(UnquantizedLinearMethod):
             return super().apply(layer, x, bias)
         return self.mxfp8_method.apply(layer, x, bias)
 
+    def get_workspace_size(self, layer: nn.Module, rows: int) -> int:
+        # The inherited LinearMethodBase version reads ``self.kernel``, which
+        # this wrapper does not have, so it reported 0 bytes for an engaged
+        # b12x linear. Callers that reserve scratch for a side stream (the MoE
+        # shared-experts runner) then bound nothing, and the linear drew the
+        # workspace manager's shared buffer concurrently with main-stream
+        # kernels: the MTP draft layer's MXFP8 shared expert raced the routed
+        # experts and draft acceptance collapsed to ~0 (r3 arm mtpq).
+        if not self.engaged:
+            return super().get_workspace_size(layer, rows)
+        return self.mxfp8_method.get_workspace_size(layer, rows)
+
 
 def _mxfp8_bytes(out_features: int, in_features: int) -> int:
     """Packed MXFP8 weight + swizzled UE8M0 scale bytes b12x actually streams.
