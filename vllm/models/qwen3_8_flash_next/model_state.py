@@ -104,10 +104,14 @@ class Qwen3_8FlashNextModelState(MambaHybridModelState):
             dtype=torch.int32,
             device=self.device,
         )
+        # prepare_attn rewrites these flags every step, possibly before the
+        # previous step's non-blocking upload has run. Pageable host memory
+        # makes copy_to_gpu stage each upload through fresh pinned memory.
         self.qsa_is_prefilling = CpuGpuBuffer(
             self.max_num_reqs,
             dtype=torch.bool,
             device=self.device,
+            pin_memory=False,
         )
         self._qsa_draft_is_prefilling = torch.zeros(
             self.max_num_reqs,
