@@ -859,6 +859,7 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
         if prefill_live_counts is not None:
             prefill_live_counts[0].fill_(num_prefills)
             prefill_live_counts[1].fill_(num_prefill_tokens)
+            self._live_counts = (num_prefills, num_prefill_tokens)
         attn_metadata = GDNAttentionMetadata(
             num_prefills=num_prefills,
             num_prefill_tokens=num_prefill_tokens,
@@ -903,20 +904,31 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
         assert metadata.num_reqs > 0
         assert metadata.seq_lens is not None
         mixed = None
+        # A uniform spec-decode step never reads the b12x mixed worklists (the
+        # layer takes the fused decode kernel), so skip re-staging them per group.
+        uniform_decode = (
+            envs.VLLM_GDN_UNIFORM_DECODE_META_SKIP
+            and metadata.is_uniform_spec_decode
+            and metadata.num_prefills == 0
+        )
         if metadata.b12x_mixed is not None:
             mixed = self._b12x_mixed
             assert mixed is not None
-            mixed.copy_worklists_from(metadata.b12x_mixed)
-            mixed.refresh_state_indices(
-                self._get_state_indices(
-                    blk_table, metadata.seq_lens, metadata.num_reqs
-                ),
-                blk_table,
-            )
+            if not uniform_decode:
+                mixed.copy_worklists_from(metadata.b12x_mixed)
+                mixed.refresh_state_indices(
+                    self._get_state_indices(
+                        blk_table, metadata.seq_lens, metadata.num_reqs
+                    ),
+                    blk_table,
+                )
         prefill_live_counts = getattr(self, "_b12x_prefill_live_counts", None)
         if prefill_live_counts is not None:
-            prefill_live_counts[0].fill_(metadata.num_prefills)
-            prefill_live_counts[1].fill_(metadata.num_prefill_tokens)
+            live = (metadata.num_prefills, metadata.num_prefill_tokens)
+            if not envs.VLLM_GDN_UNIFORM_DECODE_META_SKIP or getattr(self, "_live_counts", None) != live:
+                prefill_live_counts[0].fill_(live[0])
+                prefill_live_counts[1].fill_(live[1])
+                self._live_counts = live
 
         if (
             metadata.is_uniform_spec_decode
@@ -1115,3 +1127,4 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
         num_decode_draft_tokens_cpu = (num_accepted_tokens - 1).cpu()
 
         return self.build(0, m, num_accepted_tokens, num_decode_draft_tokens_cpu)
+

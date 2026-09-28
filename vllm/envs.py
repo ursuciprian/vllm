@@ -130,6 +130,7 @@ if TYPE_CHECKING:
     VLLM_ENABLE_FLA_PACKED_RECURRENT_DECODE: bool = True
     VLLM_GDN_DECODE_KERNEL: Literal["b12x", "cuda", "triton"] = "cuda"
     VLLM_GDN_DEFERRED_CHECKPOINTS: bool = False
+    VLLM_GDN_UNIFORM_DECODE_META_SKIP: bool = False
     VLLM_DISABLE_PYNCCL: bool = False
     VLLM_USE_OINK_OPS: bool = False
     VLLM_MXFP8_EMULATION_DEQUANT_AT_LOAD: bool = True
@@ -1260,6 +1261,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # b12x branch that implements Caps(deferred_checkpoints=...), the b12x GDN
     # decode kernel and align mamba cache mode; request-boundary checkpoints
     # (policy auto) export through an accepted-prefix commit. Off by default.
+    # Skip re-staging the b12x mixed-batch GDN worklists and state indices for
+    # every KV-cache group on uniform spec-decode steps (they are never read
+    # there); prefill live counts are written only when they change.
+    "VLLM_GDN_UNIFORM_DECODE_META_SKIP": lambda: (
+        os.getenv("VLLM_GDN_UNIFORM_DECODE_META_SKIP", "0").lower() in ("1", "true")
+    ),
     "VLLM_GDN_DEFERRED_CHECKPOINTS": lambda: (
         os.getenv("VLLM_GDN_DEFERRED_CHECKPOINTS", "0").lower()
         in ("true", "1", "yes", "on")
