@@ -192,6 +192,8 @@ if TYPE_CHECKING:
     VLLM_HUMMING_USE_F16_ACCUM: bool = False
     VLLM_HUMMING_MOE_GEMM_TYPE: Literal["indexed", "grouped", "auto"] | None = None
     VLLM_B12X_MOE_FP4_FORCE_A16: bool = False
+    B12X_MOE_DECODE_BACKEND: Literal["auto", "wm"] = "auto"
+    B12X_MOE_WM_MAX_TOKENS: int = 32
     VLLM_B12X_MOE_FP4_LAYER_MAX_INPUT_SCALE: Literal["0", "1", "all", "w13", "w2"] = "0"
     VLLM_DEFAULT_MOE_BACKEND: str = "auto"
     VLLM_B12X_DENSE_ACTIVATION_MODE: Literal["auto", "a16", "quantized"] = "auto"
@@ -1672,6 +1674,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_B12X_MOE_FP4_FORCE_A16": lambda: bool(
         int(os.getenv("VLLM_B12X_MOE_FP4_FORCE_A16", "0"))
     ),
+    # b12x NVFP4 MoE decode backend. "wm" pins decode token counts up to
+    # B12X_MOE_WM_MAX_TOKENS to the weight-major kernel. b12x reads both
+    # variables itself; they are declared here so the torch.compile cache key
+    # changes with them.
+    "B12X_MOE_DECODE_BACKEND": env_with_choices(
+        "B12X_MOE_DECODE_BACKEND", "auto", ["auto", "wm"]
+    ),
+    "B12X_MOE_WM_MAX_TOKENS": lambda: int(os.getenv("B12X_MOE_WM_MAX_TOKENS", "32")),
     # Select layer-wide activation scales for b12x NVFP4 MoE projections.
     "VLLM_B12X_MOE_FP4_LAYER_MAX_INPUT_SCALE": env_with_choices(
         "VLLM_B12X_MOE_FP4_LAYER_MAX_INPUT_SCALE",
