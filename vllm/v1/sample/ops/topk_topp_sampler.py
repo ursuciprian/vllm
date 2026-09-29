@@ -369,7 +369,10 @@ def apply_top_k_top_p(
             return apply_top_k_top_p_triton(logits, k, p)
         return apply_top_k_top_p_pytorch(logits, k, p, allow_cpu_sync=True)
 
-    if HAS_TRITON and logits.shape[0] >= 8:
+    if HAS_TRITON and (
+        logits.shape[0] >= 8
+        or (envs.VLLM_VERIFY_TOPK_TRITON and logits.dtype == torch.float32)
+    ):
         return apply_top_k_top_p_triton(logits, k, p)
 
     # Use pytorch sort implementation for small batch sizes.
