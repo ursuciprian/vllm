@@ -111,6 +111,8 @@ def _resolve_ple_table_memory(additional_config: Any) -> str:
     """Translate the public offload policy into a b12x storage mode."""
     if isinstance(additional_config, dict) and "ple_table_memory" in additional_config:
         table_memory = additional_config["ple_table_memory"]
+    elif envs.VLLM_PLE_MMAP:
+        return "io_uring"
     else:
         table_memory = envs.VLLM_PLE_TABLE_MEMORY
         if table_memory is None:
@@ -164,8 +166,13 @@ class _NGramEmbeddingStorage(nn.Module):
         self.disk_table = None
         self._table_storage = None
         if layout.caps.table_memory == "io_uring":
-            api = _b12x_module("ple_embedding")
-            self.disk_table = api.DiskTable(layout, shard_rows)
+            if envs.VLLM_PLE_MMAP:
+                from .ple_mmap import make_page_cache_disk_table
+
+                self.disk_table = make_page_cache_disk_table(layout, shard_rows)
+            else:
+                api = _b12x_module("ple_embedding")
+                self.disk_table = api.DiskTable(layout, shard_rows)
             tensors: dict[str, torch.Tensor | None] = {"weight": None}
             for name in ("weight_scale", "weight_scale_2"):
                 shape = getattr(layout, f"{name}_shape")
