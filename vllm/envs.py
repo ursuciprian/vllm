@@ -209,6 +209,7 @@ if TYPE_CHECKING:
     VLLM_QWEN3_8_FLASH_NEXT_MTP_COMPACT: bool = True
     VLLM_GDN_SPEC_DECODE_METADATA_FASTPATH: bool = True
     VLLM_MTP_NVFP4_LM_HEAD: bool = True
+    VLLM_MTP_DRAFT_VOCAB: str = ""
     VLLM_QWEN38_HC_MXFP8: str = "off"
     VLLM_QWEN3_8_FLASH_NEXT_OVERLAP: bool = True
     VLLM_B12X_MLA_CKV_GATHER: bool = False
@@ -1739,6 +1740,16 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_MTP_NVFP4_LM_HEAD": lambda: bool(
         int(os.getenv("VLLM_MTP_NVFP4_LM_HEAD", "1"))
     ),
+    # Qwen3.8-Flash-Next MTP draft head restricted to a token-id subset: a
+    # text file (optionally .gz) with one target-vocab id per line, '#'
+    # comments allowed. Empty = off. The draft head then holds K rows, and its
+    # logits are scattered back to the full vocab with -inf elsewhere, so the
+    # proposal q is exactly zero outside the subset and rejection sampling
+    # keeps the target distribution. MUST live here: K changes the draft head
+    # GEMM and logits-gather shapes, i.e. the b12x plans a boot declares, and
+    # only environment_variables entries reach envs.compile_factors(). The key
+    # hashes the path, not the file, so name files by K (ids-K65536.txt.gz).
+    "VLLM_MTP_DRAFT_VOCAB": lambda: os.getenv("VLLM_MTP_DRAFT_VOCAB", "").strip(),
     # Which Qwen3.8-Flash-Next BF16 projections are quantized to MXFP8 online.
     # MUST live here rather than behind a bare os.getenv: it changes how many
     # b12x plans a boot creates, and b12x plan handles are a process-local
