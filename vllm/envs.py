@@ -204,6 +204,7 @@ if TYPE_CHECKING:
     VLLM_B12X_BLOCKSCALED_WORKSPACE_MAX_BYTES: int = 2_000_000_000
     VLLM_MXFP8_LM_HEAD: bool = False
     VLLM_PREFIX_DROP_EXACT: bool = False
+    VLLM_VERIFY_TOPK_TRITON: bool = False
     VLLM_QWEN4_EXP_AS_FLASH_NEXT: bool = False
     VLLM_LM_HEAD_A16: bool = True
     VLLM_QWEN3_8_FLASH_NEXT_MTP_COMPACT: bool = True
@@ -1722,6 +1723,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_PREFIX_DROP_EXACT": lambda: bool(
         int(os.getenv("VLLM_PREFIX_DROP_EXACT", "0"))
     ),
+    # Use the Triton top-k/top-p kernel for FP32 logits at any row count, not
+    # only at >= 8 rows. At c1 the speculative verify path presents 1 + drafts
+    # rows (5 with MTP x4) and otherwise pays a full-vocab torch sort per step
+    # whenever a request samples with top_k/top_p. Idea from
+    # dime-online/qwen3.8-Flash-DGX-UltraFast patch_verify_topk_pivot.py.
+    "VLLM_VERIFY_TOPK_TRITON": lambda: bool(
+        int(os.getenv("VLLM_VERIFY_TOPK_TRITON", "0"))
+    ),
     # Treat model_type qwen4_exp_text (Qwen3.8-Flash-Next checkpoints published
     # under that name) as qwen3_8_flash_next_text in the GDN b12x auto-select
     # and GDN CUDA-graph support gates. Part of the compile-cache key.
@@ -2462,6 +2471,8 @@ def compile_factors() -> dict[str, object]:
         "VLLM_ENABLE_STARTUP_PLAN",
         # Scheduler-only prefix-cache policy; does not affect compiled graphs.
         "VLLM_PREFIX_DROP_EXACT",
+        # Sampler-only kernel choice; sampling runs outside compiled graphs.
+        "VLLM_VERIFY_TOPK_TRITON",
         # Location-only derived paths: where a cache/config directory lives
         # cannot affect compiled artifacts, and hashing them means relocating
         # HOME or the XDG roots silently invalidates every compile cache
