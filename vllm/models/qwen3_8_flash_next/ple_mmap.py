@@ -202,7 +202,7 @@ def _page_cache_disk_table_cls():
             self._backend = "page_cache"
             self._gds = self._native = self._reader = None
             self.ids_host = torch.empty(
-                (self.max_lookups,), dtype=torch.int64, pin_memory=True
+                (self.max_lookups,), dtype=torch.int64, device="cpu", pin_memory=True
             )
             self._ids_buffer = memoryview(self.ids_host.numpy())
             self._weight_allocation = MappedHostAllocation(
