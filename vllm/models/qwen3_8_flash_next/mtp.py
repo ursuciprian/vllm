@@ -16,6 +16,7 @@ import vllm.envs as envs
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import VllmConfig, replace, set_current_vllm_config
 from vllm.distributed import get_pp_group
+from vllm.logger import init_logger
 from vllm.model_executor.layers.linear import ReplicatedLinear
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.vocab_parallel_embedding import (
@@ -53,6 +54,11 @@ from vllm.utils.torch_utils import (
 )
 
 from .config import Qwen3_8FlashNextTextConfig
+from .draft_vocab import (
+    gather_shard_rows,
+    load_draft_vocab_ids,
+    scatter_draft_logits,
+)
 from .hyperconnection import (
     GatedResidual,
     GroupedGemmaRMSNorm,
@@ -66,6 +72,8 @@ from .model import (
     Qwen3_8FlashNextMixtureOfExperts,
     _remap_qsa_cache_scale_name,
 )
+
+logger = init_logger(__name__)
 
 
 def _mtp_api() -> Any:
@@ -669,6 +677,40 @@ direct_register_custom_op(
 )
 
 
+class DraftVocabLMHead(ParallelLMHead):
+    """ParallelLMHead over a token-id subset of the full-vocab checkpoint head.
+
+    Vocab-parallel sharding is the stock one over K rows, so TP rank r owns
+    subset rows [r*K/tp, (r+1)*K/tp). The loader receives the full [V, H]
+    ``lm_head.weight`` and keeps only this rank's subset rows. Under the b12x
+    loader that tensor is a meta view routed to the checkpoint, so only the
+    contiguous span covering this rank's ids is materialized, then gathered.
+    """
+
+    def __init__(self, draft_ids: torch.Tensor, *args, **kwargs) -> None:
+        self.draft_ids = draft_ids  # CPU, sorted; set before allocation
+        super().__init__(draft_ids.numel(), *args, **kwargs)
+
+    def weight_loader(self, param: nn.Parameter, loaded_weight: torch.Tensor):
+        from vllm.model_executor.weight_transfer import (
+            copy_weight,
+            materialize_weight,
+        )
+
+        if getattr(param, "output_dim", None) != 0 or loaded_weight.dim() != 2:
+            return super().weight_loader(param, loaded_weight)
+        s = self.shard_indices
+        # The online-quant wrapper first replays loaders on a meta param just
+        # to count copied elements; skip the checkpoint read in that pass.
+        rows = gather_shard_rows(
+            loaded_weight,
+            self.draft_ids[s.org_vocab_start_index : s.org_vocab_end_index],
+            materialize_weight if not param.is_meta else None,
+        )
+        copy_weight(param.data[: rows.shape[0]], rows)
+        param.data[rows.shape[0] :].fill_(0)
+
+
 @support_torch_compile(
     dynamic_arg_dims={
         "input_ids": 0,
@@ -743,22 +785,56 @@ class Qwen3_8FlashNextMTP(
             if isinstance(_module, LinearBase) and ".fc_" not in f".{_name}":
                 maybe_route_hc_mxfp8(_module, "mtp")
 
+        # Opt-in (VLLM_MTP_DRAFT_VOCAB): the draft head covers only a token-id
+        # subset; compute_logits scatters back to the full vocab.
+        self.draft_vocab_ids: torch.Tensor | None = None
+        if envs.VLLM_MTP_DRAFT_VOCAB:
+            if config.tie_word_embeddings:
+                raise ValueError("VLLM_MTP_DRAFT_VOCAB requires an untied lm_head")
+            self.draft_vocab_ids = load_draft_vocab_ids(
+                envs.VLLM_MTP_DRAFT_VOCAB, config.vocab_size
+            )
+        head_rows = (
+            config.vocab_size
+            if self.draft_vocab_ids is None
+            else self.draft_vocab_ids.numel()
+        )
         if get_pp_group().is_last_rank:
-            self.lm_head = ParallelLMHead(
-                config.vocab_size,
-                config.hidden_size,
+            head_kwargs = dict(
                 quant_config=self.quant_config,
                 prefix=maybe_prefix(prefix, "lm_head"),
                 lm_head_quantization="nvfp4" if self.has_own_lm_head else None,
             )
+            if self.draft_vocab_ids is None:
+                self.lm_head = ParallelLMHead(
+                    config.vocab_size, config.hidden_size, **head_kwargs
+                )
+            else:
+                self.lm_head = DraftVocabLMHead(
+                    self.draft_vocab_ids, config.hidden_size, **head_kwargs
+                )
             self.has_own_lm_head = self.lm_head.runtime_lm_head_quantization == "nvfp4"
             if config.tie_word_embeddings:
                 self.lm_head = self.lm_head.tie_weights(self.model.embed_tokens)
         else:
             self.lm_head = PPMissingLayer()
+        if self.draft_vocab_ids is not None:
+            # A subset head must never be swapped for the target's full head
+            # (load_eagle_model shares heads unless has_own_lm_head).
+            self.has_own_lm_head = True
+            # Native D2T offsets keep use_local_argmax_reduction correct too.
+            self.draft_id_to_target_id = self.draft_vocab_ids - torch.arange(
+                head_rows, device="cpu"
+            )
+            logger.info(
+                "MTP draft vocab: %d of %d ids from %s",
+                head_rows,
+                config.vocab_size,
+                envs.VLLM_MTP_DRAFT_VOCAB,
+            )
 
         self.logits_processor = LogitsProcessor(
-            config.vocab_size,
+            head_rows,
             lm_head=self.lm_head,
         )
         self.make_empty_intermediate_tensors = (
@@ -793,7 +869,12 @@ class Qwen3_8FlashNextMTP(
         hidden_states: torch.Tensor,
         spec_step_idx: int = 0,
     ) -> torch.Tensor | None:
-        return self.logits_processor(self.lm_head, hidden_states)
+        logits = self.logits_processor(self.lm_head, hidden_states)
+        if self.draft_vocab_ids is None or logits is None:
+            return logits
+        return scatter_draft_logits(
+            logits, self.draft_vocab_ids, self.config.vocab_size
+        )
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         qsa_layer_ids = frozenset(range(self.model.num_mtp_layers))
@@ -813,7 +894,12 @@ class Qwen3_8FlashNextMTP(
                 _QWEN38_FLASH_NEXT_IGNORED_MISSING_SUFFIXES.copy()
             ),
         )
-        return loader.load_weights(remap_weight_names())
+        loaded = loader.load_weights(remap_weight_names())
+        if self.draft_vocab_ids is not None:
+            device = self.model.fc_hidden.weight.device
+            self.draft_vocab_ids = self.draft_vocab_ids.to(device)
+            self.draft_id_to_target_id = self.draft_id_to_target_id.to(device)
+        return loaded
 
 
 __all__ = ["Qwen3_8FlashNextMTP", "Qwen3_8FlashNextMultiTokenPredictor"]
