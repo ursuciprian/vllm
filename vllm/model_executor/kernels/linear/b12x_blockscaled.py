@@ -87,7 +87,13 @@ class B12xBlockscaledLinear:
             int(self.packed.padded_in_features), self.out_features,
             self.activation_scale is not None, workload.max_tokens,
             workload.fixed_token_counts, workload.output_dtype,
+            self.a16_max_tokens,
         )
+
+    @property
+    def a16_max_tokens(self) -> int:
+        """VLLM_B12X_A16_MAX_TOKENS for NVFP4 weights; 0 (off) otherwise."""
+        return envs.VLLM_B12X_A16_MAX_TOKENS if self.recipe == "nvfp4" else 0
 
     def ensure_plan(self, workload: B12xWorkload):
         """Declare the exact-M regimes for the first workload; reuse afterward.
@@ -130,7 +136,13 @@ class B12xBlockscaledLinear:
             workspace_nbytes=envs.VLLM_B12X_BLOCKSCALED_WORKSPACE_MAX_BYTES,
             expected_m=None,
         )
-        self.plan = api.plan_regimes(query, exact_m=workload.fixed_token_counts)
+        cutoff = self.a16_max_tokens
+        self.plan = api.plan_regimes(
+            query,
+            exact_m=workload.fixed_token_counts,
+            # only passed when set, so b12x builds without the cutoff still plan
+            **({"a16_max_tokens": cutoff} if cutoff else {}),
+        )
         self._plan_key = key
         return self.plan
 

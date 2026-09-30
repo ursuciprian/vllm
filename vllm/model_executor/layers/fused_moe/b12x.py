@@ -9,6 +9,7 @@ from typing import Any
 
 import torch
 
+import vllm.envs as envs
 import vllm.model_executor.layers.fused_moe.modular_kernel as mk
 from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe.activation import MoEActivation
@@ -49,6 +50,25 @@ _B12X_MOE_MODES: dict[
     ("nvfp4", "mxfp8"): ("w4a8_nvfp4", "modelopt_nvfp4", "w31"),
     ("nvfp4", None): ("w4a16", "modelopt_nvfp4", "w31"),
 }
+
+
+def _a16_cutoff_kwargs(
+    quant_mode: str, source_format: str, params_dtype: torch.dtype
+) -> dict[str, int]:
+    """ActivationSpec kwargs for VLLM_B12X_A16_MAX_TOKENS.
+
+    b12x accepts the cutoff only for ModelOpt NVFP4 weights with BF16 inputs,
+    and it is a no-op for W4A16. Empty when off, so b12x builds without
+    ``a16_max_tokens`` keep working."""
+    cutoff = envs.VLLM_B12X_A16_MAX_TOKENS
+    if (
+        not cutoff
+        or quant_mode == "w4a16"
+        or source_format != "modelopt_nvfp4"
+        or params_dtype is not torch.bfloat16
+    ):
+        return {}
+    return {"a16_max_tokens": cutoff}
 
 
 def _require_b12x_fused_moe() -> Any:
@@ -368,6 +388,7 @@ class B12xExperts(mk.FusedMoEExpertsModular):
                 swiglu_limit=limit,
                 swiglu_alpha=alpha,
                 swiglu_beta=beta,
+                **_a16_cutoff_kwargs(quant_mode, self._source_format, params_dtype),
             ),
             geometry=fused_moe.MoEGeometry(
                 num_experts=num_experts,
@@ -705,6 +726,7 @@ class B12xExperts(mk.FusedMoEExpertsModular):
             route_on_input,
             counts,
             workload.output_dtype,
+            envs.VLLM_B12X_A16_MAX_TOKENS,
         )
         return (
             B12xPreparationUnit(

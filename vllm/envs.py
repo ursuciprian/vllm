@@ -196,6 +196,7 @@ if TYPE_CHECKING:
     B12X_MOE_DECODE_BACKEND: Literal["auto", "wm"] = "auto"
     B12X_MOE_WM_MAX_TOKENS: int = 32
     B12X_MOE_WM_MIN_TOKENS: int = 1
+    VLLM_B12X_A16_MAX_TOKENS: int = 0
     VLLM_B12X_MOE_FP4_LAYER_MAX_INPUT_SCALE: Literal["0", "1", "all", "w13", "w2"] = "0"
     VLLM_DEFAULT_MOE_BACKEND: str = "auto"
     VLLM_B12X_DENSE_ACTIVATION_MODE: Literal["auto", "a16", "quantized"] = "auto"
@@ -1693,6 +1694,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Optional floor for the wm backend (e.g. keep the 1..4-token MTP draft layer
     # on the dynamic kernel).
     "B12X_MOE_WM_MIN_TOKENS": lambda: int(os.getenv("B12X_MOE_WM_MIN_TOKENS", "1")),
+    # b12x A16 token cutoff (b12x b4b12bcf): NVFP4 dense linears and NVFP4 MoE
+    # run with BF16 activations for calls of at most this many tokens; larger
+    # calls keep their configured activation precision. 0 = off. MUST live
+    # here: it changes the b12x plans a boot declares (extra capacity variant
+    # at the cutoff, w13 kernel order), and only environment_variables entries
+    # reach envs.compile_factors(). Needs a b12x with a16_max_tokens support.
+    "VLLM_B12X_A16_MAX_TOKENS": lambda: int(os.getenv("VLLM_B12X_A16_MAX_TOKENS", "0")),
     # Select layer-wide activation scales for b12x NVFP4 MoE projections.
     "VLLM_B12X_MOE_FP4_LAYER_MAX_INPUT_SCALE": env_with_choices(
         "VLLM_B12X_MOE_FP4_LAYER_MAX_INPUT_SCALE",
