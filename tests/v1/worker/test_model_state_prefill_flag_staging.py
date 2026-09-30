@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """A queued prefill-flag upload must carry the flags of the step that queued it.
 
-``Qwen4ExpModelState`` and ``Glm5NextModelState`` rewrite their prefill-flag
+``Qwen3_8FlashNextModelState`` and ``Glm5NextModelState`` rewrite their prefill-flag
 host buffer in every ``prepare_attn`` and upload it with the non-blocking
 ``CpuGpuBuffer.copy_to_gpu``. Under async scheduling the host can prepare step
 N+1 while step N's upload is still queued behind earlier GPU work (for example
@@ -15,7 +15,8 @@ import pytest
 import torch
 
 from vllm.models.glm5next.model_state import Glm5NextModelState
-from vllm.models.qwen4_exp.nvidia.model_state import Qwen4ExpModelState
+from vllm.models.qwen3_8_flash_next import model_state as qwen38_model_state
+from vllm.models.qwen3_8_flash_next.model_state import Qwen3_8FlashNextModelState
 from vllm.platforms import current_platform
 from vllm.utils.torch_utils import PIN_MEMORY
 from vllm.v1.utils import CpuGpuBuffer
@@ -28,8 +29,10 @@ STEP_N = [True, False, True, False]
 STEP_N1 = [False, True, False, True]
 
 
-def _build_state(
-    state_cls: type[MambaHybridModelState], monkeypatch: pytest.MonkeyPatch
+def _build_state_on(
+    state_cls: type[MambaHybridModelState],
+    monkeypatch: pytest.MonkeyPatch,
+    device: torch.device,
 ) -> MambaHybridModelState:
     """Run the model state's own ``__init__`` over a stubbed base class."""
 
@@ -45,7 +48,13 @@ def _build_state(
         kernel_config=SimpleNamespace(linear_backend=None, moe_backend=None),
     )
     model = SimpleNamespace(modules=lambda: iter(()))
-    return state_cls(vllm_config, model, None, torch.device("cuda"))
+    return state_cls(vllm_config, model, None, device)
+
+
+def _build_state(
+    state_cls: type[MambaHybridModelState], monkeypatch: pytest.MonkeyPatch
+) -> MambaHybridModelState:
+    return _build_state_on(state_cls, monkeypatch, torch.device("cuda"))
 
 
 def _upload_two_steps(flags: CpuGpuBuffer) -> tuple[list[bool], list[bool], bool]:
@@ -66,7 +75,7 @@ def _upload_two_steps(flags: CpuGpuBuffer) -> tuple[list[bool], list[bool], bool
 @pytest.mark.parametrize(
     ("state_cls", "buffer_name"),
     [
-        pytest.param(Qwen4ExpModelState, "qsa_is_prefilling", id="qwen4_exp"),
+        pytest.param(Qwen3_8FlashNextModelState, "qsa_is_prefilling", id="qwen3_8_flash_next"),
         pytest.param(Glm5NextModelState, "selector_is_prefilling", id="glm5next"),
     ],
 )
@@ -87,3 +96,17 @@ def test_queued_prefill_flag_upload_ignores_next_step_rewrite(
     assert still_stalled, "stream drained before the rewrite; raise STALL_CYCLES"
     assert seen_n == STEP_N, "step N's queued upload read step N+1's host flags"
     assert seen_n1 == STEP_N1
+
+
+def test_qwen38_prefill_flags_use_pageable_host_memory(monkeypatch: pytest.MonkeyPatch):
+    """Host-only guard: the per-step QSA flag buffer must not be pinned."""
+    made = []
+
+    def record(*args, **kwargs):
+        made.append(kwargs)
+        return CpuGpuBuffer(*args, **{**kwargs, "device": torch.device("cpu")})
+
+    monkeypatch.setattr(qwen38_model_state, "CpuGpuBuffer", record)
+    _build_state_on(Qwen3_8FlashNextModelState, monkeypatch, torch.device("cpu"))
+    flags = [k for k in made if k.get("dtype") is torch.bool]
+    assert flags and all(k.get("pin_memory") is False for k in flags)
