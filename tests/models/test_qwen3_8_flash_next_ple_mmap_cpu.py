@@ -155,3 +155,71 @@ def test_source_past_end_of_file_is_rejected(checkpoint):
     )
     with pytest.raises(ValueError, match="exceeds"):
         rows.add_source(0, 0, str(path), path.stat().st_size - 10)
+
+
+def test_row_cache_host_buffers_ignore_default_device(monkeypatch):
+    """Model init runs under a CUDA default device; every host staging buffer
+    must name its device, or pinning fails at boot (593c8b42f). A meta default
+    device stands in for CUDA: an allocation that relies on it lands on meta."""
+    import sys
+    import types
+
+    torch = pytest.importorskip("torch")
+
+    def host_tensor(shape, dtype, device):
+        return torch.zeros(shape, dtype=dtype, device="cpu")
+
+    class MappedHostAllocation:
+        def __init__(self, shape, dtype, device):
+            self.device_view = host_tensor(shape, dtype, device)
+            self.host_view = host_tensor(shape, dtype, device)
+
+    class DiskRowCache:
+        pass
+
+    class DiskTable:
+        pass
+
+    fakes = {
+        "b12x": types.ModuleType("b12x"),
+        "b12x.sequence": types.ModuleType("b12x.sequence"),
+        "b12x.sequence._shared": types.ModuleType("b12x.sequence._shared"),
+        "b12x.sequence._shared.disk_table": types.SimpleNamespace(
+            DiskRowCache=DiskRowCache, MappedHostAllocation=MappedHostAllocation
+        ),
+        "b12x.sequence.ple_embedding": types.ModuleType("b12x.sequence.ple_embedding"),
+        "b12x.sequence.ple_embedding._disk": types.SimpleNamespace(DiskTable=DiskTable),
+    }
+    for name, module in fakes.items():
+        monkeypatch.setitem(sys.modules, name, module)
+
+    class NoPinning(torch.overrides.TorchFunctionMode):
+        # Without CUDA there is nothing to pin for; the device is what counts.
+        def __torch_function__(self, func, types, args=(), kwargs=None):
+            kwargs = dict(kwargs or {})
+            kwargs.pop("pin_memory", None)
+            return func(*args, **kwargs)
+
+    monkeypatch.setattr(torch.cuda, "Event", lambda: object())
+    layout = types.SimpleNamespace(
+        caps=types.SimpleNamespace(
+            device="cuda:0", max_tokens=4, quant_mode="nvfp4_group16"
+        ),
+        head_count=16,
+        padded_vocab_size=TABLE_ROWS,
+        shard_start=0,
+        shard_end=TABLE_ROWS,
+        weight_shape=(TABLE_ROWS, 80),
+        weight_dtype=torch.uint8,
+        head_dim=160,
+    )
+    ple_mmap._page_cache_disk_table_cls.cache_clear()
+    try:
+        with torch.device("meta"), NoPinning():
+            table = ple_mmap.make_page_cache_disk_table(layout, SHARD_ROWS)
+    finally:
+        ple_mmap._page_cache_disk_table_cls.cache_clear()
+    cache = table._cache
+    for tensor in (cache.ids_host, cache.weight_host, cache.scale_host):
+        assert tensor.device.type == "cpu"
+    assert [p.shape for p in cache._planes] == [(64, 80), (64, 10)]
