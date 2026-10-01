@@ -98,6 +98,32 @@ from .utils import request_memory
 logger = init_logger(__name__)
 
 
+def _maybe_malloc_trim(stage: str) -> None:
+    """VLLM_MALLOC_TRIM=1: hand freed glibc heap back to the OS after a startup
+    stage. On unified memory (GB10) that heap is the same pool the KV cache and
+    page cache draw from. Read from os.environ: no effect on compiled graphs."""
+    if os.environ.get("VLLM_MALLOC_TRIM", "0") != "1":
+        return
+    import ctypes
+
+    def rss_gib() -> float:
+        with open("/proc/self/statm") as fh:
+            return int(fh.read().split()[1]) * os.sysconf("SC_PAGE_SIZE") / 2**30
+
+    try:
+        before = rss_gib()
+        released = ctypes.CDLL("libc.so.6").malloc_trim(0)
+        logger.info(
+            "malloc_trim after %s: RSS %.2f -> %.2f GiB (released=%d)",
+            stage,
+            before,
+            rss_gib(),
+            released,
+        )
+    except (OSError, AttributeError) as exc:
+        logger.warning("malloc_trim after %s failed: %s", stage, exc)
+
+
 def _num_workspace_lanes(vllm_config: VllmConfig, use_v2_model_runner: bool) -> int:
     spec_config = vllm_config.speculative_config
     return (
@@ -490,6 +516,7 @@ class Worker(WorkerBase):
             self._scoped_allocator_max_split(max_split_size_mb=20),
         ):
             self.model_runner.load_model(load_dummy_weights=load_dummy_weights)
+        _maybe_malloc_trim("load_model")
 
         if self.vllm_config.weight_transfer_config is not None:
             self.weight_transfer_engine = WeightTransferEngineFactory.create_engine(
@@ -859,11 +886,15 @@ class Worker(WorkerBase):
                 self.model_runner, "_init_kv_zero_meta"
             ):
                 self.model_runner._init_kv_zero_meta()
+        _maybe_malloc_trim("initialize_from_config")
 
     @instrument(span_name="Warmup (GPU)")
     def compile_or_warm_up_model(self) -> CompilationTimes:
         with set_current_vllm_config(self.vllm_config):
-            return self._compile_or_warm_up_model_after_preparation()
+            try:
+                return self._compile_or_warm_up_model_after_preparation()
+            finally:
+                _maybe_malloc_trim("compile_or_warm_up_model")
 
     def _compile_or_warm_up_model_after_preparation(self) -> CompilationTimes:
         warmup_sizes: list[int] = []
