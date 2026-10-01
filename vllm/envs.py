@@ -212,6 +212,7 @@ if TYPE_CHECKING:
     VLLM_MTP_NVFP4_LM_HEAD: bool = True
     VLLM_MTP_DRAFT_VOCAB: str = ""
     VLLM_QWEN38_HC_MXFP8: str = "off"
+    VLLM_QWEN38_B12X_GEMV: str = "off"
     VLLM_QWEN3_8_FLASH_NEXT_OVERLAP: bool = True
     VLLM_B12X_MLA_CKV_GATHER: bool = False
     VLLM_B12X_MLA_CKV_GATHER_MIN_TOKENS: int = 16
@@ -1770,6 +1771,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
         "VLLM_QWEN38_HC_MXFP8",
         "off",
         ["hc,gate", "gate,hc", "hc", "gate", "mtp", "hc,mtp", "off"],
+        case_sensitive=False,
+    ),
+    # Qwen3.8-Flash-Next: b12x SIMT GEMV for decode rows <= 8 of BF16 projections
+    # (models/qwen3_8_flash_next/b12x_gemv.py): mtp = draft self_attn qkv/o_proj,
+    # gate = MoE router gates. Declared here so it keys the AOT compile cache.
+    "VLLM_QWEN38_B12X_GEMV": env_with_choices(
+        "VLLM_QWEN38_B12X_GEMV",
+        "off",
+        ["off", "mtp", "gate", "mtp,gate", "gate,mtp"],
         case_sensitive=False,
     ),
     # Overlap independent small-batch projections in Qwen3.8-Flash-Next graphs.

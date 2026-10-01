@@ -73,6 +73,7 @@ from vllm.sequence import IntermediateTensors
 from vllm.tokenizers.registry import cached_tokenizer_from_config
 from vllm.v1.attention.backends.registry import MambaAttentionBackendEnum
 
+from .b12x_gemv import maybe_route_b12x_gemv
 from .config import Qwen3_8FlashNextConfig, Qwen3_8FlashNextTextConfig
 from .hyperconnection import (
     GatedResidual,
@@ -158,7 +159,8 @@ class Qwen3_8FlashNextSparseMoeBlock(Qwen3NextSparseMoeBlock):
         self.n_shared_experts = int(config.shared_expert_intermediate_size > 0)
         # Router gate: [512, 2560] BF16, one GEMM per layer per decode step.
         # See hyperconnection.py for the online MXFP8 route and its env gate.
-        maybe_route_hc_mxfp8(self.gate, "gate")
+        if not maybe_route_hc_mxfp8(self.gate, "gate"):
+            maybe_route_b12x_gemv(self.gate, "gate")
 
 
 class Qwen3_8FlashNextDecoderLayer(nn.Module):

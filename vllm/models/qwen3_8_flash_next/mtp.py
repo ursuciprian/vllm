@@ -53,6 +53,7 @@ from vllm.utils.torch_utils import (
     direct_register_custom_op,
 )
 
+from .b12x_gemv import maybe_route_b12x_gemv
 from .config import Qwen3_8FlashNextTextConfig
 from .draft_vocab import (
     gather_shard_rows,
@@ -262,6 +263,9 @@ class Qwen3_8FlashNextMultiTokenPredictor(nn.Module):
                     )
                 ]
             )
+            for layer in self.layers:
+                for proj in ("qkv_proj", "o_proj"):
+                    maybe_route_b12x_gemv(getattr(layer.self_attn, proj), "mtp")
             self.hyper_connection_mixer = GatedResidual(
                 hc_config,
                 self.hyper_connection_workspace,
