@@ -223,3 +223,14 @@ def test_row_cache_host_buffers_ignore_default_device(monkeypatch):
     for tensor in (cache.ids_host, cache.weight_host, cache.scale_host):
         assert tensor.device.type == "cpu"
     assert [p.shape for p in cache._planes] == [(64, 80), (64, 10)]
+
+
+def test_reader_stats_log_every_n_reads(caplog):
+    stats = ple_mmap.ReaderStats(every=3)
+    with caplog.at_level("INFO", logger="vllm.ple_mmap"):
+        for _ in range(7):
+            stats.add(np.array([1, 1, 2, -1], np.int64), 0.001, 0.002)
+    lines = [r.getMessage() for r in caplog.records if "PLE reader" in r.getMessage()]
+    assert len(lines) == 2 and stats.reads == 1
+    assert "3 reads, 4.0 lookups/read (3.0 unique)" in lines[0]
+    assert "gather 2.000 ms/read" in lines[0]

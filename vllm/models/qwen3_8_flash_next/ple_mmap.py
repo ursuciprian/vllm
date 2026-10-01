@@ -16,18 +16,101 @@ step.
 from __future__ import annotations
 
 import functools
+import logging
 import math
 import mmap
 import os
+import re
+import resource
+import time
 from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
 from numpy.lib.stride_tricks import as_strided
 
+logger = logging.getLogger("vllm.ple_mmap")
+
 # Batches above this many lookups (prefill) are split across threads so
 # page-cache misses are in flight concurrently; decode batches stay serial.
 _PARALLEL_LOOKUPS = 2048
 _CHUNK = 1024
+
+
+def _env_int(name: str, default: int) -> int:
+    # Reader knobs are read from os.environ, not vllm/envs.py, on purpose: they
+    # change no b12x plan or graph, so they must stay out of the compile key.
+    value = os.environ.get(name, "").strip()
+    return int(value) if value else default
+
+
+def _host_counters() -> dict[str, int]:
+    """Process page faults, host-wide NVMe reads completed and page cache."""
+    usage = resource.getrusage(resource.RUSAGE_SELF)
+    out = dict(majflt=usage.ru_majflt, minflt=usage.ru_minflt, nvme_reads=0,
+               mem_available=0, cached=0)
+    try:
+        with open("/proc/diskstats") as fh:
+            for line in fh:
+                fields = line.split()
+                if re.fullmatch(r"nvme\d+n\d+", fields[2]):
+                    out["nvme_reads"] += int(fields[3])
+        with open("/proc/meminfo") as fh:
+            for line in fh:
+                key, value = line.split(":", 1)
+                if key in ("MemAvailable", "Cached"):
+                    name = "mem_available" if key == "MemAvailable" else "cached"
+                    out[name] = int(value.split()[0]) * 1024
+    except OSError:
+        pass
+    return out
+
+
+class ReaderStats:
+    """VLLM_PLE_MMAP_STATS=N: log the reader's cost every N table reads.
+
+    ``wait`` is the CPU blocked on the GPU before the gather (ids ready);
+    ``gather`` is the host row copy itself, which the next graph waits for.
+    """
+
+    def __init__(self, every: int) -> None:
+        self.every = every
+        self._host = _host_counters()
+        self._reset()
+
+    def _reset(self) -> None:
+        self.reads = self.lookups = self.unique = 0
+        self.wait_s = self.gather_s = self.max_gather_s = 0.0
+        self.t0 = time.monotonic()
+
+    def add(self, ids: np.ndarray, wait_s: float, gather_s: float) -> None:
+        self.reads += 1
+        self.lookups += ids.size
+        self.unique += np.unique(ids).size
+        self.wait_s += wait_s
+        self.gather_s += gather_s
+        self.max_gather_s = max(self.max_gather_s, gather_s)
+        if self.reads >= self.every:
+            self.flush()
+
+    def flush(self) -> None:
+        if not self.reads:
+            return
+        host, n = _host_counters(), self.reads
+        elapsed = max(time.monotonic() - self.t0, 1e-9)
+        delta = {k: host[k] - self._host[k] for k in ("majflt", "minflt", "nvme_reads")}
+        logger.info(
+            "PLE reader: %d reads, %.1f lookups/read (%.1f unique), sync wait "
+            "%.3f ms/read, gather %.3f ms/read (max %.3f), majflt %.2f/read, "
+            "minflt %.2f/read, nvme %.0f reads/s, MemAvailable %.2f GiB, "
+            "Cached %.2f GiB",
+            n, self.lookups / n, self.unique / n, 1e3 * self.wait_s / n,
+            1e3 * self.gather_s / n, 1e3 * self.max_gather_s,
+            delta["majflt"] / n, delta["minflt"] / n,
+            delta["nvme_reads"] / elapsed, host["mem_available"] / 2**30,
+            host["cached"] / 2**30,
+        )
+        self._host = host
+        self._reset()
 
 
 class PageCacheRows:
@@ -230,6 +313,8 @@ def _page_cache_disk_table_cls():
                 row_bytes=tuple(p.shape[1] for p in planes),
                 workers=min(32, os.cpu_count() or 1),
             )
+            every = _env_int("VLLM_PLE_MMAP_STATS", 0)
+            self._stats = ReaderStats(every) if every > 0 else None
             self._sources = set()
             self._frozen = False
             self._lock = threading.RLock()
@@ -257,8 +342,13 @@ def _page_cache_disk_table_cls():
 
         def _read_staged(self, count: int) -> None:
             with torch.cuda.device(self.device):
+                t0 = time.perf_counter()
                 self._ids_ready.synchronize()
-                self._rows.gather(self.ids_host.numpy()[:count], self._planes)
+                t1 = time.perf_counter()
+                ids = self.ids_host.numpy()[:count]
+                self._rows.gather(ids, self._planes)
+                if self._stats is not None:
+                    self._stats.add(ids, t1 - t0, time.perf_counter() - t1)
 
         def stats(self) -> dict[str, int | float]:
             return {"cache_bytes": sum(p.nbytes for p in self._planes)}
