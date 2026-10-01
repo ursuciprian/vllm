@@ -918,6 +918,16 @@ def test_ple_table_memory_env_overrides_cpu_offload_flag(
     assert ple_layer_module._resolve_ple_table_memory(None) == backend
 
 
+def test_ple_mmap_selects_disk_table_unless_config_says_otherwise(
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("VLLM_PLE_TABLE_MEMORY", "ram")
+    monkeypatch.setenv("VLLM_PLE_MMAP", "1")
+    assert ple_layer_module._resolve_ple_table_memory(None) == "io_uring"
+    config = {"ple_table_memory": "device"}
+    assert ple_layer_module._resolve_ple_table_memory(config) == "device"
+
+
 def test_ple_table_memory_env_rejects_backend_names(monkeypatch) -> None:
     monkeypatch.setenv("VLLM_PLE_TABLE_MEMORY", "io_uring")
     with pytest.raises(ValueError, match="VLLM_PLE_TABLE_MEMORY"):
