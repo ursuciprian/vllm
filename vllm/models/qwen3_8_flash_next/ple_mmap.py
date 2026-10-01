@@ -43,11 +43,28 @@ def _env_int(name: str, default: int) -> int:
     return int(value) if value else default
 
 
+def reader_knobs() -> dict[str, object]:
+    """PageCacheRows tuning from VLLM_PLE_MMAP_* (defaults = the old reader)."""
+    return dict(
+        workers=_env_int("VLLM_PLE_MMAP_WORKERS", min(32, os.cpu_count() or 1)),
+        parallel_lookups=_env_int("VLLM_PLE_MMAP_PARALLEL_LOOKUPS", _PARALLEL_LOOKUPS),
+        chunk=_env_int("VLLM_PLE_MMAP_CHUNK", _CHUNK),
+        willneed_max=_env_int("VLLM_PLE_MMAP_WILLNEED_MAX", 0),
+        prewarm=os.environ.get("VLLM_PLE_MMAP_PREWARM", "").strip(),
+        madvise=os.environ.get("VLLM_PLE_MMAP_MADV", "random").strip() or "random",
+    )
+
+
 def _host_counters() -> dict[str, int]:
     """Process page faults, host-wide NVMe reads completed and page cache."""
     usage = resource.getrusage(resource.RUSAGE_SELF)
-    out = dict(majflt=usage.ru_majflt, minflt=usage.ru_minflt, nvme_reads=0,
-               mem_available=0, cached=0)
+    out = dict(
+        majflt=usage.ru_majflt,
+        minflt=usage.ru_minflt,
+        nvme_reads=0,
+        mem_available=0,
+        cached=0,
+    )
     try:
         with open("/proc/diskstats") as fh:
             for line in fh:
@@ -103,10 +120,16 @@ class ReaderStats:
             "%.3f ms/read, gather %.3f ms/read (max %.3f), majflt %.2f/read, "
             "minflt %.2f/read, nvme %.0f reads/s, MemAvailable %.2f GiB, "
             "Cached %.2f GiB",
-            n, self.lookups / n, self.unique / n, 1e3 * self.wait_s / n,
-            1e3 * self.gather_s / n, 1e3 * self.max_gather_s,
-            delta["majflt"] / n, delta["minflt"] / n,
-            delta["nvme_reads"] / elapsed, host["mem_available"] / 2**30,
+            n,
+            self.lookups / n,
+            self.unique / n,
+            1e3 * self.wait_s / n,
+            1e3 * self.gather_s / n,
+            1e3 * self.max_gather_s,
+            delta["majflt"] / n,
+            delta["minflt"] / n,
+            delta["nvme_reads"] / elapsed,
+            host["mem_available"] / 2**30,
             host["cached"] / 2**30,
         )
         self._host = host
@@ -121,6 +144,16 @@ class PageCacheRows:
     contiguously at a byte offset of one file. ``gather`` writes the row of
     lookup ``i`` into row ``i`` of each output and zeros lookups outside this
     rank's ``[shard_start, shard_end)``, like b12x's O_DIRECT reader.
+
+    Tuning (all off or at the old values by default):
+      parallel_lookups / chunk / workers: gathers above ``parallel_lookups``
+        are split into ``chunk``-row jobs on ``workers`` threads.
+      willneed_max: gathers of at most this many lookups first queue a
+        posix_fadvise(WILLNEED) per row, so every page miss of the batch is in
+        flight at once instead of one serial fault after another.
+      prewarm: "scale" or "all" streams the local scale plane (then the weight
+        plane) once in a background thread after freeze, into the page cache.
+      madvise: "random" (no readahead per fault, the old behaviour) or "normal".
     """
 
     def __init__(
@@ -132,9 +165,26 @@ class PageCacheRows:
         shard_end: int,
         row_bytes: tuple[int, ...],
         workers: int = 32,
+        parallel_lookups: int = _PARALLEL_LOOKUPS,
+        chunk: int = _CHUNK,
+        willneed_max: int = 0,
+        prewarm: str = "",
+        madvise: str = "random",
     ) -> None:
         if not 0 <= shard_start <= shard_end <= table_rows or shard_rows <= 0:
             raise ValueError("invalid PLE table geometry")
+        if prewarm not in ("", "0", "scale", "all") or madvise not in (
+            "random",
+            "normal",
+        ):
+            raise ValueError(
+                "PLE reader: prewarm must be scale|all, madvise random|normal"
+            )
+        if chunk <= 0 or parallel_lookups < 0:
+            raise ValueError("PLE reader: chunk must be positive")
+        if willneed_max and not hasattr(os, "posix_fadvise"):
+            logger.warning("PLE reader: no posix_fadvise here, WILLNEED pass off")
+            willneed_max = 0
         self.table_rows = table_rows
         self.shard_rows = shard_rows
         self.shard_start = shard_start
@@ -142,9 +192,15 @@ class PageCacheRows:
         self.row_bytes = row_bytes
         self.shard_count = math.ceil(table_rows / shard_rows)
         self.workers = workers
+        self.parallel_lookups = parallel_lookups
+        self.chunk = chunk
+        self.willneed_max = willneed_max
+        self.prewarm = "" if prewarm == "0" else prewarm
+        self.madvise = madvise
         self._sources: dict[tuple[int, int], tuple[str, int]] = {}
         self._frozen = False
         self._pool: ThreadPoolExecutor | None = None
+        self._fds: list[int] = []
 
     def shard_row_count(self, shard: int) -> int:
         return min(self.shard_rows, self.table_rows - shard * self.shard_rows)
@@ -178,9 +234,14 @@ class PageCacheRows:
         maps = []
         for path in paths:
             mapped = np.memmap(path, dtype=np.uint8, mode="r")
-            # Rows are scattered: fault in one page per miss, no readahead.
-            mapped._mmap.madvise(mmap.MADV_RANDOM)
+            if self.madvise == "random":
+                # Rows are scattered: fault in one page per miss, no readahead.
+                mapped._mmap.madvise(mmap.MADV_RANDOM)
             maps.append(mapped)
+        if self.willneed_max or self.prewarm:
+            # np.memmap keeps no descriptor; fadvise and prewarm reads need one.
+            self._fds = [os.open(path, os.O_RDONLY | os.O_CLOEXEC) for path in paths]
+        self._file_index = file_index
         self._file_of, self._base_of, self._windows = [], [], []
         for plane, row_bytes in enumerate(self.row_bytes):
             file_of = np.full(self.shard_count, -1, dtype=np.int64)
@@ -209,6 +270,45 @@ class PageCacheRows:
         self._maps = maps
         self._pool = ThreadPoolExecutor(self.workers, thread_name_prefix="ple-mmap")
         self._frozen = True
+        if self.prewarm:
+            import threading
+
+            planes = [1, 0] if self.prewarm == "all" else [1]
+            threading.Thread(
+                target=self._prewarm,
+                args=([p for p in planes if p < len(self.row_bytes)],),
+                name="ple-prewarm",
+                daemon=True,
+            ).start()
+
+    def _prewarm(self, planes: list[int]) -> None:
+        """Read the local planes once, sequentially, so the page cache holds
+        whatever fits (evictable; scale rows first, 8x denser per page)."""
+        t0, total = time.monotonic(), 0
+        buf = memoryview(bytearray(8 << 20))
+        try:
+            for plane in planes:
+                for (p, shard), (path, offset) in sorted(self._sources.items()):
+                    if p != plane:
+                        continue
+                    fd = self._fds[self._file_index[path]]
+                    pos = offset
+                    end = offset + self.shard_row_count(shard) * self.row_bytes[plane]
+                    while pos < end:
+                        got = os.preadv(fd, [buf[: min(len(buf), end - pos)]], pos)
+                        if got <= 0:
+                            break
+                        pos += got
+                        total += got
+        except OSError as exc:
+            logger.warning("PLE prewarm stopped: %s", exc)
+        logger.info(
+            "PLE prewarm (planes %s): %.2f GiB (%d bytes) in %.1f s",
+            planes,
+            total / 2**30,
+            total,
+            time.monotonic() - t0,
+        )
 
     def gather(self, ids: np.ndarray, outs: tuple[np.ndarray, ...]) -> None:
         if not self._frozen:
@@ -219,26 +319,39 @@ class PageCacheRows:
         valid_ids = ids[valid]
         shard = valid_ids // self.shard_rows
         row = valid_ids - shard * self.shard_rows
+        planes = []
+        for plane in range(len(outs)):
+            file_of = self._file_of[plane][shard]
+            planes.append(
+                (file_of, self._base_of[plane][shard] + row * self.row_bytes[plane])
+            )
+        if count <= self.willneed_max and self._fds:
+            # Queue every row's page before the first blocking fault: the misses
+            # of one batch then overlap at device queue depth (one syscall each,
+            # no-op for cached pages).
+            fadvise, willneed = os.posix_fadvise, os.POSIX_FADV_WILLNEED
+            for plane, (file_of, offsets) in enumerate(planes):
+                row_bytes = self.row_bytes[plane]
+                for file, offset in zip(file_of.tolist(), offsets.tolist()):
+                    fadvise(self._fds[file], offset, row_bytes, willneed)
         jobs = []
         for plane, out in enumerate(outs):
             out[:count][~local] = 0
-            row_bytes = self.row_bytes[plane]
-            file_of = self._file_of[plane][shard]
-            offsets = self._base_of[plane][shard] + row * row_bytes
+            file_of, offsets = planes[plane]
             for file in np.unique(file_of):
                 pick = file_of == file
                 window = self._windows[plane][file]
                 targets, sources = valid[pick], offsets[pick]
-                for start in range(0, targets.size, _CHUNK):
+                for start in range(0, targets.size, self.chunk):
                     jobs.append(
                         (
                             out,
                             window,
-                            targets[start : start + _CHUNK],
-                            sources[start : start + _CHUNK],
+                            targets[start : start + self.chunk],
+                            sources[start : start + self.chunk],
                         )
                     )
-        if count > _PARALLEL_LOOKUPS and len(jobs) > 1:
+        if count > self.parallel_lookups and len(jobs) > 1:
             list(self._pool.map(lambda job: _copy_rows(*job), jobs))
         else:
             for job in jobs:
@@ -311,8 +424,9 @@ def _page_cache_disk_table_cls():
                 shard_start=self.shard_start,
                 shard_end=self.shard_end,
                 row_bytes=tuple(p.shape[1] for p in planes),
-                workers=min(32, os.cpu_count() or 1),
+                **reader_knobs(),
             )
+            logger.info("PLE page-cache reader: %s", reader_knobs())
             every = _env_int("VLLM_PLE_MMAP_STATS", 0)
             self._stats = ReaderStats(every) if every > 0 else None
             self._sources = set()

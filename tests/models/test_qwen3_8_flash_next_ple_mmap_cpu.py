@@ -75,7 +75,7 @@ def checkpoint(tmp_path_factory):
     return planes, sources
 
 
-def _rows(checkpoint, shard_start=0, shard_end=TABLE_ROWS, workers=4):
+def _rows(checkpoint, shard_start=0, shard_end=TABLE_ROWS, workers=4, **knobs):
     planes, sources = checkpoint
     rows = ple_mmap.PageCacheRows(
         table_rows=TABLE_ROWS,
@@ -84,6 +84,7 @@ def _rows(checkpoint, shard_start=0, shard_end=TABLE_ROWS, workers=4):
         shard_end=shard_end,
         row_bytes=ROW_BYTES,
         workers=workers,
+        **knobs,
     )
     registered = {
         (plane, shard)
@@ -234,3 +235,82 @@ def test_reader_stats_log_every_n_reads(caplog):
     assert len(lines) == 2 and stats.reads == 1
     assert "3 reads, 4.0 lookups/read (3.0 unique)" in lines[0]
     assert "gather 2.000 ms/read" in lines[0]
+
+
+@pytest.mark.parametrize(
+    "knobs",
+    [
+        dict(parallel_lookups=32, chunk=8),  # r8 tp1-ple-par: decode on the pool
+        dict(parallel_lookups=0, chunk=1, workers=8),
+        dict(madvise="normal"),
+    ],
+)
+@pytest.mark.parametrize("count", [80, 5000])
+def test_gather_knobs_keep_rows_identical(checkpoint, knobs, count):
+    planes, _ = checkpoint
+    rows, _ = _rows(checkpoint, **knobs)
+    ids = np.random.default_rng(7).integers(-3, TABLE_ROWS + 3, count, dtype=np.int64)
+    outs = tuple(np.full((count, b), 0xAB, np.uint8) for b in ROW_BYTES)
+    rows.gather(ids, outs)
+    for out, want in zip(outs, _expected(planes, ids, 0, TABLE_ROWS)):
+        np.testing.assert_array_equal(out, want)
+
+
+def test_willneed_pass_names_every_row(checkpoint, monkeypatch):
+    """The WILLNEED pass must advise exactly the bytes the gather then copies."""
+    import os
+
+    calls = []
+    monkeypatch.setattr(os, "posix_fadvise", lambda *a: calls.append(a), raising=False)
+    monkeypatch.setattr(os, "POSIX_FADV_WILLNEED", 3, raising=False)
+    planes, _ = checkpoint
+    rows, _ = _rows(checkpoint, willneed_max=128)
+    ids = np.array([5, -1, 999, 300, 5, TABLE_ROWS], np.int64)
+    outs = tuple(np.zeros((ids.size, b), np.uint8) for b in ROW_BYTES)
+    rows.gather(ids, outs)
+    assert len(calls) == 2 * 4  # 4 local lookups x 2 planes, none for -1 / out of range
+    got = [os.pread(fd, length, offset) for fd, offset, length, advice in calls]
+    want = [p[i].tobytes() for p in planes for i in (5, 999, 300, 5)]
+    assert got == want and all(c[3] == 3 for c in calls)
+    for out, exp in zip(outs, _expected(planes, ids, 0, TABLE_ROWS)):
+        np.testing.assert_array_equal(out, exp)
+    calls.clear()
+    big = np.arange(129, dtype=np.int64)  # above willneed_max: no pass
+    rows.gather(big, tuple(np.zeros((129, b), np.uint8) for b in ROW_BYTES))
+    assert not calls
+
+
+def test_prewarm_reads_each_local_plane_once(checkpoint, caplog):
+    import threading
+
+    with caplog.at_level("INFO", logger="vllm.ple_mmap"):
+        _rows(checkpoint, 256, 640, prewarm="all")
+        for t in threading.enumerate():
+            if t.name == "ple-prewarm":
+                t.join(10)
+    msg = next(
+        r.getMessage() for r in caplog.records if "PLE prewarm" in r.getMessage()
+    )
+    local_bytes = 3 * SHARD_ROWS * sum(ROW_BYTES)  # shards 2, 3, 4
+    assert f"({local_bytes} bytes)" in msg and "planes [1, 0]" in msg
+
+
+def test_bad_reader_knobs_are_rejected():
+    with pytest.raises(ValueError):
+        ple_mmap.PageCacheRows(
+            table_rows=10,
+            shard_rows=5,
+            shard_start=0,
+            shard_end=10,
+            row_bytes=(8,),
+            prewarm="yes",
+        )
+    with pytest.raises(ValueError):
+        ple_mmap.PageCacheRows(
+            table_rows=10,
+            shard_rows=5,
+            shard_start=0,
+            shard_end=10,
+            row_bytes=(8,),
+            chunk=0,
+        )
