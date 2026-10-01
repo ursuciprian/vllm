@@ -364,6 +364,54 @@ def _copy_rows(out, window, targets, sources) -> None:
     out[targets] = window[sources]
 
 
+def ple_hash_ids(
+    tokens: np.ndarray,
+    query_start_loc: np.ndarray,
+    history: np.ndarray,
+    num_seqs: int,
+    num_tokens: int,
+    *,
+    eos_token_id: int,
+    multipliers: np.ndarray,
+    prime_sizes: np.ndarray,
+    table_offsets: np.ndarray,
+    heads_per_order: int,
+) -> np.ndarray:
+    """NumPy twin of b12x's ``_hash_ids_kernel`` (sequence/ple_hash/_kernels.py).
+
+    ``tokens`` is the launch window (int64); rows at or past ``num_tokens`` are
+    -1. Same int64 products, EOS bounding and non-negative modulo as the kernel.
+    """
+    count, order = tokens.shape[0], multipliers.shape[0]
+    out = np.full((count, prime_sizes.shape[0]), -1, dtype=np.int64)
+    live = min(int(num_tokens), count) if num_seqs > 0 else 0
+    if live <= 0:
+        return out
+    eos = np.int64(eos_token_id)
+    token = np.arange(live)
+    starts = query_start_loc[:num_seqs].astype(np.int64)
+    request = np.searchsorted(starts, token, side="right") - 1
+    lag = np.arange(order)
+    source = (token - starts[request])[:, None] - lag  # offset in the request query
+    past = (order - 1) + source  # column in the committed history
+    from_query = tokens[np.maximum(token[:, None] - lag, 0)]
+    from_history = history[request[:, None], np.clip(past, 0, order - 2)]
+    values = np.where(
+        source >= 0, from_query, np.where(past >= 0, from_history, eos)
+    ).astype(np.int64)
+    # Lag d keeps its token only when no EOS sits at lags 1..d-1.
+    blocked = np.zeros(values.shape, dtype=bool)
+    blocked[:, 2:] = np.cumsum(values[:, 1:-1] == eos, axis=1) > 0
+    products = np.where(blocked, eos, values) * multipliers.astype(np.int64)
+    for n in range(2, order + 1):
+        mixed = np.bitwise_xor.reduce(products[:, :n], axis=1)
+        heads = slice((n - 2) * heads_per_order, (n - 1) * heads_per_order)
+        out[:live, heads] = table_offsets[heads] + np.mod(
+            mixed[:, None], prime_sizes[heads]
+        )
+    return out
+
+
 @functools.cache
 def _page_cache_disk_table_cls():
     import threading
@@ -464,6 +512,98 @@ def _page_cache_disk_table_cls():
                 if self._stats is not None:
                     self._stats.add(ids, t1 - t0, time.perf_counter() - t1)
 
+        def read_rows_hashed_on_cpu(self, binding, hash_state, token_count) -> int:
+            """VLLM_PLE_MMAP_CPU_HASH: stage the hash inputs (not the hashed
+            ids) to the host, hash there, upload the ids for the lookup and
+            gather. Returns the number of ids that differed from the GPU hash
+            when the check is armed (the GPU ids are then used)."""
+            if self._transaction_thread != threading.get_ident():
+                raise RuntimeError("read_rows requires an active disk row transaction")
+            q = hash_state.query
+            count = token_count * q.head_count
+            if not 0 <= count <= self.max_lookups:
+                raise ValueError("disk lookup count exceeds batch capacity")
+            src = {
+                "token_ids": binding.token_ids.view(-1)[:token_count],
+                "query_start_loc": binding.query_start_loc,
+                "committed_history": binding.committed_history,
+                "num_seqs": binding.num_seqs.view(-1)[:1],
+                "num_tokens": binding.num_tokens.view(-1)[:1],
+            }
+            staged = self._hash_staging(binding)
+            check = self._cpu_hash_check > 0
+            if check:
+                hash_state.run(binding._hash_binding, token_count=token_count)
+                staged["gpu_ids"][:count].copy_(
+                    binding._ids.view(-1)[:count], non_blocking=True
+                )
+            for name, tensor in src.items():
+                staged[name][: tensor.shape[0]].copy_(tensor, non_blocking=True)
+            self._ids_ready.record(self._transaction_stream)
+            t0 = time.perf_counter()
+            self._ids_ready.synchronize()
+            t1 = time.perf_counter()
+            num_seqs = int(staged["num_seqs"][0])
+            ids = ple_hash_ids(
+                staged["token_ids"].numpy()[:token_count],
+                staged["query_start_loc"].numpy(),
+                staged["committed_history"].numpy(),
+                num_seqs,
+                int(staged["num_tokens"][0]),
+                eos_token_id=q.eos_token_id,
+                heads_per_order=q.heads_per_order,
+                **self._hash_geometry,
+            ).reshape(-1)
+            host = self.ids_host.numpy()[:count]
+            host[:] = ids
+            mismatched = 0
+            if check:
+                self._cpu_hash_check -= 1
+                gpu = staged["gpu_ids"].numpy()[:count]
+                mismatched = int((gpu != host).sum())
+                if mismatched:
+                    logger.error(
+                        "PLE cpu-hash MISMATCH: %d of %d ids (%d tokens, %d seqs)",
+                        mismatched,
+                        count,
+                        token_count,
+                        num_seqs,
+                    )
+                    host[:] = gpu
+            else:
+                binding._ids.view(-1)[:count].copy_(
+                    self.ids_host[:count], non_blocking=True
+                )
+            self._rows.gather(host, self._planes)
+            if self._stats is not None:
+                self._stats.add(host, t1 - t0, time.perf_counter() - t1)
+            return mismatched
+
+        def _hash_staging(self, binding) -> dict:
+            staged = getattr(self, "_staged", None)
+            if staged is None:
+
+                def pinned(tensor):
+                    return torch.empty(
+                        tensor.shape, dtype=tensor.dtype, device="cpu", pin_memory=True
+                    )
+
+                geometry = binding._hash_binding.geometry
+                self._hash_geometry = {
+                    name: getattr(geometry, name).detach().cpu().numpy()
+                    for name in ("multipliers", "prime_sizes", "table_offsets")
+                }
+                staged = self._staged = {
+                    "token_ids": pinned(binding.token_ids.view(-1)),
+                    "query_start_loc": pinned(binding.query_start_loc),
+                    "committed_history": pinned(binding.committed_history),
+                    "num_seqs": pinned(binding.num_seqs.view(-1)[:1]),
+                    "num_tokens": pinned(binding.num_tokens.view(-1)[:1]),
+                    "gpu_ids": pinned(self.ids_host),
+                }
+                self._cpu_hash_check = _env_int("VLLM_PLE_MMAP_CPU_HASH_CHECK", 0)
+            return staged
+
         def stats(self) -> dict[str, int | float]:
             return {"cache_bytes": sum(p.nbytes for p in self._planes)}
 
@@ -480,6 +620,30 @@ def _page_cache_disk_table_cls():
             self.weight_scale_host = (
                 scale_host.view(torch.float8_e4m3fn) if scale_host is not None else None
             )
+            self._cpu_hash = _env_int("VLLM_PLE_MMAP_CPU_HASH", 0) > 0
+
+        def _run(self, binding, *, state, token_count: int) -> None:
+            if not self._cpu_hash:
+                return super()._run(binding, state=state, token_count=token_count)
+            with self._cache.transaction():
+                self._cache.read_rows_hashed_on_cpu(
+                    binding, state.hash_state, token_count
+                )
+                if token_count:
+                    weight_scale = (
+                        self.weight_scale
+                        if self._cache.scale_row_bytes
+                        else binding.weight_scale
+                    )
+                    state.run_lookup(
+                        self.weight,
+                        weight_scale,
+                        binding.weight_scale_2,
+                        binding._ids,
+                        binding.num_tokens,
+                        binding.out,
+                        token_count=token_count,
+                    )
 
     return PageCacheDiskTable
 

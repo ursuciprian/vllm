@@ -314,3 +314,75 @@ def test_bad_reader_knobs_are_rejected():
             row_bytes=(8,),
             chunk=0,
         )
+
+
+def _b12x_hash_reference():
+    """b12x's exact PyTorch hash oracle: the installed package, or a checkout
+    named by B12X_SRC (it only needs torch)."""
+    import os
+
+    pytest.importorskip("torch")
+    try:
+        from b12x.sequence.ple_hash import reference
+
+        return reference
+    except ImportError:
+        src = os.environ.get("B12X_SRC")
+        if not src:
+            pytest.skip("needs b12x or B12X_SRC=<b12x checkout>")
+        path = Path(src) / "b12x/sequence/ple_hash/reference.py"
+        spec = importlib.util.spec_from_file_location("ple_hash_reference", path)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module
+
+
+def test_cpu_hash_matches_b12x_hash_bit_for_bit():
+    """r8 tp1-ple-cpuhash: the NumPy hash must give the GPU kernel's ids
+    exactly; b12x's reference is the oracle its kernel tests compare to."""
+    import torch
+
+    ref = _b12x_hash_reference()
+    vocab, eos, order, per_order = 248320, 248044, 3, 8
+    multipliers = ref.ple_multipliers(
+        vocab_size=vocab, max_order=order, dense_layer_ordinal=0
+    )
+    sizes, offsets = ref.ple_table_geometry(
+        base_size=20_000_000, dense_layer_ordinal=0, total_heads=16
+    )
+    rng = np.random.default_rng(11)
+    for case in range(300):
+        num_seqs = int(rng.integers(1, 6))
+        lens = rng.integers(0, 7, num_seqs)
+        lens[-int(rng.integers(0, 2)) or num_seqs :] = 0  # padded requests
+        qsl = np.concatenate([[0], np.cumsum(lens)]).astype(np.int32)
+        num_tokens = int(qsl[-1])
+        window = num_tokens + int(rng.integers(0, 4))  # graph-padded launch
+        tokens = rng.integers(0, vocab, window, dtype=np.int64)
+        history = rng.integers(0, vocab, (num_seqs + 2, order - 1), dtype=np.int64)
+        for arr in (tokens, history.reshape(-1)):  # EOS boundaries
+            arr[rng.random(arr.shape) < 0.15] = eos
+        got = ple_mmap.ple_hash_ids(
+            tokens,
+            np.pad(qsl, (0, 3)),
+            history,
+            num_seqs,
+            num_tokens,
+            eos_token_id=eos,
+            multipliers=multipliers.numpy(),
+            prime_sizes=sizes.numpy(),
+            table_offsets=offsets.numpy(),
+            heads_per_order=per_order,
+        )
+        want = ref.ple_hash_packed_reference(
+            torch.from_numpy(tokens[:num_tokens]),
+            torch.from_numpy(qsl),
+            torch.from_numpy(history[:num_seqs]),
+            eos_token_id=eos,
+            multipliers=multipliers,
+            prime_sizes=sizes,
+            table_offsets=offsets,
+            heads_per_order=per_order,
+        ).numpy()
+        np.testing.assert_array_equal(got[:num_tokens], want, err_msg=f"case {case}")
+        assert (got[num_tokens:] == -1).all()
