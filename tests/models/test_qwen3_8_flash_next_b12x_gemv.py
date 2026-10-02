@@ -21,10 +21,18 @@ def test_gemv_matches_linear_and_falls_back(n, k):
     method = b12x_gemv.B12xGemvLinearMethod(f"test.{n}x{k}")
     method.process_weights_after_loading(layer)
     assert method.name in b12x_gemv._LAUNCHERS
-    for m in (1, 5, 8, 9, 64):
+    for m in (1, 2, 5, 8, 9, 64):
         x = torch.randn(m, k, device="cuda").to(torch.bfloat16)
-        ref = F.linear(x, layer.weight).float()
-        out = method.apply(layer, x).float()
-        err = ((out - ref).norm() / ref.norm()).item()
-        # BF16 operands, FP32 accumulation: only the summation order differs.
-        assert err < (1e-3 if m <= b12x_gemv.MAX_ROWS else 1e-6), (m, err)
+        exact = F.linear(x.float(), layer.weight.float())
+
+        def err(y):
+            return ((y.float() - exact).norm() / exact.norm()).item()
+
+        out = method.apply(layer, x)
+        if m > b12x_gemv.MAX_ROWS:  # fallback is the stock F.linear call
+            assert torch.equal(out, F.linear(x, layer.weight)), m
+            continue
+        # FP32 accumulation, one BF16 rounding of the output: b12x sits on the
+        # BF16 rounding floor. Do not compare against cuBLAS: its split-K router
+        # GEMM (N=512, M>=2) adds BF16 partials and is itself ~2.4e-3 off.
+        assert err(out) <= 1.05 * err(exact.to(torch.bfloat16)), (m, err(out))
