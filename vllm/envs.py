@@ -197,6 +197,7 @@ if TYPE_CHECKING:
     B12X_MOE_WM_MAX_TOKENS: int = 32
     B12X_MOE_WM_MIN_TOKENS: int = 1
     VLLM_B12X_A16_MAX_TOKENS: int = 0
+    VLLM_B12X_BLOCKSCALED_PIN: str = ""
     VLLM_B12X_MOE_FP4_LAYER_MAX_INPUT_SCALE: Literal["0", "1", "all", "w13", "w2"] = "0"
     VLLM_DEFAULT_MOE_BACKEND: str = "auto"
     VLLM_B12X_DENSE_ACTIVATION_MODE: Literal["auto", "a16", "quantized"] = "auto"
@@ -1702,6 +1703,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # at the cutoff, w13 kernel order), and only environment_variables entries
     # reach envs.compile_factors(). Needs a b12x with a16_max_tokens support.
     "VLLM_B12X_A16_MAX_TOKENS": lambda: int(os.getenv("VLLM_B12X_A16_MAX_TOKENS", "0")),
+    # Pin decode-sized b12x blockscaled regimes per (N, K), e.g. "2560x6144@16=a16:64:128:8".
+    # It changes the declared b12x plans, so it lives here and keys the AOT compile cache.
+    "VLLM_B12X_BLOCKSCALED_PIN": lambda: os.getenv("VLLM_B12X_BLOCKSCALED_PIN", "").strip(),
     # Select layer-wide activation scales for b12x NVFP4 MoE projections.
     "VLLM_B12X_MOE_FP4_LAYER_MAX_INPUT_SCALE": env_with_choices(
         "VLLM_B12X_MOE_FP4_LAYER_MAX_INPUT_SCALE",

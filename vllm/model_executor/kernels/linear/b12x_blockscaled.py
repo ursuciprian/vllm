@@ -37,6 +37,26 @@ def _operands(packed, recipe: str):
     return weight.values, weight.scale_mma, None, "none"
 
 
+def parse_blockscaled_pins(spec: str) -> list[tuple[int, int, int, dict]]:
+    """``NxK@MAXROWS=a16:TILE_N:TILE_K:SPLIT`` rules, ``;``-separated.
+
+    Example: ``2560x6144@16=a16:64:128:8`` pins every declared regime of N=2560,
+    K=6144 with at most 16 rows to the A16 64x128 split-8 config.
+    """
+    rules = []
+    for item in filter(None, (part.strip() for part in (spec or "").split(";"))):
+        shape, _, cfg = item.partition("=")
+        nk, _, max_rows = shape.partition("@")
+        n, _, k = nk.partition("x")
+        mode, *knobs = cfg.split(":")
+        if mode != "a16" or len(knobs) != 3 or not max_rows:
+            raise ValueError(f"VLLM_B12X_BLOCKSCALED_PIN: bad rule {item!r}")
+        tile_n, tile_k, split_k = map(int, knobs)
+        rules.append((int(n), int(k), int(max_rows),
+                      {"mode": "a16", "tile_n": tile_n, "tile_k": tile_k, "split_k": split_k}))
+    return rules
+
+
 class B12xBlockscaledLinear:
     def __init__(
         self,
@@ -137,14 +157,31 @@ class B12xBlockscaledLinear:
             expected_m=None,
         )
         cutoff = self.a16_max_tokens
+        overrides = self._pins(api, (*workload.fixed_token_counts, workload.max_tokens))
         self.plan = api.plan_regimes(
             query,
             exact_m=workload.fixed_token_counts,
             # only passed when set, so b12x builds without the cutoff still plan
             **({"a16_max_tokens": cutoff} if cutoff else {}),
+            **({"overrides": overrides} if overrides else {}),
         )
         self._plan_key = key
         return self.plan
+
+    def _pins(self, api, counts) -> dict:
+        """VLLM_B12X_BLOCKSCALED_PIN regimes for this weight's (N, K): {rows: config}."""
+        out = {}
+        for rule in parse_blockscaled_pins(envs.VLLM_B12X_BLOCKSCALED_PIN):
+            n, k, max_rows, cfg = rule
+            if (n, k) != (self.out_features, self.in_features):
+                continue
+            for rows in counts:
+                if rows <= max_rows and rows not in out:
+                    out[rows] = api.BlockscaledConfig(**cfg)
+        if out:
+            logger.info_once("%s: b12x blockscaled pin %dx%d rows %s -> %s", self.layer_name,
+                             self.out_features, self.in_features, sorted(out), next(iter(out.values())))
+        return out
 
     def _call_factory(self, rows: int):
         values, scales, global_scale, _ = self._operands()
