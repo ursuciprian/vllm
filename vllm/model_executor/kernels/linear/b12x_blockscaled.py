@@ -180,7 +180,8 @@ class B12xBlockscaledLinear:
                     out[rows] = api.BlockscaledConfig(**cfg)
         if out:
             logger.info_once("%s: b12x blockscaled pin %dx%d rows %s -> %s", self.layer_name,
-                             self.out_features, self.in_features, sorted(out), next(iter(out.values())))
+                             self.out_features, self.in_features, tuple(sorted(out)),
+                             str(next(iter(out.values()))))
         return out
 
     def _call_factory(self, rows: int):
