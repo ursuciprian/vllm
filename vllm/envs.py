@@ -220,6 +220,7 @@ if TYPE_CHECKING:
     VLLM_PLE_CPU_OFFLOAD: bool = False
     VLLM_PLE_TABLE_MEMORY: Literal["ram", "disk"] | None = None
     VLLM_PLE_MMAP: bool = False
+    VLLM_PLE_MMAP_KEEPALIVE_MS: int = 0
     VLLM_DEEPEPLL_NVFP4_DISPATCH: bool = False
     VLLM_V1_USE_OUTLINES_CACHE: bool = False
     VLLM_TPU_USING_PATHWAYS: bool = False
@@ -1812,6 +1813,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # so a single GB10 keeps only the hot rows resident. Selects the disk
     # table layout, which changes the b12x PLE plans.
     "VLLM_PLE_MMAP": lambda: bool(int(os.getenv("VLLM_PLE_MMAP", "0"))),
+    # Page-cache PLE reader: every N ms while gathers are recent, read one 4 KiB
+    # block of the table with O_DIRECT so the NVMe drive never sits idle past
+    # its APST timeout (100 ms) and the next step's page-cache misses do not
+    # pay the low-power exit latency (~10 ms). 0 = off. Read by ple_mmap.py.
+    "VLLM_PLE_MMAP_KEEPALIVE_MS": lambda: int(
+        os.getenv("VLLM_PLE_MMAP_KEEPALIVE_MS", "0")
+    ),
     # Allow use of FlashInfer MxInt4 MoE kernels for fused moe ops.
     "VLLM_USE_FLASHINFER_MOE_INT4": lambda: bool(
         int(os.getenv("VLLM_USE_FLASHINFER_MOE_INT4", "0"))
@@ -2486,6 +2494,8 @@ def compile_factors() -> dict[str, object]:
         "VLLM_ENABLE_STARTUP_PLAN",
         # Scheduler-only prefix-cache policy; does not affect compiled graphs.
         "VLLM_PREFIX_DROP_EXACT",
+        # Host-side disk keepalive of the PLE reader; no plan or graph change.
+        "VLLM_PLE_MMAP_KEEPALIVE_MS",
         # Location-only derived paths: where a cache/config directory lives
         # cannot affect compiled artifacts, and hashing them means relocating
         # HOME or the XDG roots silently invalidates every compile cache

@@ -116,6 +116,23 @@ def test_gather_matches_in_memory_table(checkpoint, count):
         assert (out[count:] == 0xAB).all()  # positional: nothing past count
 
 
+def test_keepalive_reads_only_while_gathers_are_recent(checkpoint, monkeypatch):
+    import time
+
+    monkeypatch.setattr(ple_mmap, "_KEEPALIVE_IDLE_S", 0.3)
+    rows, _ = _rows(checkpoint, keepalive_ms=10)
+    time.sleep(0.15)
+    assert rows.keepalive_reads == 0  # no gather yet: the drive may sleep
+    outs = tuple(np.empty((8, b), np.uint8) for b in ROW_BYTES)
+    rows.gather(np.arange(8, dtype=np.int64), outs)
+    time.sleep(0.15)
+    assert rows.keepalive_reads > 0
+    time.sleep(0.4)  # past the idle window: the reads stop
+    idle = rows.keepalive_reads
+    time.sleep(0.15)
+    assert rows.keepalive_reads == idle
+
+
 def test_tp_rank_reads_only_its_rows(checkpoint):
     planes, _ = checkpoint
     lo, hi = 256, 640  # rank 1 of a TP split

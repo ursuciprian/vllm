@@ -22,6 +22,7 @@ import mmap
 import os
 import re
 import resource
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 
@@ -34,6 +35,9 @@ logger = logging.getLogger("vllm.ple_mmap")
 # page-cache misses are in flight concurrently; decode batches stay serial.
 _PARALLEL_LOOKUPS = 2048
 _CHUNK = 1024
+# Keepalive reads stop this long after the last gather (an idle server lets
+# the drive sleep; the first step after it pays one wake-up).
+_KEEPALIVE_IDLE_S = 2.0
 
 
 def _env_int(name: str, default: int) -> int:
@@ -52,6 +56,7 @@ def reader_knobs() -> dict[str, object]:
         willneed_max=_env_int("VLLM_PLE_MMAP_WILLNEED_MAX", 0),
         prewarm=os.environ.get("VLLM_PLE_MMAP_PREWARM", "").strip(),
         madvise=os.environ.get("VLLM_PLE_MMAP_MADV", "random").strip() or "random",
+        keepalive_ms=_env_int("VLLM_PLE_MMAP_KEEPALIVE_MS", 0),
     )
 
 
@@ -154,6 +159,11 @@ class PageCacheRows:
       prewarm: "scale" or "all" streams the local scale plane (then the weight
         plane) once in a background thread after freeze, into the page cache.
       madvise: "random" (no readahead per fault, the old behaviour) or "normal".
+      keepalive_ms: while gathers are recent, one 4 KiB O_DIRECT read every
+        keepalive_ms. An NVMe drive idle for the kernel's APST timeout (100 ms)
+        drops to a low-power state, and the first miss of the next gather pays
+        its exit latency (~10 ms on the Spark's drive): once per decode step as
+        soon as a step takes longer than the timeout (TP=1 c4/c8).
     """
 
     def __init__(
@@ -170,6 +180,7 @@ class PageCacheRows:
         willneed_max: int = 0,
         prewarm: str = "",
         madvise: str = "random",
+        keepalive_ms: int = 0,
     ) -> None:
         if not 0 <= shard_start <= shard_end <= table_rows or shard_rows <= 0:
             raise ValueError("invalid PLE table geometry")
@@ -197,6 +208,9 @@ class PageCacheRows:
         self.willneed_max = willneed_max
         self.prewarm = "" if prewarm == "0" else prewarm
         self.madvise = madvise
+        self.keepalive_ms = keepalive_ms
+        self.keepalive_reads = 0
+        self._last_gather = -math.inf
         self._sources: dict[tuple[int, int], tuple[str, int]] = {}
         self._frozen = False
         self._pool: ThreadPoolExecutor | None = None
@@ -270,9 +284,12 @@ class PageCacheRows:
         self._maps = maps
         self._pool = ThreadPoolExecutor(self.workers, thread_name_prefix="ple-mmap")
         self._frozen = True
+        if self.keepalive_ms > 0 and paths:
+            threading.Thread(
+                target=self._keepalive, args=(paths[0],), name="ple-keepalive",
+                daemon=True,
+            ).start()
         if self.prewarm:
-            import threading
-
             planes = [1, 0] if self.prewarm == "all" else [1]
             threading.Thread(
                 target=self._prewarm,
@@ -310,9 +327,32 @@ class PageCacheRows:
             time.monotonic() - t0,
         )
 
+    def _keepalive(self, path: str) -> None:
+        # O_DIRECT so the read reaches the drive, not the page cache; an
+        # anonymous mmap is the page-aligned buffer O_DIRECT needs.
+        try:
+            fd = os.open(path, os.O_RDONLY | os.O_CLOEXEC | getattr(os, "O_DIRECT", 0))
+        except OSError as exc:
+            logger.warning("PLE keepalive off: %s", exc)
+            return
+        buf = mmap.mmap(-1, 4096)
+        logger.info("PLE keepalive: one 4 KiB read every %d ms", self.keepalive_ms)
+        while True:
+            time.sleep(self.keepalive_ms / 1e3)
+            if time.monotonic() - self._last_gather > _KEEPALIVE_IDLE_S:
+                continue
+            try:
+                os.preadv(fd, [buf], 0)
+            except OSError as exc:
+                logger.warning("PLE keepalive stopped: %s", exc)
+                os.close(fd)
+                return
+            self.keepalive_reads += 1
+
     def gather(self, ids: np.ndarray, outs: tuple[np.ndarray, ...]) -> None:
         if not self._frozen:
             raise RuntimeError("PLE rows are not frozen")
+        self._last_gather = time.monotonic()
         count = ids.shape[0]
         local = (ids >= self.shard_start) & (ids < self.shard_end)
         valid = np.flatnonzero(local)
