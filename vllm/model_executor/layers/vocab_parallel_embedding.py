@@ -362,6 +362,8 @@ class VocabParallelEmbedding(PluggableLayer):
 
         is_embedding_layer = not isinstance(self, ParallelLMHead)
         head_quantization = lm_head_quantization
+        if head_quantization is None and envs.VLLM_LM_HEAD_NVFP4 != "off":
+            head_quantization = "nvfp4"
         if head_quantization is None and envs.VLLM_MXFP8_LM_HEAD:
             head_quantization = "mxfp8"
         self.runtime_lm_head_quantization: Literal["mxfp8", "nvfp4"] | None = None
@@ -376,9 +378,11 @@ class VocabParallelEmbedding(PluggableLayer):
                 quant_method, (UnquantizedEmbeddingMethod, UnquantizedLinearMethod)
             )
             flag = (
-                "VLLM_MTP_NVFP4_LM_HEAD"
-                if head_quantization == "nvfp4"
-                else "VLLM_MXFP8_LM_HEAD"
+                "VLLM_MXFP8_LM_HEAD"
+                if head_quantization == "mxfp8"
+                else "VLLM_MTP_NVFP4_LM_HEAD"
+                if lm_head_quantization == "nvfp4"
+                else "VLLM_LM_HEAD_NVFP4"
             )
             model_config = get_current_vllm_config().model_config
             tied = getattr(

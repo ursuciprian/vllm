@@ -205,6 +205,7 @@ if TYPE_CHECKING:
     VLLM_B12X_MXFP8_ACTIVATION_MODE: Literal["auto", "a16", "quantized"] | None = None
     VLLM_B12X_BLOCKSCALED_WORKSPACE_MAX_BYTES: int = 2_000_000_000
     VLLM_MXFP8_LM_HEAD: bool = False
+    VLLM_LM_HEAD_NVFP4: Literal["off", "rtn", "mse"] = "off"
     VLLM_PREFIX_DROP_EXACT: bool = False
     VLLM_QWEN4_EXP_AS_FLASH_NEXT: bool = False
     VLLM_LM_HEAD_A16: bool = True
@@ -1736,6 +1737,16 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     # Quantize eligible unquantized LM heads on b12x only when explicitly enabled.
     "VLLM_MXFP8_LM_HEAD": lambda: bool(int(os.getenv("VLLM_MXFP8_LM_HEAD", "0"))),
+    # Runtime NVFP4 (weight-only, BF16 activations) for eligible unquantized LM
+    # heads that are not quantized otherwise, ahead of VLLM_MXFP8_LM_HEAD, and
+    # the block-scale rule of every online NVFP4 head (the MTP draft head too):
+    # rtn = absmax, mse = per-16-block search over amax/6 x (1.0..0.8) keeping
+    # the lowest squared error. MUST live here: it changes the main head GEMM
+    # (MXFP8 -> NVFP4), i.e. the b12x plans a boot declares, and only
+    # environment_variables entries reach envs.compile_factors().
+    "VLLM_LM_HEAD_NVFP4": env_with_choices(
+        "VLLM_LM_HEAD_NVFP4", "off", ["off", "rtn", "mse"]
+    ),
     # EAGLE/MTP prefix caching: keep the last matched full block when the
     # request's token after it equals the token the cached drafter KV was
     # written with, instead of always dropping that block. Scheduler-only.
