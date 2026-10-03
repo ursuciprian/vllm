@@ -11,6 +11,7 @@ from vllm.triton_utils import tl, triton
 __all__ = [
     "break_fp4_bytes",
     "dequantize_to_dtype",
+    "nvfp4_quantize_mse",
     "ref_nvfp4_quant",
 ]
 
@@ -426,6 +427,65 @@ def ref_nvfp4_quant(x, global_scale, block_size):
     clipped_x = torch.clamp(scaled_x, -6.0, 6.0).reshape(m, n)
     # both outputs are float32
     return cast_to_fp4(clipped_x), scale.squeeze(-1)
+
+
+# Block-scale candidates of nvfp4_quantize_mse: amax / 6 times each factor.
+NVFP4_MSE_SCALE_FACTORS = (1.0, 0.95, 0.9, 0.85, 0.8)
+
+
+def nvfp4_quantize_mse(
+    weight: torch.Tensor,
+    global_scale: torch.Tensor,
+    factors: tuple[float, ...] = NVFP4_MSE_SCALE_FACTORS,
+    rows_per_chunk: int = 8192,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Weight-only NVFP4 with a per-block MSE scale search.
+
+    Same outputs as ``scaled_fp4_quant(weight, global_scale,
+    is_sf_swizzled_layout=False)``: packed E2M1 ``uint8 [N, K // 2]`` (even
+    element in the low nibble) and linear E4M3 block scales ``[N, K // 16]``.
+    Every 16-element block tries the scales ``amax / 6 * f`` for ``f`` in
+    ``factors`` (values past the range saturate at +-6) and keeps the one with
+    the lowest squared reconstruction error, the first factor on ties.
+    Rounding is to nearest, ties to the even code; ``factors=(1.0,)`` is the
+    absmax quantization of ``ref_nvfp4_quant``.
+    """
+    n, k = weight.shape
+    assert k % 16 == 0, f"last dim has to be multiple of 16, but got {k}."
+    dev = weight.device
+    values = torch.tensor([0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0], device=dev)
+    # Midpoints, plus inf so that the tie lookup below never indexes past them.
+    bounds = torch.cat([(values[1:] + values[:-1]) / 2, values.new_tensor([1e30])])
+    gs = global_scale.float().reshape(()).to(dev)
+    packed = torch.empty(n, k // 2, dtype=torch.uint8, device=dev)
+    scales = torch.empty(n, k // 16, dtype=torch.float8_e4m3fn, device=dev)
+    for r in range(0, n, rows_per_chunk):
+        blk = weight[r : r + rows_per_chunk].float().view(-1, k // 16, 16)
+        amax = blk.abs().amax(-1)
+        best_err = best_scale = best_code = None
+        for f in factors:
+            scale = (gs * (amax * (f / 6.0))).clamp(max=448.0)
+            scale = scale.to(torch.float8_e4m3fn)
+            step = (scale.float() / gs).unsqueeze(-1)
+            x = torch.where(step > 0, blk / step, torch.zeros_like(blk))
+            ax = x.abs().clamp(max=6.0)
+            mag = torch.bucketize(ax, bounds[:-1])
+            mag += (ax == bounds[mag]) & (mag % 2 == 1)
+            err = ((values[mag] * step - blk.abs()) ** 2).sum(-1)
+            code = (mag | (((x < 0) & (mag > 0)).long() << 3)).to(torch.uint8)
+            if best_err is None:
+                best_err, best_scale, best_code = err, scale, code
+                continue
+            take = err < best_err
+            best_err = torch.minimum(err, best_err)
+            best_scale = torch.where(
+                take, scale.view(torch.uint8), best_scale.view(torch.uint8)
+            ).view(torch.float8_e4m3fn)
+            best_code = torch.where(take.unsqueeze(-1), code, best_code)
+        rows = best_code.view(-1, k)
+        packed[r : r + rows.shape[0]] = rows[:, 0::2] | (rows[:, 1::2] << 4)
+        scales[r : r + rows.shape[0]] = best_scale
+    return packed, scales
 
 
 def ref_nvfp4_quant_dequant(

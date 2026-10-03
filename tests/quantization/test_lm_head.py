@@ -338,6 +338,118 @@ def test_runtime_mxfp8_b12x_shard_loading_and_graph(
         graph.reset()
     session.close()
 
+class _StubNvfp4Kernel:
+    """CPU stand-in for B12xNvFp4LinearKernel (selection and weight packing only)."""
+
+    def __init__(self, config):
+        del config
+
+    @classmethod
+    def is_supported(cls):
+        return True, None
+
+    def process_weights_after_loading(self, layer):
+        del layer
+
+
+@pytest.mark.cpu_test
+@pytest.mark.parametrize(
+    ("nvfp4", "mxfp8", "expected"),
+    [
+        ("off", "1", "mxfp8"),
+        ("mse", "1", "nvfp4"),
+        ("rtn", "0", "nvfp4"),
+        ("off", "0", None),
+    ],
+)
+def test_lm_head_nvfp4_knob_selects_main_head(
+    monkeypatch, mxfp8_head_config, nvfp4, mxfp8, expected
+):
+    import vllm.envs as envs
+    from vllm.model_executor.layers.quantization.online import mxfp8 as mx
+    from vllm.model_executor.layers.quantization.online import nvfp4 as fp4
+
+    monkeypatch.setenv("VLLM_LM_HEAD_NVFP4", nvfp4)
+    monkeypatch.setenv("VLLM_MXFP8_LM_HEAD", mxfp8)
+    monkeypatch.setattr(mx, "init_mxfp8_linear_kernel", lambda: None)
+    monkeypatch.setattr(fp4, "B12xNvFp4LinearKernel", _StubNvfp4Kernel)
+    head = ParallelLMHead(256, 128, params_dtype=torch.bfloat16, disable_tp=True)
+    embedding = VocabParallelEmbedding(
+        256, 128, params_dtype=torch.bfloat16, disable_tp=True
+    )
+    assert head.runtime_lm_head_quantization == expected
+    assert isinstance(embedding.quant_method, UnquantizedEmbeddingMethod)
+    # A changed main-head GEMM changes the b12x plans: it must key the AOT cache.
+    assert envs.compile_factors()["VLLM_LM_HEAD_NVFP4"] == nvfp4
+
+
+@pytest.mark.cpu_test
+def test_nvfp4_quantize_mse_codec():
+    from vllm.model_executor.layers.quantization.utils.nvfp4_emulation_utils import (
+        break_fp4_bytes,
+        nvfp4_quantize_mse,
+        ref_nvfp4_quant,
+    )
+
+    torch.manual_seed(0)
+    w = torch.randn(96, 256) * 0.02
+    w[3, 7] = 0.5  # one outlier block
+    w[5, 16:32] = 0.0  # one all-zero block
+    w = w.bfloat16()
+    gs = 2688.0 / w.abs().amax().float()
+
+    def dequant(q, s):
+        vals = break_fp4_bytes(q, torch.float32).view(96, 16, 16)
+        return (vals * s.float().unsqueeze(-1) / gs).view(96, 256)
+
+    def block_err(q, s):
+        return ((dequant(q, s) - w.float()) ** 2).view(96, 16, 16).sum(-1)
+
+    # rows_per_chunk 40 leaves a 16-row tail chunk.
+    rtn_q, rtn_s = nvfp4_quantize_mse(w, gs, factors=(1.0,), rows_per_chunk=40)
+    assert rtn_q.shape == (96, 128) and rtn_q.dtype == torch.uint8
+    assert rtn_s.shape == (96, 16) and rtn_s.dtype == torch.float8_e4m3fn
+    ref_vals, ref_s = ref_nvfp4_quant(w.float(), gs, 16)
+    assert (rtn_s.float() == ref_s).float().mean() > 0.999
+    assert (break_fp4_bytes(rtn_q, torch.float32) == ref_vals).float().mean() > 0.999
+    assert torch.equal(dequant(rtn_q, rtn_s)[5, 16:32], torch.zeros(16))
+
+    q, s = nvfp4_quantize_mse(w, gs, rows_per_chunk=40)
+    err, rtn_err = block_err(q, s), block_err(rtn_q, rtn_s)
+    assert (err <= rtn_err * (1 + 1e-6) + 1e-12).all()
+    assert err.sum() < 0.95 * rtn_err.sum()
+    assert (s.float() <= rtn_s.float()).all()  # factors only shrink a scale
+
+
+@pytest.mark.cpu_test
+@pytest.mark.parametrize("rule", ["rtn", "mse"])
+def test_online_nvfp4_head_block_scale_rule(monkeypatch, mxfp8_head_config, rule):
+    from vllm.model_executor.layers.quantization.online import nvfp4 as fp4
+    from vllm.model_executor.layers.quantization.utils.nvfp4_emulation_utils import (
+        nvfp4_quantize_mse,
+    )
+
+    monkeypatch.setenv("VLLM_LM_HEAD_NVFP4", rule)
+    monkeypatch.setattr(fp4, "B12xNvFp4LinearKernel", _StubNvfp4Kernel)
+    calls = []
+    monkeypatch.setattr(
+        fp4, "scaled_fp4_quant", lambda w, g, **kw: calls.append(1) or (w, w)
+    )
+    torch.manual_seed(1)
+    w = (torch.randn(64, 128) * 0.02).bfloat16()
+    layer = torch.nn.Module()
+    layer.weight = torch.nn.Parameter(w.clone(), requires_grad=False)
+    fp4.Nvfp4OnlineLinearMethod(use_a16=True).process_weights_after_loading(layer)
+    if rule == "rtn":
+        assert calls == [1]
+        return
+    assert calls == []
+    q, s = nvfp4_quantize_mse(w, 2688.0 / w.abs().amax().float())
+    assert torch.equal(layer.weight, q)
+    assert torch.equal(layer.weight_scale.view(torch.uint8), s.view(torch.uint8))
+    assert layer.b12x_activation_mode == "a16"
+
+
 def test_lm_head(
     vllm_runner,
     model_id: str,

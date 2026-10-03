@@ -4,7 +4,9 @@
 import torch
 from torch.nn import Module
 
+import vllm.envs as envs
 from vllm._custom_ops import scaled_fp4_quant
+from vllm.logger import init_logger
 from vllm.model_executor.kernels.linear.nvfp4.b12x import (
     B12xNvFp4LinearKernel,
     run_b12x_nvfp4_serialized_linear,
@@ -24,6 +26,8 @@ from vllm.model_executor.layers.quantization.online.moe_base import (
 )
 from vllm.model_executor.layers.quantization.utils.nvfp4_emulation_utils import (
     FLOAT4_E2M1_MAX,
+    NVFP4_MSE_SCALE_FACTORS,
+    nvfp4_quantize_mse,
 )
 from vllm.model_executor.layers.quantization.utils.quant_utils import (
     amax_for_moe_weight_quant,
@@ -35,6 +39,8 @@ from vllm.model_executor.utils import replace_parameter
 from vllm.platforms import current_platform
 
 FLOAT8_E4M3_MAX = torch.finfo(torch.float8_e4m3fn).max
+
+logger = init_logger(__name__)
 
 
 class Nvfp4OnlineLinearMethod(_Fp8OnlineLinearBase):
@@ -58,9 +64,16 @@ class Nvfp4OnlineLinearMethod(_Fp8OnlineLinearBase):
             raise ValueError("Online NVFP4 head requires K divisible by 16")
         amax = weight.abs().amax().float().clamp_min(1e-8)
         global_scale = (FLOAT4_E2M1_MAX * FLOAT8_E4M3_MAX) / amax
-        packed, scales = scaled_fp4_quant(
-            weight, global_scale, is_sf_swizzled_layout=False
-        )
+        if envs.VLLM_LM_HEAD_NVFP4 == "mse":
+            logger.info_once(
+                "NVFP4 LM head block scales: MSE search over amax/6 x %s.",
+                NVFP4_MSE_SCALE_FACTORS,
+            )
+            packed, scales = nvfp4_quantize_mse(weight, global_scale)
+        else:
+            packed, scales = scaled_fp4_quant(
+                weight, global_scale, is_sf_swizzled_layout=False
+            )
         replace_parameter(layer, "weight", packed)
         replace_parameter(layer, "weight_scale", scales)
         replace_parameter(layer, "weight_global_scale", global_scale.reciprocal())
