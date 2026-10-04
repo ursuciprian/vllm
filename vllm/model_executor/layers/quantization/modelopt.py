@@ -1385,7 +1385,9 @@ class ModelOptNvFp4W4A16LinearMethod(LinearMethodBase):
         del layer.weight_scale_2
 
         mxfp8_copy = None
-        if self.checkpoint_prefixes and getattr(layer, "b12x_large_m_linear", None) is None:
+        if self.checkpoint_prefixes and getattr(layer, "b12x_large_m_linear", None) is not None:
+            raise NotImplementedError("reloading a layer with an MXFP8 large-M copy")
+        if self.checkpoint_prefixes:
             from vllm.model_executor.kernels.linear.nvfp4.b12x import (
                 B12xNvFp4LinearKernel,
                 load_mxfp8_large_m_copy,
@@ -2455,8 +2457,10 @@ class ModelOptMixedPrecisionConfig(ModelOptQuantConfigBase):
             if quant_algo == "NVFP4":
                 return ModelOptNvFp4LinearMethod(self.nvfp4_config)
             if quant_algo == "W4A16_NVFP4":
+                # Only the GDN projections take the MXFP8 large-M copy.
                 return ModelOptNvFp4W4A16LinearMethod(
-                    self.w4a16_nvfp4_config, self._checkpoint_prefixes(prefix)
+                    self.w4a16_nvfp4_config,
+                    self._checkpoint_prefixes(prefix) if ".linear_attn." in prefix else (),
                 )
             if quant_algo == "MXFP8":
                 return ModelOptMxFp8LinearMethod(self.mxfp8_config)

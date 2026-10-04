@@ -176,7 +176,8 @@ def test_copy_rejects_wrong_shard_order_and_partition(fused_checkpoint):
 
 def test_copy_is_off_without_knob_or_names(fused_checkpoint, monkeypatch):
     layer, _ = fused_checkpoint
-    assert nvfp4_mod.load_mxfp8_large_m_copy(layer, [("absent.name",)]) is None
+    with pytest.raises(ValueError, match="no MXFP8 weights"):
+        nvfp4_mod.load_mxfp8_large_m_copy(layer, [("absent.name",)])
     monkeypatch.setenv("VLLM_B12X_NVFP4_MXFP8_MIN_TOKENS", "0")
     assert nvfp4_mod.load_mxfp8_large_m_copy(layer, [(QKV, Z)]) is None
     monkeypatch.setenv("VLLM_B12X_NVFP4_MXFP8_MIN_TOKENS", "41")
@@ -228,7 +229,7 @@ def test_each_path_matches_its_standalone_layer(tmp_path, monkeypatch):
         reset_workspace_manager,
     )
 
-    from .test_b12x_linear import _prepare
+    from test_b12x_linear import _prepare  # same directory, no package
 
     monkeypatch.setattr(parameter, "get_tensor_model_parallel_rank", lambda: 0)
     monkeypatch.setattr(parameter, "get_tensor_model_parallel_world_size", lambda: 1)
@@ -269,7 +270,8 @@ def test_each_path_matches_its_standalone_layer(tmp_path, monkeypatch):
             plain_nv, nv_layer = w4a16(((name,),))
             assert getattr(nv_layer, "b12x_large_m_linear", None) is None
             plain_mx = ModelOptMxFp8LinearMethod(
-                ModelOptMxFp8Config(is_checkpoint_mxfp8_serialized=True))
+                ModelOptMxFp8Config(is_checkpoint_mxfp8_serialized=True,
+                                    kv_cache_quant_algo=None, exclude_modules=[]))
             mx_layer = torch.nn.Module()
             with torch.device(device):
                 plain_mx.create_weights(mx_layer, k, [n], k, n, torch.bfloat16)
@@ -286,6 +288,10 @@ def test_each_path_matches_its_standalone_layer(tmp_path, monkeypatch):
                                          else (plain_nv, nv_layer))
                 expected = ref_method.apply(ref_layer, source)
                 assert torch.equal(both.apply(layer, source), expected), rows
+                wanted = layer.b12x_large_m_linear if rows >= cutoff else layer.b12x_linear
+                assert b12x_linear_for(layer, rows) is wanted
+                if rows >= cutoff:  # the paths differ, so equality above proves the switch
+                    assert not torch.equal(plain_nv.apply(nv_layer, source), expected), rows
                 exact = (source.float() @ decoded.to(device).T)
                 assert ((expected.float() - exact).norm() / exact.norm()) < 0.05
                 if rows in fixed:
