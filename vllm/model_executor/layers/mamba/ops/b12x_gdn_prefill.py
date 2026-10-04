@@ -9,9 +9,19 @@ from typing import Any
 
 import torch
 
+import vllm.envs as envs
+from vllm.logger import init_logger
 from vllm.triton_utils import tl, triton
 from vllm.utils.b12x import get_b12x_gdn_prefill, get_b12x_scratch_buffers
 from vllm.v1.worker.workspace import retain_cuda_graph_capture_resource
+
+logger = init_logger(__name__)
+
+# VLLM_GDN_SHARED_PREFILL_STAGING=1: one staging per shape and device, shared by every GDN
+# layer of the process. B12xGdnPrefill.run copies its inputs in, runs the kernel and copies
+# the output out on the current stream, and nothing reads the staging between calls, so
+# layers that run one after another can use the same buffers.
+_SHARED_STAGING: dict[tuple, "GdnPrefillStaging"] = {}
 
 @triton.jit
 def _stage_metadata(
@@ -89,6 +99,30 @@ class GdnPrefillStaging:
 
     @classmethod
     def allocate(
+        cls,
+        *,
+        max_tokens: int,
+        max_seqs: int,
+        key_heads: int,
+        value_heads: int,
+        device: torch.device,
+    ) -> "GdnPrefillStaging":
+        if not envs.VLLM_GDN_SHARED_PREFILL_STAGING:
+            return cls._allocate(max_tokens=max_tokens, max_seqs=max_seqs,
+                                 key_heads=key_heads, value_heads=value_heads,
+                                 device=device)
+        key = (max_tokens, max_seqs, key_heads, value_heads, torch.device(device))
+        staging = _SHARED_STAGING.get(key)
+        if staging is None:
+            staging = _SHARED_STAGING[key] = cls._allocate(
+                max_tokens=max_tokens, max_seqs=max_seqs, key_heads=key_heads,
+                value_heads=value_heads, device=device)
+            logger.info("GDN prefill staging shared across layers: %.1f MiB on %s",
+                        staging.nbytes / 2**20, key[-1])
+        return staging
+
+    @classmethod
+    def _allocate(
         cls,
         *,
         max_tokens: int,
