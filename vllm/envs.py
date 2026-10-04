@@ -222,6 +222,7 @@ if TYPE_CHECKING:
     VLLM_PLE_TABLE_MEMORY: Literal["ram", "disk"] | None = None
     VLLM_PLE_MMAP: bool = False
     VLLM_PLE_MMAP_KEEPALIVE_MS: int = 0
+    VLLM_PLE_MMAP_PREFILL_WILLNEED: bool = False
     VLLM_DEEPEPLL_NVFP4_DISPATCH: bool = False
     VLLM_V1_USE_OUTLINES_CACHE: bool = False
     VLLM_TPU_USING_PATHWAYS: bool = False
@@ -1828,6 +1829,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_PLE_MMAP_KEEPALIVE_MS": lambda: int(
         os.getenv("VLLM_PLE_MMAP_KEEPALIVE_MS", "0")
     ),
+    # Page-cache PLE reader: prefill-sized gathers queue posix_fadvise(WILLNEED)
+    # for their rows on a helper thread while the pool copies, so cold rows are
+    # read at device queue depth. Same rows, host side only. Read by ple_mmap.py.
+    "VLLM_PLE_MMAP_PREFILL_WILLNEED": lambda: bool(
+        int(os.getenv("VLLM_PLE_MMAP_PREFILL_WILLNEED", "0"))
+    ),
     # Allow use of FlashInfer MxInt4 MoE kernels for fused moe ops.
     "VLLM_USE_FLASHINFER_MOE_INT4": lambda: bool(
         int(os.getenv("VLLM_USE_FLASHINFER_MOE_INT4", "0"))
@@ -2504,6 +2511,8 @@ def compile_factors() -> dict[str, object]:
         "VLLM_PREFIX_DROP_EXACT",
         # Host-side disk keepalive of the PLE reader; no plan or graph change.
         "VLLM_PLE_MMAP_KEEPALIVE_MS",
+        # Host-side prefill readahead of the PLE reader; same rows, no graph change.
+        "VLLM_PLE_MMAP_PREFILL_WILLNEED",
         # Location-only derived paths: where a cache/config directory lives
         # cannot affect compiled artifacts, and hashing them means relocating
         # HOME or the XDG roots silently invalidates every compile cache
