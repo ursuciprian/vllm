@@ -57,6 +57,7 @@ def reader_knobs() -> dict[str, object]:
         prewarm=os.environ.get("VLLM_PLE_MMAP_PREWARM", "").strip(),
         madvise=os.environ.get("VLLM_PLE_MMAP_MADV", "random").strip() or "random",
         keepalive_ms=_env_int("VLLM_PLE_MMAP_KEEPALIVE_MS", 0),
+        prefill_willneed=bool(_env_int("VLLM_PLE_MMAP_PREFILL_WILLNEED", 0)),
     )
 
 
@@ -94,8 +95,9 @@ class ReaderStats:
     ``gather`` is the host row copy itself, which the next graph waits for.
     """
 
-    def __init__(self, every: int) -> None:
+    def __init__(self, every: int, large: int = 0) -> None:
         self.every = every
+        self.large = large
         self._host = _host_counters()
         self._reset()
 
@@ -140,6 +142,24 @@ class ReaderStats:
         self._host = host
         self._reset()
 
+    def log_large(
+        self, ids: np.ndarray, gather_s: float, before: dict, advised: int
+    ) -> None:
+        """VLLM_PLE_MMAP_STATS_LARGE: one line per prefill-sized gather."""
+        host = _host_counters()
+        logger.info(
+            "PLE gather: %d lookups (%d unique), gather %.3f ms, majflt %d, "
+            "nvme reads %d, advised %d, MemAvailable %.2f GiB, Cached %.2f GiB",
+            ids.size,
+            np.unique(ids).size,
+            1e3 * gather_s,
+            host["majflt"] - before["majflt"],
+            host["nvme_reads"] - before["nvme_reads"],
+            advised,
+            host["mem_available"] / 2**30,
+            host["cached"] / 2**30,
+        )
+
 
 class PageCacheRows:
     """Positional row gather over checkpoint row planes.
@@ -159,6 +179,11 @@ class PageCacheRows:
       prewarm: "scale" or "all" streams the local scale plane (then the weight
         plane) once in a background thread after freeze, into the page cache.
       madvise: "random" (no readahead per fault, the old behaviour) or "normal".
+      prefill_willneed: gathers above ``willneed_max`` (prefill chunks) get a
+        helper thread that queues posix_fadvise(WILLNEED) for their rows in the
+        order the pool copies them, while it copies. Cold rows are then read at
+        device queue depth instead of one blocking fault per worker. The helper
+        stops when the copy is done, so a warm gather pays ~nothing.
       keepalive_ms: while gathers are recent, one 4 KiB O_DIRECT read every
         keepalive_ms. An NVMe drive idle for the kernel's APST timeout (100 ms)
         drops to a low-power state, and the first miss of the next gather pays
@@ -181,6 +206,7 @@ class PageCacheRows:
         prewarm: str = "",
         madvise: str = "random",
         keepalive_ms: int = 0,
+        prefill_willneed: bool = False,
     ) -> None:
         if not 0 <= shard_start <= shard_end <= table_rows or shard_rows <= 0:
             raise ValueError("invalid PLE table geometry")
@@ -193,9 +219,9 @@ class PageCacheRows:
             )
         if chunk <= 0 or parallel_lookups < 0:
             raise ValueError("PLE reader: chunk must be positive")
-        if willneed_max and not hasattr(os, "posix_fadvise"):
+        if (willneed_max or prefill_willneed) and not hasattr(os, "posix_fadvise"):
             logger.warning("PLE reader: no posix_fadvise here, WILLNEED pass off")
-            willneed_max = 0
+            willneed_max, prefill_willneed = 0, False
         self.table_rows = table_rows
         self.shard_rows = shard_rows
         self.shard_start = shard_start
@@ -209,6 +235,8 @@ class PageCacheRows:
         self.prewarm = "" if prewarm == "0" else prewarm
         self.madvise = madvise
         self.keepalive_ms = keepalive_ms
+        self.prefill_willneed = prefill_willneed
+        self.last_advised = 0
         self.keepalive_reads = 0
         self._last_gather = -math.inf
         self._sources: dict[tuple[int, int], tuple[str, int]] = {}
@@ -252,7 +280,7 @@ class PageCacheRows:
                 # Rows are scattered: fault in one page per miss, no readahead.
                 mapped._mmap.madvise(mmap.MADV_RANDOM)
             maps.append(mapped)
-        if self.willneed_max or self.prewarm:
+        if self.willneed_max or self.prewarm or self.prefill_willneed:
             # np.memmap keeps no descriptor; fadvise and prewarm reads need one.
             self._fds = [os.open(path, os.O_RDONLY | os.O_CLOEXEC) for path in paths]
         self._file_index = file_index
@@ -283,6 +311,11 @@ class PageCacheRows:
             )
         self._maps = maps
         self._pool = ThreadPoolExecutor(self.workers, thread_name_prefix="ple-mmap")
+        self._ahead = (
+            ThreadPoolExecutor(1, thread_name_prefix="ple-ahead")
+            if self.prefill_willneed
+            else None
+        )
         self._frozen = True
         if self.keepalive_ms > 0 and paths:
             threading.Thread(
@@ -374,7 +407,7 @@ class PageCacheRows:
                 row_bytes = self.row_bytes[plane]
                 for file, offset in zip(file_of.tolist(), offsets.tolist()):
                     fadvise(self._fds[file], offset, row_bytes, willneed)
-        jobs = []
+        jobs, ahead = [], []
         for plane, out in enumerate(outs):
             out[:count][~local] = 0
             file_of, offsets = planes[plane]
@@ -391,11 +424,49 @@ class PageCacheRows:
                             sources[start : start + self.chunk],
                         )
                     )
+                    ahead.append((int(file), self.row_bytes[plane]))
+        self.last_advised = 0
         if count > self.parallel_lookups and len(jobs) > 1:
-            list(self._pool.map(lambda job: _copy_rows(*job), jobs))
+            readahead = None
+            if self._ahead is not None and count > self.willneed_max:
+                stop = threading.Event()
+                readahead = self._ahead.submit(self._advise, jobs, ahead, stop)
+            try:
+                list(self._pool.map(lambda job: _copy_rows(*job), jobs))
+            finally:
+                if readahead is not None:
+                    stop.set()
+                    self.last_advised = readahead.result()
         else:
             for job in jobs:
                 _copy_rows(*job)
+
+    def _advise(self, jobs, ahead, stop: threading.Event) -> int:
+        """WILLNEED the rows of ``jobs`` in the order the pool copies them: one
+        wave of ``workers`` jobs at a time, row k of each job in the wave before
+        row k + 1 of any. Stops as soon as ``stop`` is set (the copy is done);
+        returns the number of calls made."""
+        fadvise, willneed, fds = os.posix_fadvise, os.POSIX_FADV_WILLNEED, self._fds
+        calls = 0
+        try:
+            for wave in range(0, len(jobs), self.workers):
+                group = [
+                    (fds[file], row_bytes, job[3].tolist())
+                    for job, (file, row_bytes) in zip(
+                        jobs[wave : wave + self.workers],
+                        ahead[wave : wave + self.workers],
+                    )
+                ]
+                for k in range(max(len(g[2]) for g in group)):
+                    for fd, row_bytes, offsets in group:
+                        if k < len(offsets):
+                            if stop.is_set():
+                                return calls
+                            fadvise(fd, offsets[k], row_bytes, willneed)
+                            calls += 1
+        except Exception as exc:  # advice only: the copy faults the rows in anyway
+            logger.warning("PLE prefill WILLNEED stopped: %s", exc)
+        return calls
 
 
 def _copy_rows(out, window, targets, sources) -> None:
@@ -516,7 +587,8 @@ def _page_cache_disk_table_cls():
             )
             logger.info("PLE page-cache reader: %s", reader_knobs())
             every = _env_int("VLLM_PLE_MMAP_STATS", 0)
-            self._stats = ReaderStats(every) if every > 0 else None
+            large = _env_int("VLLM_PLE_MMAP_STATS_LARGE", 0)
+            self._stats = ReaderStats(every, large) if every > 0 else None
             self._sources = set()
             self._frozen = False
             self._lock = threading.RLock()
@@ -548,9 +620,15 @@ def _page_cache_disk_table_cls():
                 self._ids_ready.synchronize()
                 t1 = time.perf_counter()
                 ids = self.ids_host.numpy()[:count]
+                stats = self._stats
+                large = stats is not None and 0 < stats.large <= count
+                before = _host_counters() if large else None
                 self._rows.gather(ids, self._planes)
-                if self._stats is not None:
-                    self._stats.add(ids, t1 - t0, time.perf_counter() - t1)
+                if stats is not None:
+                    t2 = time.perf_counter()
+                    stats.add(ids, t1 - t0, t2 - t1)
+                    if large:
+                        stats.log_large(ids, t2 - t1, before, self._rows.last_advised)
 
         def read_rows_hashed_on_cpu(self, binding, hash_state, token_count) -> int:
             """VLLM_PLE_MMAP_CPU_HASH: stage the hash inputs (not the hashed
