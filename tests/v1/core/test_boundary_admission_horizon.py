@@ -355,3 +355,12 @@ def test_queued_checkpoint_pressure_preserves_admission_control(
     cache.block_pool.free_blocks(held)
     cache.free(active)
     assert cache.block_pool.get_num_free_blocks() == 1933
+
+
+def test_compact_records_keep_the_boundary_restore_lookahead(monkeypatch):
+    # MTP-4: the speculative blocks used to stand in for the drafter window.
+    monkeypatch.delenv("VLLM_GDN_COMPACT_RECORDS", raising=False)
+    shipped = manager(spec=4, num_lookahead_tokens=4)._boundary_restore_lookahead
+    monkeypatch.setenv("VLLM_GDN_COMPACT_RECORDS", "1")
+    compact = manager(spec=0, num_lookahead_tokens=4)._boundary_restore_lookahead
+    assert compact == shipped == 5
