@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import contextlib
 from dataclasses import dataclass, replace
 from types import SimpleNamespace
 from typing import TYPE_CHECKING
@@ -1252,15 +1253,30 @@ def test_b12x_moe_cuda_graph_replay(
 
 
 @pytest.mark.skipif(not _has_b12x_moe(), reason="requires b12x MoE on SM120")
+@pytest.mark.parametrize("tokens", [5, 20, 40])
 @torch.inference_mode()
-def test_b12x_w4a16_moe_tail_routing_keeps_tail_rows_exact(workspace_init) -> None:
-    """MTP draft-prefill tail routing must not change the rows that are used."""
-    from vllm.models.qwen3_8_flash_next.tail_routing import TailRouting
+def test_b12x_w4a16_moe_tail_routing_keeps_tail_rows(tokens: int) -> None:
+    """MTP draft-prefill tail routing must not change the rows that are used.
 
-    with set_current_vllm_config(
-        VllmConfig(parallel_config=ParallelConfig(pipeline_parallel_size=1))
-    ):
-        case = _make_b12x_moe_case("nvfp4", None, tokens=20, seed=29)
+    Each request (5 rows) gives every row its tail row's routes. Tail rows must
+    match the unrouted run: bit-exact on the expert-packed path, within
+    tolerance at M <= 8, where direct TC-decode sums FC2 with atomics. Sets up
+    its own workspace so it also runs with ``--noconftest`` in a serving image.
+    """
+    from vllm.v1.worker.workspace import (
+        init_workspace_manager,
+        reset_workspace_manager,
+    )
+
+    with contextlib.ExitStack() as cleanup:
+        init_workspace_manager(torch.device(0))
+        cleanup.callback(reset_workspace_manager)
+        cleanup.enter_context(
+            set_current_vllm_config(
+                VllmConfig(parallel_config=ParallelConfig(pipeline_parallel_size=1))
+            )
+        )
+        case = _make_b12x_moe_case("nvfp4", None, tokens=tokens, seed=29)
         kernel, session, _ = _make_b12x_moe_kernel(
             case.hidden_states,
             case.w1,
@@ -1269,17 +1285,13 @@ def test_b12x_w4a16_moe_tail_routing_keeps_tail_rows_exact(workspace_init) -> No
             case.activation,
             case.quant_config,
         )
+        cleanup.callback(session.close)
         topk_weights, topk_ids, _ = fused_topk(
             case.hidden_states, case.score, case.topk, renormalize=False
         )
-        tails = torch.tensor([2, 9, 10, 17], device="cuda")
-        routing = TailRouting(20, "cuda")
-        routing.begin(
-            torch.tensor([0, 5, 10, 15, 20], dtype=torch.int32, device="cuda"),
-            tails,
-            4,
-        )
-        sources = routing.select(20)
+        rows = torch.arange(tokens, device="cuda")
+        tails = rows[2::5]
+        sources = tails.repeat_interleave(5)[:tokens]
 
         def apply(weights: torch.Tensor, ids: torch.Tensor) -> torch.Tensor:
             return kernel.apply(
@@ -1294,18 +1306,17 @@ def test_b12x_w4a16_moe_tail_routing_keeps_tail_rows_exact(workspace_init) -> No
                 apply_router_weight_on_input=False,
             )
 
-        try:
-            full = apply(topk_weights, topk_ids).clone()
-            routed = apply(
-                topk_weights.index_select(0, sources),
-                topk_ids.index_select(0, sources),
-            )
-            torch.accelerator.synchronize()
-        finally:
-            session.close()
+        full = apply(topk_weights, topk_ids).clone()
+        routed = apply(
+            topk_weights.index_select(0, sources), topk_ids.index_select(0, sources)
+        )
+        torch.accelerator.synchronize()
 
     assert torch.isfinite(routed).all()
-    assert torch.equal(routed[tails], full[tails])
+    if tokens > 8:
+        assert torch.equal(routed[tails], full[tails])
+    else:
+        torch.testing.assert_close(routed[tails], full[tails], atol=2e-2, rtol=2e-2)
 
 
 @pytest.mark.skipif(not _has_b12x_moe(), reason="requires b12x MoE on SM120")

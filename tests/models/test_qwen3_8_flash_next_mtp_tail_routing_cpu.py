@@ -43,10 +43,11 @@ def test_inactive_oversized_and_empty_batches_keep_own_rows() -> None:
     assert routing.select(20).tolist() == list(range(20))
 
 
-def test_stale_tail_index_stays_inside_its_request() -> None:
+def test_capture_time_zero_tails_stay_in_bounds() -> None:
+    # capture() zeroes last_token_indices before on_prefill_begin.
     routing = TailRouting(20, "cpu")
-    routing.begin(QSL, torch.tensor([7, 3, 99, 15]), 4)
-    assert routing.select(17).tolist() == [4] * 5 + [5] * 5 + [11] * 2 + [15] * 5
+    routing.begin(QSL, torch.zeros(6, dtype=torch.int64), 4)
+    assert routing.select(20).tolist() == [0] * 17 + [17, 18, 19]
 
 
 def test_router_wrapper_keeps_tail_routes_and_shrinks_expert_set() -> None:

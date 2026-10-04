@@ -3,10 +3,13 @@
 
 import torch.nn as nn
 
+from vllm.logger import init_logger
 from vllm.v1.worker.gpu.spec_decode.autoregressive.speculator import (
     AutoRegressiveSpeculator,
 )
 from vllm.v1.worker.gpu.spec_decode.eagle.utils import load_eagle_model
+
+logger = init_logger(__name__)
 
 
 class MTPSpeculator(AutoRegressiveSpeculator):
@@ -44,6 +47,12 @@ class MTPSpeculator(AutoRegressiveSpeculator):
         self.prefill_tail_routing = getattr(
             draft_model.model, "prefill_tail_routing", None
         )
+        if self.prefill_tail_routing is not None and getattr(
+            draft_model.model.layers[0].mlp.experts, "is_monolithic", False
+        ):
+            # A monolithic MoE routes inside its kernel and never calls the router.
+            logger.warning("MTP prefill tail routing off: monolithic draft MoE")
+            self.prefill_tail_routing = None
         return draft_model
 
     def on_prefill_begin(self, num_reqs: int) -> None:

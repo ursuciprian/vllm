@@ -299,14 +299,20 @@ class Qwen3_8FlashNextMultiTokenPredictor(nn.Module):
         if self.supports_mtp_prefill_compaction:
             self._prefill_output_indices = self._decode_output_indices
         self.prefill_tail_routing: TailRouting | None = None
-        if (
-            envs.VLLM_MTP_PREFILL_TAIL_ROUTING
-            and not self.supports_mtp_prefill_compaction
-        ):
+        if envs.VLLM_MTP_PREFILL_TAIL_ROUTING:
+            parallel = vllm_config.parallel_config
             experts = getattr(self.layers[0].mlp, "experts", None)
             router = getattr(experts, "router", None)
-            if router is None:
-                logger.warning("MTP prefill tail routing: no MoE router, left off")
+            if self.supports_mtp_prefill_compaction:
+                logger.info("MTP prefill tail routing off: prefill rows are compacted")
+            elif (
+                parallel.data_parallel_size > 1
+                or parallel.prefill_context_parallel_size > 1
+            ):
+                # The MoE may then see rows gathered from other ranks.
+                logger.warning("MTP prefill tail routing off: needs DP=1 and PCP=1")
+            elif router is None:
+                logger.warning("MTP prefill tail routing off: no MoE router")
             else:
                 self.prefill_tail_routing = TailRouting(max_tokens, device)
                 install_tail_routing(router, self.prefill_tail_routing)

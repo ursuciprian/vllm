@@ -12,11 +12,16 @@ num_tokens rows to those of num_reqs rows.
 
 from __future__ import annotations
 
-from typing import Any
+from typing import TYPE_CHECKING
 
 import torch
 
 from vllm.logger import init_logger
+
+if TYPE_CHECKING:
+    from vllm.model_executor.layers.fused_moe.router.fused_moe_router import (
+        FusedMoERouter,
+    )
 
 logger = init_logger(__name__)
 
@@ -28,7 +33,6 @@ class TailRouting:
         self.rows = torch.arange(capacity, dtype=torch.int64, device=device)
         self.sources = self.rows.clone()
         self.active = False
-        self.engaged = False
 
     def begin(
         self,
@@ -40,19 +44,16 @@ class TailRouting:
 
         Rows past the last request keep their own routing. Runs eagerly before
         the draft prefill (graph replays read ``sources``), with no host sync.
+        A tail lies inside its request, so every source is below the row count;
+        at capture ``last_token_indices`` is zeroed, mapping rows to row 0.
         """
         if num_reqs <= 0:
             self.sources.copy_(self.rows)
         else:
-            bounds = query_start_loc[: num_reqs + 1].to(torch.int64)
-            starts, ends = bounds[:-1], bounds[1:]
+            ends = query_start_loc[1 : num_reqs + 1].to(torch.int64)
             req = torch.searchsorted(ends, self.rows, right=True)
-            inside = req < num_reqs
-            req.clamp_(max=num_reqs - 1)
-            # Clamp into the request's own rows so a stale index cannot leave it.
-            tail = last_token_indices[:num_reqs].to(torch.int64)[req]
-            tail = torch.minimum(torch.maximum(tail, starts[req]), ends[req] - 1)
-            torch.where(inside, tail, self.rows, out=self.sources)
+            tails = last_token_indices[:num_reqs][req.clamp(max=num_reqs - 1)]
+            torch.where(req < num_reqs, tails, self.rows, out=self.sources)
         self.active = True
 
     def end(self) -> None:
@@ -64,7 +65,7 @@ class TailRouting:
         return self.sources[:num_rows]
 
 
-def install_tail_routing(router: Any, routing: TailRouting) -> None:
+def install_tail_routing(router: FusedMoERouter, routing: TailRouting) -> None:
     """Wrap ``router.select_experts`` so active rows take their source's routes."""
     select_experts = router.select_experts
 
@@ -73,9 +74,7 @@ def install_tail_routing(router: Any, routing: TailRouting) -> None:
         sources = routing.select(topk_ids.shape[0])
         if sources is None:
             return topk_weights, topk_ids
-        if not routing.engaged:
-            routing.engaged = True
-            logger.info("MTP prefill tail routing engaged (%d rows)", sources.numel())
+        logger.info_once("MTP prefill tail routing engaged in the draft MoE")
         return topk_weights.index_select(0, sources), topk_ids.index_select(0, sources)
 
-    router.select_experts = tail_routed_select_experts
+    router.select_experts = tail_routed_select_experts  # type: ignore[method-assign]
