@@ -690,6 +690,10 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
         self.enable_partial_hash_hits = (
             has_partial_mamba_group or has_partial_attention_group
         )
+        if envs.VLLM_HYBRID_ATTN_BLOCK_SIZE > 0:
+            # The hash unit is only finer because attention blocks are; keep
+            # hits on the mamba block, as with one block size for all groups.
+            self.enable_partial_hash_hits = False
         if self.enable_partial_hash_hits:
             unsupported_partial_hit_managers = {
                 type(manager).__name__

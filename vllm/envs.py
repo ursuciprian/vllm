@@ -131,6 +131,7 @@ if TYPE_CHECKING:
     VLLM_GDN_DECODE_KERNEL: Literal["b12x", "cuda", "triton"] = "cuda"
     VLLM_GDN_DEFERRED_CHECKPOINTS: bool = False
     VLLM_GDN_COMPACT_RECORDS: bool = False
+    VLLM_HYBRID_ATTN_BLOCK_SIZE: int = 0
     VLLM_GDN_UNIFORM_DECODE_META_SKIP: bool = False
     VLLM_DISABLE_PYNCCL: bool = False
     VLLM_USE_OINK_OPS: bool = False
@@ -1285,6 +1286,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_GDN_COMPACT_RECORDS": lambda: (
         os.getenv("VLLM_GDN_COMPACT_RECORDS", "0").lower()
         in ("true", "1", "yes", "on")
+    ),
+    # Hybrid attention+mamba models in align mode: tokens per attention block.
+    # 0 (default) grows the attention block until one attention page holds a
+    # mamba state page. N > 0 keeps the mamba page as the pool block, packs
+    # every attention layer of a bucket into one group of N-token pages inside
+    # that block, and checkpoints mamba state every N * floor(old block / N)
+    # tokens.
+    "VLLM_HYBRID_ATTN_BLOCK_SIZE": lambda: int(
+        os.getenv("VLLM_HYBRID_ATTN_BLOCK_SIZE", "0")
     ),
     # Disable pynccl (using torch.distributed instead)
     "VLLM_DISABLE_PYNCCL": lambda: (
@@ -2596,7 +2606,10 @@ def compile_factors() -> dict[str, object]:
         try:
             raw = getter()
             # Hashed only when on, so the off key stays the pre-knob key.
-            if factor == "VLLM_GDN_COMPACT_RECORDS" and not raw:
+            if (
+                factor in ("VLLM_GDN_COMPACT_RECORDS", "VLLM_HYBRID_ATTN_BLOCK_SIZE")
+                and not raw
+            ):
                 continue
         except Exception as exc:  # pragma: no cover - defensive logging
             logger.warning(

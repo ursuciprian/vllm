@@ -1324,6 +1324,59 @@ def _get_kv_cache_groups_uniform_page_size(
     return _split_kv_cache_layer_buckets(kv_cache_spec, layer_buckets, group_counts)
 
 
+def _get_kv_cache_groups_packed_attention(
+    kv_cache_spec: dict[str, KVCacheSpec],
+) -> list[KVCacheGroupSpec]:
+    """Group a hybrid model whose attention block is smaller than its mamba page.
+
+    Used with ``VLLM_HYBRID_ATTN_BLOCK_SIZE``. Mamba buckets are split as in
+    ``_get_kv_cache_groups_uniform_page_size`` (the smallest mamba bucket sets
+    the layers per group), so the pool block keeps its size. Each attention
+    bucket becomes a single group whose per-layer pages sit side by side in
+    that block (block-outermost layout).
+
+    Args:
+        kv_cache_spec: The KVCacheSpec of each attention layer in the model.
+
+    Returns:
+        The generated KVCacheGroupSpecs, in bucket order.
+
+    Raises:
+        ValueError: If the model lacks attention or mamba layers, the mamba
+            pages differ, or an attention group does not fit in the pool block.
+    """
+    layer_buckets = _get_kv_cache_layer_buckets(kv_cache_spec)
+    is_mamba = [isinstance(kv_cache_spec[b[0]], MambaSpec) for b in layer_buckets]
+    if all(is_mamba) or not any(is_mamba):
+        raise ValueError(
+            "VLLM_HYBRID_ATTN_BLOCK_SIZE needs both attention and mamba layers."
+        )
+    mamba_buckets = [b for b, m in zip(layer_buckets, is_mamba) if m]
+    mamba_pages = {kv_cache_spec[n].page_size_bytes for b in mamba_buckets for n in b}
+    if len(mamba_pages) != 1:
+        raise ValueError(
+            f"VLLM_HYBRID_ATTN_BLOCK_SIZE needs one mamba page size, got "
+            f"{sorted(mamba_pages)}."
+        )
+    group_size = min(len(b) for b in mamba_buckets)
+    block_bytes = group_size * mamba_pages.pop()
+    for layers, mamba in zip(layer_buckets, is_mamba):
+        spec = kv_cache_spec[layers[0]]
+        if mamba or len(layers) * spec.page_size_bytes <= block_bytes:
+            continue
+        raise ValueError(
+            f"{len(layers)} attention layers of {spec.page_size_bytes} B pages "
+            f"exceed the {block_bytes} B pool block; set "
+            "VLLM_HYBRID_ATTN_BLOCK_SIZE to at most "
+            f"{spec.block_size * block_bytes // (len(layers) * spec.page_size_bytes)}."
+        )
+    group_counts = [
+        cdiv(len(layers), group_size) if mamba else 1
+        for layers, mamba in zip(layer_buckets, is_mamba)
+    ]
+    return _split_kv_cache_layer_buckets(kv_cache_spec, layer_buckets, group_counts)
+
+
 def _get_per_layer_spec(
     group: KVCacheGroupSpec,
     layer_name: str,
@@ -2177,6 +2230,14 @@ def get_kv_cache_groups(
             ),
         )
         return groups
+
+    if envs.VLLM_HYBRID_ATTN_BLOCK_SIZE > 0:
+        if hidden_specs:
+            raise ValueError(
+                "VLLM_HYBRID_ATTN_BLOCK_SIZE does not support hidden-state cache "
+                "layers."
+            )
+        return _get_kv_cache_groups_packed_attention(filtered_spec)
 
     # Prefer preserving each layer's cache semantics. If physical pages cannot
     # be unified, try a supported allocation-only fallback before failing.

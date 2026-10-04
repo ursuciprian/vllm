@@ -8,6 +8,7 @@ from collections.abc import Iterable
 from dataclasses import replace
 from typing import Any
 
+from vllm import envs
 from vllm.compilation.cuda_graph import CUDAGraphStat
 from vllm.config import KVEventsConfig, VllmConfig
 from vllm.distributed.ec_transfer.ec_connector.base import (
@@ -418,6 +419,13 @@ class Scheduler(SchedulerInterface):
         self.need_mamba_block_aligned_split = (
             self.has_mamba_layers and self.cache_config.mamba_cache_mode == "align"
         )
+        if envs.VLLM_HYBRID_ATTN_BLOCK_SIZE > 0 and self.has_mamba_layers:
+            # Attention blocks are smaller than the mamba checkpoint block.
+            self.mamba_align_block_size = max(
+                g.kv_cache_spec.block_size
+                for g in kv_cache_config.kv_cache_groups
+                if isinstance(g.kv_cache_spec, MambaSpec)
+            )
         glm5_next_mtp_has_independent_draft_state = (
             speculative_config is not None
             and speculative_config.method == "mtp"
@@ -526,6 +534,8 @@ class Scheduler(SchedulerInterface):
             return num_new_tokens
 
         block_size = self.cache_config.block_size
+        if envs.VLLM_HYBRID_ATTN_BLOCK_SIZE > 0:
+            block_size = self.mamba_align_block_size
         # The last block-aligned position whose state can be cached.
         # Eagle-family drafters pollute the target's last matching
         # full-attention block with their lookahead KV write, so back off one

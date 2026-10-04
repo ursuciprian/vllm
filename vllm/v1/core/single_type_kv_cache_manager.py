@@ -6,6 +6,7 @@ from collections import defaultdict
 from collections.abc import Sequence
 from typing import ClassVar
 
+from vllm import envs
 from vllm.utils.math_utils import cdiv
 from vllm.v1.core.block_pool import BlockPool
 from vllm.v1.core.kv_cache_utils import (
@@ -1807,6 +1808,7 @@ class MambaManager(SingleTypeKVCacheManager):
         self.block_size = kv_cache_spec.block_size
         self.mamba_cache_mode = kv_cache_spec.mamba_cache_mode
         self.num_speculative_blocks: int = kv_cache_spec.num_speculative_blocks
+        self.split_attn_block = envs.VLLM_HYBRID_ATTN_BLOCK_SIZE > 0
         self.cached_blocks_this_step: set[BlockHashWithGroupId] = set()
         if self.mamba_cache_mode == "align":
             # Mapping from request ID to the index of the block
@@ -2374,6 +2376,9 @@ class MambaManager(SingleTypeKVCacheManager):
     ) -> BlockHashWithGroupId | None:
         hash_block_size = self.block_pool.hash_block_size
         if self.block_size == hash_block_size:
+            return None
+        if self.split_attn_block and self.hit_alignment_tokens >= self.block_size:
+            # Lookups stay mamba-block aligned, so a partial tail is never hit.
             return None
         if num_tokens % self.block_size == 0:
             return None

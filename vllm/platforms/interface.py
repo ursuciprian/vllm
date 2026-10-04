@@ -1024,6 +1024,18 @@ class Platform:
                 kernel_block_alignment_size * attn_page_size_1_token,
             )
 
+        import vllm.envs as envs
+
+        if envs.VLLM_HYBRID_ATTN_BLOCK_SIZE > 0:
+            cls._split_hybrid_attn_block(
+                vllm_config,
+                backend_cls,
+                legacy_page_size=attn_block_size * attn_page_size_1_token,
+                legacy_block_size=attn_block_size,
+                mamba_page_size=mamba_page_size,
+            )
+            return
+
         if cache_config.block_size < attn_block_size:
             cache_config.block_size = attn_block_size
             logger.info(
@@ -1065,6 +1077,74 @@ class Platform:
                 "exactly equal.",
                 mamba_padding_pct,
             )
+
+    @classmethod
+    def _split_hybrid_attn_block(
+        cls,
+        vllm_config: "VllmConfig",
+        backend_cls: "type[AttentionBackend]",
+        *,
+        legacy_page_size: int,
+        legacy_block_size: int,
+        mamba_page_size: int,
+    ) -> None:
+        """Give attention its own block size (VLLM_HYBRID_ATTN_BLOCK_SIZE).
+
+        The pool block stays the page the legacy sizing would use (one
+        attention page of ``legacy_block_size`` tokens, which the mamba page is
+        padded to). ``get_kv_cache_groups`` packs the attention layers of a
+        bucket into one group whose N-token pages share that block, and the
+        mamba checkpoint block becomes the largest multiple of N not above the
+        legacy block, so the scheduler block (their LCM) stays near it.
+        """
+        import vllm.envs as envs
+        from vllm.config.vllm import set_current_vllm_config
+        from vllm.v1.attention.backend import MultipleOf
+
+        cache_config = vllm_config.cache_config
+        block_size = envs.VLLM_HYBRID_ATTN_BLOCK_SIZE
+        if (
+            cache_config.block_size == block_size
+            and cache_config.mamba_block_size is not None
+            and cache_config.mamba_block_size > block_size
+            and cache_config.mamba_block_size % block_size == 0
+        ):
+            return  # already resolved in this process
+        if cache_config.mamba_cache_mode != "align":
+            raise ValueError(
+                "VLLM_HYBRID_ATTN_BLOCK_SIZE requires --mamba-cache-mode align."
+            )
+        if vllm_config.model_config.use_mla:
+            raise ValueError("VLLM_HYBRID_ATTN_BLOCK_SIZE does not support MLA.")
+        if cache_config.user_specified_mamba_block_size:
+            raise ValueError(
+                "VLLM_HYBRID_ATTN_BLOCK_SIZE sets the mamba block size itself; "
+                "drop --mamba-block-size."
+            )
+        with set_current_vllm_config(vllm_config):
+            alignment = min(
+                s.base if isinstance(s, MultipleOf) else s
+                for s in backend_cls.get_supported_kernel_block_sizes()
+            )
+        if block_size % alignment or block_size >= legacy_block_size:
+            raise ValueError(
+                f"VLLM_HYBRID_ATTN_BLOCK_SIZE={block_size} must be a multiple of "
+                f"{alignment} below the legacy attention block "
+                f"({legacy_block_size} tokens)."
+            )
+        cache_config.block_size = block_size
+        cache_config.mamba_block_size = block_size * (legacy_block_size // block_size)
+        cache_config.mamba_page_size_padded = (
+            legacy_page_size if legacy_page_size > mamba_page_size else None
+        )
+        logger.info(
+            "VLLM_HYBRID_ATTN_BLOCK_SIZE: attention block %d tokens, mamba block "
+            "%d tokens (legacy %d), pool block %d bytes.",
+            block_size,
+            cache_config.mamba_block_size,
+            legacy_block_size,
+            max(legacy_page_size, mamba_page_size),
+        )
 
     @classmethod
     def register_custom_kv_cache_specs(cls, vllm_config: "VllmConfig") -> None:
