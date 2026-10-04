@@ -42,7 +42,7 @@ logger = init_logger(__name__)
 _TEMPORAL_TILES = 16
 
 
-@triton.jit(do_not_specialize=["num_requests"])
+@triton.jit(do_not_specialize=["num_requests", "num_real_requests"])
 def get_aligned_state_indices_multi_group_kernel(
     block_table_ptrs_ptr,
     seq_lens_ptr,
@@ -1603,6 +1603,8 @@ class MambaSpecDecodeGPUContext:
         )
         deferred = self.gdn_deferred_commit
         if deferred is not None and deferred.active:
+            # V1 rows are batch rows, not request slots.
+            assert not deferred.compact, "compact GDN records require the V2 runner"
             # Decide, commit, then copy. See vllm/v1/worker/gdn_deferred_commit.
             postprocess_mamba_fused_kernel[(num_reqs, 1, 1)](
                 *args,
