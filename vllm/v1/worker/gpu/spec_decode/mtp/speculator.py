@@ -11,6 +11,7 @@ from vllm.v1.worker.gpu.spec_decode.eagle.utils import load_eagle_model
 
 class MTPSpeculator(AutoRegressiveSpeculator):
     share_mtp_topk_indices: bool = False
+    prefill_tail_routing = None
     rollback_qsa_interval_starts: bool = False
     boundary_checkpoint_capture = None
 
@@ -40,6 +41,9 @@ class MTPSpeculator(AutoRegressiveSpeculator):
         self.prefill_outputs_are_compact = hasattr(
             draft_model.model, "set_prefill_output_indices"
         ) and getattr(draft_model.model, "supports_mtp_prefill_compaction", True)
+        self.prefill_tail_routing = getattr(
+            draft_model.model, "prefill_tail_routing", None
+        )
         return draft_model
 
     def on_prefill_begin(self, num_reqs: int) -> None:
@@ -50,6 +54,10 @@ class MTPSpeculator(AutoRegressiveSpeculator):
         if self.prefill_outputs_are_compact:
             self.model.model.set_prefill_output_indices(
                 self.last_token_indices[:num_reqs]
+            )
+        if self.prefill_tail_routing is not None:
+            self.prefill_tail_routing.begin(
+                self.input_buffers.query_start_loc, self.last_token_indices, num_reqs
             )
 
     def on_prefill_end(self, num_reqs: int) -> None:
@@ -63,6 +71,8 @@ class MTPSpeculator(AutoRegressiveSpeculator):
             self.model.model.compact_topk_indices(self.last_token_indices[:num_reqs])
         if self.prefill_outputs_are_compact:
             self.model.model.set_prefill_output_indices(None)
+        if self.prefill_tail_routing is not None:
+            self.prefill_tail_routing.end()
 
     def on_multi_step_decode_begin(self, num_reqs: int) -> None:
         if self.rollback_qsa_interval_starts:

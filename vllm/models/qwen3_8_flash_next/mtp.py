@@ -73,6 +73,7 @@ from .model import (
     Qwen3_8FlashNextMixtureOfExperts,
     _remap_qsa_cache_scale_name,
 )
+from .tail_routing import TailRouting, install_tail_routing
 
 logger = init_logger(__name__)
 
@@ -297,6 +298,23 @@ class Qwen3_8FlashNextMultiTokenPredictor(nn.Module):
         )
         if self.supports_mtp_prefill_compaction:
             self._prefill_output_indices = self._decode_output_indices
+        self.prefill_tail_routing: TailRouting | None = None
+        if (
+            envs.VLLM_MTP_PREFILL_TAIL_ROUTING
+            and not self.supports_mtp_prefill_compaction
+        ):
+            experts = getattr(self.layers[0].mlp, "experts", None)
+            router = getattr(experts, "router", None)
+            if router is None:
+                logger.warning("MTP prefill tail routing: no MoE router, left off")
+            else:
+                self.prefill_tail_routing = TailRouting(max_tokens, device)
+                install_tail_routing(router, self.prefill_tail_routing)
+                logger.info(
+                    "MTP prefill tail routing on: draft-prefill rows use their "
+                    "request tail's experts (capacity %d rows)",
+                    max_tokens,
+                )
         self._feedback_caps = _mtp_api().Caps(
             device=device,
             max_tokens=max_tokens,

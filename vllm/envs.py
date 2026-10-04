@@ -209,6 +209,7 @@ if TYPE_CHECKING:
     VLLM_QWEN4_EXP_AS_FLASH_NEXT: bool = False
     VLLM_LM_HEAD_A16: bool = True
     VLLM_QWEN3_8_FLASH_NEXT_MTP_COMPACT: bool = True
+    VLLM_MTP_PREFILL_TAIL_ROUTING: bool = False
     VLLM_GDN_SPEC_DECODE_METADATA_FASTPATH: bool = True
     VLLM_MTP_NVFP4_LM_HEAD: bool = True
     VLLM_MTP_DRAFT_VOCAB: str = ""
@@ -1753,6 +1754,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_QWEN3_8_FLASH_NEXT_MTP_COMPACT": lambda: bool(
         int(os.getenv("VLLM_QWEN3_8_FLASH_NEXT_MTP_COMPACT", "1"))
     ),
+    # Qwen3.8-Flash-Next MTP draft prefill: every row of a request uses its
+    # tail row's experts in the draft-layer MoE. Only tail rows are sampled and
+    # fed back, and attention has written every row's KV before the MoE, so the
+    # used rows keep their routing while the MoE streams fewer experts.
+    "VLLM_MTP_PREFILL_TAIL_ROUTING": lambda: bool(
+        int(os.getenv("VLLM_MTP_PREFILL_TAIL_ROUTING", "0"))
+    ),
     # Reuse uniform speculative metadata in the shared GDN/KDA backend.
     "VLLM_GDN_SPEC_DECODE_METADATA_FASTPATH": lambda: bool(
         int(os.getenv("VLLM_GDN_SPEC_DECODE_METADATA_FASTPATH", "1"))
@@ -2513,6 +2521,8 @@ def compile_factors() -> dict[str, object]:
         "VLLM_PLE_MMAP_KEEPALIVE_MS",
         # Host-side prefill readahead of the PLE reader; same rows, no graph change.
         "VLLM_PLE_MMAP_PREFILL_WILLNEED",
+        # Draft-prefill routing inside the MoE custom op; no plan or graph change.
+        "VLLM_MTP_PREFILL_TAIL_ROUTING",
         # Location-only derived paths: where a cache/config directory lives
         # cannot affect compiled artifacts, and hashing them means relocating
         # HOME or the XDG roots silently invalidates every compile cache
