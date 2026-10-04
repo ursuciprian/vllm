@@ -86,7 +86,13 @@ def _config(split: bool, num_blocks: int) -> KVCacheConfig:
     )
 
 
-def _manager(monkeypatch, split: bool, num_blocks: int = 4000):
+@pytest.fixture(params=[None, 0], ids=["dense", "retention0"])
+def retention(request):
+    """Dense mamba checkpoints, and the fork's default sparse retention (0)."""
+    return request.param
+
+
+def _manager(monkeypatch, split: bool, retention, num_blocks: int = 4000):
     monkeypatch.setenv("VLLM_HYBRID_ATTN_BLOCK_SIZE", str(N) if split else "0")
     monkeypatch.setenv("VLLM_PREFIX_DROP_EXACT", "1")
     return make_kv_cache_manager(
@@ -96,15 +102,20 @@ def _manager(monkeypatch, split: bool, num_blocks: int = 4000):
         hash_block_size=N if split else LEGACY,
         use_eagle=True,
         num_prefill_lookahead=1,
+        retention_interval=retention,
     )
 
 
 def _stub(manager, split: bool) -> SimpleNamespace:
     return SimpleNamespace(
         cache_config=SimpleNamespace(
-            block_size=N if split else LEGACY, prefix_cache_retention_interval=None
+            block_size=N if split else LEGACY,
+            prefix_cache_retention_interval=getattr(
+                manager.coordinator, "retention_interval", None
+            ),
         ),
-        mamba_align_block_size=M,
+        block_size=M if split else LEGACY,  # scheduler block: LCM of group blocks
+        kv_cache_manager=manager,
         drop_last_prefix_cache_block=not manager.coordinator.prefix_drop_exact,
         use_eagle=True,
         max_num_scheduled_tokens=BUDGET,
@@ -202,9 +213,9 @@ def test_chunks_end_on_the_mamba_block(monkeypatch) -> None:
 
 
 @pytest.mark.parametrize("split", [False, True])
-def test_footprint_16k(monkeypatch, split):
+def test_footprint_16k(monkeypatch, split, retention):
     """A 16K + 2K prefill holds cdiv(T, block) blocks per attention group."""
-    manager = _manager(monkeypatch, split)
+    manager = _manager(monkeypatch, split, retention)
     request = _request("r", _context() + list(range(NEW)), split)
     assert _prefill(manager, request, split) is not None
     mamba, attn = _held(manager, "r")
@@ -228,23 +239,28 @@ def _two_16k_requests(manager, split: bool) -> int | None:
     return peak
 
 
-def test_admission_at_16k(monkeypatch):
+def test_admission_at_16k(monkeypatch, retention):
     """A pool sized for two 16K requests with 232-token blocks admits only
     one with 3024-token blocks."""
     peaks = {
-        split: _two_16k_requests(_manager(monkeypatch, split), split)
+        split: _two_16k_requests(_manager(monkeypatch, split, retention), split)
         for split in (False, True)
     }
     assert peaks[True] < peaks[False]
     pool = peaks[True] + 1  # + the null block
-    assert _two_16k_requests(_manager(monkeypatch, True, pool), True) == peaks[True]
-    assert _two_16k_requests(_manager(monkeypatch, False, pool), False) is None
+    assert (
+        _two_16k_requests(_manager(monkeypatch, True, retention, pool), True)
+        == peaks[True]
+    )
+    assert (
+        _two_16k_requests(_manager(monkeypatch, False, retention, pool), False) is None
+    )
 
 
-def test_prefix_hit_lands_on_the_mamba_block(monkeypatch):
+def test_prefix_hit_lands_on_the_mamba_block(monkeypatch, retention):
     """Hits stay mamba-block aligned (partial hash hits off) and reuse the
     warm request's own attention blocks."""
-    manager = _manager(monkeypatch, split=True)
+    manager = _manager(monkeypatch, True, retention)
     assert manager.coordinator.enable_partial_hash_hits is False
     ctx = _context()
     warm = _request("warm", ctx, split=True)
@@ -264,12 +280,12 @@ def test_prefix_hit_lands_on_the_mamba_block(monkeypatch):
 
 
 @pytest.mark.parametrize("split", [False, True])
-def test_boundary_steps(monkeypatch, split):
+def test_boundary_steps(monkeypatch, split, retention):
     """Decode across a mamba boundary: a group holds one running block, two on
     the crossing step; attention grows by one block every block of tokens."""
     block = M if split else LEGACY
     attn_block = N if split else LEGACY
-    manager = _manager(monkeypatch, split)
+    manager = _manager(monkeypatch, split, retention)
     request = _request("r", _context()[: block - 3], split)
     assert _prefill(manager, request, split) is not None
     seen = set()
@@ -283,22 +299,23 @@ def test_boundary_steps(monkeypatch, split):
     assert _used(manager) == 0
 
 
-def test_eviction_keeps_hits_aligned(monkeypatch):
-    """A request that needs most of the pool evicts cached blocks; later hits
-    stay on 3016 multiples and every block returns to the pool."""
-    manager = _manager(monkeypatch, split=True, num_blocks=300)
-    ctx = _context()
-    warm = _request("warm", ctx, split=True)
-    assert _prefill(manager, warm, split=True) is not None
-    manager.free(warm)
-    assert _used(manager) == 0
-    assert manager.get_computed_blocks(_request("w2", ctx + [1] * 64, True))[1] == 5 * M
-    filler = _request("fill", [9000 + i for i in range(20 * M)], split=True)
-    assert _prefill(manager, filler, split=True) is not None
-    manager.free(filler)
-    assert _used(manager) == 0
-    hit = manager.get_computed_blocks(_request("again", ctx + [1] * 64, True))[1]
-    assert hit % M == 0 and hit < 5 * M
+def test_eviction(monkeypatch, retention):
+    """In a 300-block pool, a 15 x 3016-token request leaves the cached 16K
+    prefix whole (hit 5 x 3016); a 20 x 3016-token one evicts it (hit 0).
+    Every block returns to the pool after each free."""
+    for filler_blocks, expected in ((15, 5 * M), (20, 0)):
+        manager = _manager(monkeypatch, True, retention, num_blocks=300)
+        ctx = _context()
+        warm = _request("warm", ctx, split=True)
+        assert _prefill(manager, warm, split=True) is not None
+        manager.free(warm)
+        assert _used(manager) == 0
+        filler = _request("fill", [9000 + i for i in range(filler_blocks * M)], True)
+        assert _prefill(manager, filler, split=True) is not None
+        manager.free(filler)
+        assert _used(manager) == 0
+        again = _request("again", ctx + [1] * 64, split=True)
+        assert manager.get_computed_blocks(again)[1] == expected
 
 
 @pytest.fixture
@@ -331,12 +348,11 @@ class _Backend:
         return [MultipleOf(8)]
 
 
-def _split(config, legacy_block: int = LEGACY) -> None:
+def _split(config) -> None:
     Platform._split_hybrid_attn_block(
         config,
         _Backend,
-        legacy_page_size=legacy_block * 1088,
-        legacy_block_size=legacy_block,
+        attn_page_size_1_token=1088,
         mamba_page_size=3_289_088,
     )
 
@@ -348,7 +364,7 @@ def test_platform_sizes(monkeypatch, _no_vllm_config_context):
     cache = config.cache_config
     assert (cache.block_size, cache.mamba_block_size) == (N, M)
     assert cache.mamba_page_size_padded == POOL_BLOCK
-    _split(config, legacy_block=3248)  # a second pass keeps the first result
+    _split(config)  # a second pass (block_size now 232) gives the same result
     assert (cache.block_size, cache.mamba_block_size) == (N, M)
     for value in ("236", str(LEGACY)):
         monkeypatch.setenv("VLLM_HYBRID_ATTN_BLOCK_SIZE", value)

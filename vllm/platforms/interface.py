@@ -1030,8 +1030,7 @@ class Platform:
             cls._split_hybrid_attn_block(
                 vllm_config,
                 backend_cls,
-                legacy_page_size=attn_block_size * attn_page_size_1_token,
-                legacy_block_size=attn_block_size,
+                attn_page_size_1_token=attn_page_size_1_token,
                 mamba_page_size=mamba_page_size,
             )
             return
@@ -1084,32 +1083,26 @@ class Platform:
         vllm_config: "VllmConfig",
         backend_cls: "type[AttentionBackend]",
         *,
-        legacy_page_size: int,
-        legacy_block_size: int,
+        attn_page_size_1_token: int,
         mamba_page_size: int,
     ) -> None:
         """Give attention its own block size (VLLM_HYBRID_ATTN_BLOCK_SIZE).
 
-        The pool block stays the page the legacy sizing would use (one
-        attention page of ``legacy_block_size`` tokens, which the mamba page is
-        padded to). ``get_kv_cache_groups`` packs the attention layers of a
-        bucket into one group whose N-token pages share that block, and the
-        mamba checkpoint block becomes the largest multiple of N not above the
-        legacy block, so the scheduler block (their LCM) stays near it.
+        The pool block is the legacy page: the smallest kernel-aligned attention
+        block whose page holds a mamba page, which the mamba page is padded to.
+        ``get_kv_cache_groups`` packs the attention layers of a bucket into one
+        group whose N-token pages share that block, and the mamba checkpoint
+        block becomes the largest multiple of N not above the legacy block, so
+        the scheduler block (their LCM) stays near it. The result depends only
+        on the model and the knob, so repeated calls agree.
         """
         import vllm.envs as envs
         from vllm.config.vllm import set_current_vllm_config
+        from vllm.utils.math_utils import cdiv
         from vllm.v1.attention.backend import MultipleOf
 
         cache_config = vllm_config.cache_config
         block_size = envs.VLLM_HYBRID_ATTN_BLOCK_SIZE
-        if (
-            cache_config.block_size == block_size
-            and cache_config.mamba_block_size is not None
-            and cache_config.mamba_block_size > block_size
-            and cache_config.mamba_block_size % block_size == 0
-        ):
-            return  # already resolved in this process
         if cache_config.mamba_cache_mode != "align":
             raise ValueError(
                 "VLLM_HYBRID_ATTN_BLOCK_SIZE requires --mamba-cache-mode align."
@@ -1126,24 +1119,28 @@ class Platform:
                 s.base if isinstance(s, MultipleOf) else s
                 for s in backend_cls.get_supported_kernel_block_sizes()
             )
-        if block_size % alignment or block_size >= legacy_block_size:
+        legacy_block = alignment * cdiv(
+            mamba_page_size, alignment * attn_page_size_1_token
+        )
+        if block_size % alignment or block_size >= legacy_block:
             raise ValueError(
                 f"VLLM_HYBRID_ATTN_BLOCK_SIZE={block_size} must be a multiple of "
                 f"{alignment} below the legacy attention block "
-                f"({legacy_block_size} tokens)."
+                f"({legacy_block} tokens)."
             )
+        legacy_page = legacy_block * attn_page_size_1_token
         cache_config.block_size = block_size
-        cache_config.mamba_block_size = block_size * (legacy_block_size // block_size)
+        cache_config.mamba_block_size = block_size * (legacy_block // block_size)
         cache_config.mamba_page_size_padded = (
-            legacy_page_size if legacy_page_size > mamba_page_size else None
+            legacy_page if legacy_page > mamba_page_size else None
         )
         logger.info(
             "VLLM_HYBRID_ATTN_BLOCK_SIZE: attention block %d tokens, mamba block "
             "%d tokens (legacy %d), pool block %d bytes.",
             block_size,
             cache_config.mamba_block_size,
-            legacy_block_size,
-            max(legacy_page_size, mamba_page_size),
+            legacy_block,
+            max(legacy_page, mamba_page_size),
         )
 
     @classmethod
