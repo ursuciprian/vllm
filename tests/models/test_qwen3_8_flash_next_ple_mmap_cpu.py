@@ -297,6 +297,56 @@ def test_willneed_pass_names_every_row(checkpoint, monkeypatch):
     assert not calls
 
 
+def test_prefill_willneed_advises_each_page_and_keeps_rows(checkpoint, monkeypatch):
+    """r13: a prefill-sized gather advises each distinct page it copies once,
+    row k of every job before row k + 1 of any, and copies the same rows."""
+    import os
+    import threading
+    import time
+
+    calls = []
+    monkeypatch.setattr(os, "posix_fadvise", lambda *a: calls.append(a), raising=False)
+    monkeypatch.setattr(os, "POSIX_FADV_WILLNEED", 3, raising=False)
+    planes, sources = checkpoint
+    rows, _ = _rows(
+        checkpoint, willneed_max=64, parallel_lookups=32, chunk=16, prefill_willneed=True
+    )
+    copy = ple_mmap._copy_rows
+
+    def slow_copy(*job):  # a cold copy: the helper gets to advise every page
+        time.sleep(0.05)
+        copy(*job)
+
+    monkeypatch.setattr(ple_mmap, "_copy_rows", slow_copy)
+    ids = np.random.default_rng(3).integers(-3, TABLE_ROWS + 3, 500, dtype=np.int64)
+    outs = tuple(np.full((ids.size, b), 0xAB, np.uint8) for b in ROW_BYTES)
+    rows.gather(ids, outs)
+    for out, want in zip(outs, _expected(planes, ids, 0, TABLE_ROWS)):
+        np.testing.assert_array_equal(out, want)
+
+    page = ple_mmap.mmap.PAGESIZE
+    path_of = {rows._fds[i]: path for path, i in rows._file_index.items()}
+    source = {(plane, shard): (str(path), off) for plane, shard, path, off in sources}
+    want = set()
+    for i in np.unique(ids[(ids >= 0) & (ids < TABLE_ROWS)]).tolist():
+        shard = i // SHARD_ROWS
+        for plane, row_bytes in enumerate(ROW_BYTES):
+            path, off = source[(plane, shard)]
+            want.add((path, (off + (i - shard * SHARD_ROWS) * row_bytes) // page))
+    got = [(path_of[fd], offset // page) for fd, offset, _, advice in calls]
+    assert len(got) == len(set(got)) == rows.last_advised  # one call per page
+    assert set(got) == want and all(c[3] == 3 for c in calls)
+
+    calls.clear()  # decode-sized: only the existing per-row pass, no helper
+    rows.gather(np.arange(40, dtype=np.int64), tuple(np.zeros((40, b), np.uint8)
+                                                   for b in ROW_BYTES))
+    assert rows.last_advised == 0 and len(calls) == 2 * 40
+
+    stop = threading.Event()
+    stop.set()  # the copy finished first: no advice at all
+    assert rows._advise([(None, None, None, np.arange(4))], [(0, 80)], stop) == 0
+
+
 def test_prewarm_reads_each_local_plane_once(checkpoint, caplog):
     import threading
 
