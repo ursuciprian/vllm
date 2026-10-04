@@ -687,9 +687,9 @@ def test_ple_prefetch_joins_before_embedding_consumers(monkeypatch, num_tokens) 
             torch.testing.assert_close(actual, expected, rtol=0, atol=0)
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
-def test_disk_ple_preparation_refreshes_graph_output(tmp_path, monkeypatch) -> None:
-    """Real file reads precede replay, including accepted history and padding."""
+def _disk_ple_setup(tmp_path, monkeypatch):
+    """A file-backed 2-head PLE table, its resident twin and the model state
+    that prepares it, for one request padded to two (4 tokens)."""
     pytest.importorskip("b12x.sequence.ple_embedding")
     from safetensors.torch import save_file
 
@@ -793,6 +793,15 @@ def test_disk_ple_preparation_refreshes_graph_output(tmp_path, monkeypatch) -> N
             gpu=torch.tensor([[5, 9, 13, 17, 19, 23]], device="cuda")
         ),
     )
+    return embedding, resident, state, batch, req_states
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_disk_ple_preparation_refreshes_graph_output(tmp_path, monkeypatch) -> None:
+    """Real file reads precede replay, including accepted history and padding."""
+    embedding, resident, state, batch, req_states = _disk_ple_setup(
+        tmp_path, monkeypatch
+    )
     with pytest.raises(RuntimeError, match="not prepared"):
         embedding(batch.input_ids, batch.query_start_loc, state.ngram_context)
 
@@ -835,6 +844,77 @@ def test_disk_ple_preparation_refreshes_graph_output(tmp_path, monkeypatch) -> N
             torch.testing.assert_close(
                 consume(batch.input_ids, **prepared), expected, rtol=0, atol=0
             )
+    torch.cuda.current_stream().wait_stream(stream)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_page_cache_ple_stream_gather_matches_resident_table(
+    tmp_path, monkeypatch
+) -> None:
+    """VLLM_PLE_MMAP_STREAM_GATHER: 1000 graph replays, each prepared with a new
+    batch and no host wait, stage the resident table's bytes; batches above the
+    stream cap take the host gather, interleaved with queued ones."""
+    monkeypatch.setenv("VLLM_PLE_MMAP", "1")
+    monkeypatch.setenv("VLLM_PLE_MMAP_STREAM_GATHER", "1")
+    monkeypatch.setenv("VLLM_PLE_MMAP_WILLNEED_MAX", "8192")
+    monkeypatch.setenv("VLLM_PLE_MMAP_PARALLEL_LOOKUPS", "32")
+    embedding, resident, state, batch, req_states = _disk_ple_setup(
+        tmp_path, monkeypatch
+    )
+    cache = embedding.ngram_embedding.disk_table._cache
+    assert cache._host_gather is not None, "stream gather setup failed (see log)"
+    host_gathers: list[int] = []
+    host_gather = cache._rows.gather
+
+    def counted(ids, outs):
+        host_gathers.append(ids.size)
+        host_gather(ids, outs)
+
+    monkeypatch.setattr(cache._rows, "gather", counted)
+
+    @torch.compile(backend="eager", fullgraph=True)
+    def consume(ids, query_start_loc, ngram_context):
+        return embedding(ids, query_start_loc, ngram_context) + 1
+
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.inference_mode(), torch.cuda.stream(stream):
+        dummy = state.prepare_dummy_inputs(2, 4)
+        for _ in range(3):
+            consume(batch.input_ids, **dummy)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph, stream=stream):
+            actual = consume(batch.input_ids, **dummy)
+        got, want = [], []
+        for step in range(1000):
+            # Keep the GPU behind the host, so every step is queued behind work
+            # that has not run yet (the ids copy is still pending when the
+            # gather is queued).
+            torch.cuda._sleep(10_000_000)
+            batch.input_ids.random_(1, 128)
+            batch.query_start_loc[1:].fill_(1 + step % 4)
+            req_states.num_computed_tokens.gpu.fill_(1 + step % 5)
+            prepared = state.prepare_inputs(batch, req_states)
+            graph.replay()
+            got.append(actual.clone())
+            want.append(resident(batch.input_ids, **prepared) + 1)
+        assert not host_gathers  # 8 lookups per step: every gather was queued
+        torch.cuda.synchronize()
+        for step, (g, w) in enumerate(zip(got, want)):
+            torch.testing.assert_close(g, w, rtol=0, atol=0, msg=f"step {step}")
+        got, want = [], []
+        for count in (4, 8, 3, 24, 7, 2, 32, 6, 12, 16, 1):
+            torch.cuda._sleep(10_000_000)
+            batch.input_ids = torch.randint(
+                1, 128, (count,), dtype=torch.int32, device="cuda"
+            )
+            batch.query_start_loc[1:].fill_(count)
+            prepared = state.prepare_inputs(batch, req_states)
+            got.append(consume(batch.input_ids, **prepared))
+            want.append(resident(batch.input_ids, **prepared) + 1)
+        assert host_gathers == [48, 64]  # 24 and 32 tokens x 2 heads > 32
+        for g, w in zip(got, want):
+            torch.testing.assert_close(g, w, rtol=0, atol=0)
     torch.cuda.current_stream().wait_stream(stream)
 
 

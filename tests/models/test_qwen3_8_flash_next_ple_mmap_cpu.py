@@ -6,8 +6,12 @@ Loads vllm/models/qwen3_8_flash_next/ple_mmap.py by path (numpy only), so it
 runs without a vLLM build: python -m pytest <this file>.
 """
 
+import ctypes
 import importlib.util
 import json
+import math
+import os
+import shutil
 import struct
 from pathlib import Path
 
@@ -271,6 +275,60 @@ def test_gather_knobs_keep_rows_identical(checkpoint, knobs, count):
     rows.gather(ids, outs)
     for out, want in zip(outs, _expected(planes, ids, 0, TABLE_ROWS)):
         np.testing.assert_array_equal(out, want)
+
+
+_needs_cc = pytest.mark.skipif(
+    shutil.which((os.environ.get("CC") or "cc").split()[0]) is None,
+    reason="the stream gather compiles C with $CC / cc",
+)
+
+
+@_needs_cc
+@pytest.mark.parametrize("count", [1, 80, 640])  # c1 decode, c8 MTP x4
+@pytest.mark.parametrize(
+    ("lo", "hi", "willneed"), [(0, TABLE_ROWS, 0), (300, 700, 8192)]
+)
+def test_host_gather_writes_the_numpy_gather_bytes(checkpoint, count, lo, hi, willneed):
+    """VLLM_PLE_MMAP_STREAM_GATHER swaps the numpy gather for C: every staged
+    byte must match, non-local lookups zeroed, rows past ``count`` untouched."""
+    rows, _ = _rows(checkpoint, lo, hi, willneed_max=willneed)
+    ids = np.random.default_rng(count).integers(-3, TABLE_ROWS + 3, 700, np.int64)
+    want = tuple(np.full((700, b), 0xAB, np.uint8) for b in ROW_BYTES)
+    got = tuple(w.copy() for w in want)
+    rows.gather(ids[:count], want)
+    ple_mmap.HostGather(rows, ids, got)(count)
+    for g, w in zip(got, want):
+        np.testing.assert_array_equal(g, w)
+
+
+@_needs_cc
+def test_stream_gather_queues_the_c_gather_and_keeps_the_drive_awake(
+    checkpoint, monkeypatch
+):
+    """enqueue passes the C function and its argument block to cuLaunchHostFunc
+    (run inline here), refreshes the keepalive window and fails loudly."""
+    planes, _ = checkpoint
+    launched, result = [], [0]
+
+    def launch(stream, fn, arg):
+        launched.append(stream)
+        ctypes.CFUNCTYPE(None, ctypes.c_void_p)(fn)(arg)
+        return result[0]
+
+    monkeypatch.setattr(ple_mmap, "_launch_host_func", lambda: launch)
+    rows, _ = _rows(checkpoint)
+    ids = np.array([5, -1, 999, 300, TABLE_ROWS, 0], np.int64)
+    outs = tuple(np.full((ids.size, b), 0xAB, np.uint8) for b in ROW_BYTES)
+    gather = ple_mmap.HostGather(rows, ids, outs)
+    rows._last_gather = -math.inf
+    gather.enqueue(7, 4)
+    assert launched == [7] and rows._last_gather > 0
+    for out, want in zip(outs, _expected(planes, ids[:4], 0, TABLE_ROWS)):
+        np.testing.assert_array_equal(out[:4], want)
+        assert (out[4:] == 0xAB).all()
+    result[0] = 1
+    with pytest.raises(RuntimeError, match="cuLaunchHostFunc"):
+        gather.enqueue(7, 4)
 
 
 def test_willneed_pass_names_every_row(checkpoint, monkeypatch):
