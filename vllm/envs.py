@@ -223,6 +223,7 @@ if TYPE_CHECKING:
     VLLM_PLE_MMAP: bool = False
     VLLM_PLE_MMAP_KEEPALIVE_MS: int = 0
     VLLM_PLE_MMAP_PREFILL_WILLNEED: bool = False
+    VLLM_PLE_MMAP_STREAM_GATHER: bool = False
     VLLM_DEEPEPLL_NVFP4_DISPATCH: bool = False
     VLLM_V1_USE_OUTLINES_CACHE: bool = False
     VLLM_TPU_USING_PATHWAYS: bool = False
@@ -1835,6 +1836,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_PLE_MMAP_PREFILL_WILLNEED": lambda: bool(
         int(os.getenv("VLLM_PLE_MMAP_PREFILL_WILLNEED", "0"))
     ),
+    # Page-cache PLE reader: decode-sized gathers (at most
+    # VLLM_PLE_MMAP_PARALLEL_LOOKUPS lookups) run as a CUDA host function queued
+    # between the ids copy and the lookup, so the host does not wait for the GPU
+    # every step. Same rows, same kernels and graphs. Read by ple_mmap.py.
+    "VLLM_PLE_MMAP_STREAM_GATHER": lambda: bool(
+        int(os.getenv("VLLM_PLE_MMAP_STREAM_GATHER", "0"))
+    ),
     # Allow use of FlashInfer MxInt4 MoE kernels for fused moe ops.
     "VLLM_USE_FLASHINFER_MOE_INT4": lambda: bool(
         int(os.getenv("VLLM_USE_FLASHINFER_MOE_INT4", "0"))
@@ -2513,6 +2521,8 @@ def compile_factors() -> dict[str, object]:
         "VLLM_PLE_MMAP_KEEPALIVE_MS",
         # Host-side prefill readahead of the PLE reader; same rows, no graph change.
         "VLLM_PLE_MMAP_PREFILL_WILLNEED",
+        # Stream-ordered PLE gather: host-side only, same plans and graphs.
+        "VLLM_PLE_MMAP_STREAM_GATHER",
         # Location-only derived paths: where a cache/config directory lives
         # cannot affect compiled artifacts, and hashing them means relocating
         # HOME or the XDG roots silently invalidates every compile cache

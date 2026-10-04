@@ -11,10 +11,16 @@ hash, positional per-lookup row cache in mapped host memory, compact-row
 decode); only the O_DIRECT io_uring reader is replaced by buffered reads, so
 hot rows stay in the evictable page cache instead of coming from NVMe every
 step.
+
+VLLM_PLE_MMAP_STREAM_GATHER=1 queues decode-sized gathers on the CUDA stream as
+a host function (C, no GIL) between the ids copy and the lookup, so the host no
+longer waits for the GPU each step and the next graph launch overlaps the
+current step.
 """
 
 from __future__ import annotations
 
+import ctypes
 import functools
 import logging
 import math
@@ -22,6 +28,9 @@ import mmap
 import os
 import re
 import resource
+import shlex
+import subprocess
+import tempfile
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -475,6 +484,180 @@ def _copy_rows(out, window, targets, sources) -> None:
     out[targets] = window[sources]
 
 
+# PageCacheRows.gather for a serial (decode-sized) batch, as a CUDA host
+# function: same WILLNEED pass, same rows, zeros outside the local shard range.
+_GATHER_SRC = r"""
+#include <fcntl.h>
+#include <stdint.h>
+#include <string.h>
+
+typedef struct {
+    const int64_t *ids;
+    int64_t count, shard_start, shard_end, shard_rows, planes, willneed;
+    const int *fds;
+    const uint8_t *const *maps;
+    uint8_t *out[2];
+    int64_t row_bytes[2];
+    const int64_t *file_of[2];
+    const int64_t *base_of[2];
+} ple_gather_t;
+
+/* File index and byte offset of table row ``id`` in plane ``p``; -1 if not local.
+   The WILLNEED pass and the copy share it, so the copy tests cover both. */
+static int64_t row_at(const ple_gather_t *g, int64_t p, int64_t id, int64_t *offset) {
+    if (id < g->shard_start || id >= g->shard_end) return -1;
+    int64_t shard = id / g->shard_rows;
+    *offset = g->base_of[p][shard] + (id - shard * g->shard_rows) * g->row_bytes[p];
+    return g->file_of[p][shard];
+}
+
+void ple_gather(void *arg) {
+    const ple_gather_t *g = (const ple_gather_t *)arg;
+    int64_t offset, file;
+#ifdef POSIX_FADV_WILLNEED
+    for (int64_t p = 0; g->willneed && p < g->planes; p++)
+        for (int64_t i = 0; i < g->count; i++)
+            if ((file = row_at(g, p, g->ids[i], &offset)) >= 0)
+                posix_fadvise(g->fds[file], offset, g->row_bytes[p], POSIX_FADV_WILLNEED);
+#endif
+    for (int64_t p = 0; p < g->planes; p++) {
+        int64_t bytes = g->row_bytes[p];
+        for (int64_t i = 0; i < g->count; i++) {
+            uint8_t *dst = g->out[p] + i * bytes;
+            if ((file = row_at(g, p, g->ids[i], &offset)) < 0)
+                memset(dst, 0, bytes);
+            else
+                memcpy(dst, g->maps[file] + offset, bytes);
+        }
+    }
+    /* The staging rows are write-combined; drain them before the GPU reads. */
+#if defined(__aarch64__)
+    __asm__ volatile("dsb sy" ::: "memory");
+#elif defined(__x86_64__)
+    __asm__ volatile("sfence" ::: "memory");
+#else
+    __sync_synchronize();
+#endif
+}
+"""
+
+
+class _GatherArgs(ctypes.Structure):
+    _fields_ = [
+        ("ids", ctypes.c_void_p),
+        ("count", ctypes.c_int64),
+        ("shard_start", ctypes.c_int64),
+        ("shard_end", ctypes.c_int64),
+        ("shard_rows", ctypes.c_int64),
+        ("planes", ctypes.c_int64),
+        ("willneed", ctypes.c_int64),
+        ("fds", ctypes.c_void_p),
+        ("maps", ctypes.c_void_p),
+        ("out", ctypes.c_void_p * 2),
+        ("row_bytes", ctypes.c_int64 * 2),
+        ("file_of", ctypes.c_void_p * 2),
+        ("base_of", ctypes.c_void_p * 2),
+    ]
+
+
+@functools.cache
+def _gather_lib() -> ctypes.CDLL:
+    """Compile and load the C gather (b12x builds its loader with cc the same
+    way, so the serving image has a compiler)."""
+    compiler = shlex.split(os.environ.get("CC", "cc"))
+    with tempfile.TemporaryDirectory(prefix="ple-gather-") as tmp:
+        src, lib = os.path.join(tmp, "gather.c"), os.path.join(tmp, "gather.so")
+        with open(src, "w") as fh:
+            fh.write(_GATHER_SRC)
+        subprocess.run(
+            [*compiler, "-O2", "-std=gnu11", "-shared", "-fPIC", "-o", lib, src],
+            check=True,
+            capture_output=True,
+        )
+        dll = ctypes.CDLL(lib)
+    dll.ple_gather.argtypes = [ctypes.c_void_p]
+    dll.ple_gather.restype = None
+    return dll
+
+
+@functools.cache
+def _launch_host_func():
+    fn = ctypes.CDLL("libcuda.so.1").cuLaunchHostFunc
+    fn.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p]
+    fn.restype = ctypes.c_int
+    return fn
+
+
+class HostGather:
+    """``rows.gather(ids[:count], outs)`` in C, queued on a CUDA stream.
+
+    Stream order replaces the host sync: the function runs after the ids copy
+    into ``ids`` and before any later kernel, which then sees the staged rows.
+    It takes no lock and makes no CUDA call, so it cannot deadlock the stream;
+    a slow page fault delays the stream exactly as it delayed the host before.
+    """
+
+    def __init__(
+        self, rows: PageCacheRows, ids: np.ndarray, outs: tuple[np.ndarray, ...]
+    ) -> None:
+        if not rows._frozen:
+            raise RuntimeError("PLE rows are not frozen")
+        if ids.dtype != np.int64 or not ids.flags.c_contiguous:
+            raise ValueError("PLE host gather ids must be contiguous int64")
+        if len(outs) != len(rows.row_bytes) or not 1 <= len(outs) <= 2:
+            raise ValueError("PLE host gather needs one output per row plane")
+        for out, row_bytes in zip(outs, rows.row_bytes):
+            if not out.flags.c_contiguous or out.strides[0] != row_bytes:
+                raise ValueError("PLE host gather outputs must be contiguous rows")
+        self._lib = _gather_lib()
+        self.fn = ctypes.cast(self._lib.ple_gather, ctypes.c_void_p).value
+        self.rows = rows
+        self.capacity = min(ids.shape[0], *(out.shape[0] for out in outs))
+        fds = (ctypes.c_int * max(1, len(rows._fds)))(*rows._fds)
+        maps = (ctypes.c_void_p * len(rows._maps))(*(m.ctypes.data for m in rows._maps))
+        self._keep = (ids, outs, fds, maps)
+        args = self._base = _GatherArgs(
+            ids=ids.ctypes.data,
+            shard_start=rows.shard_start,
+            shard_end=rows.shard_end,
+            shard_rows=rows.shard_rows,
+            planes=len(outs),
+            fds=ctypes.addressof(fds) if rows._fds else None,
+            maps=ctypes.addressof(maps),
+        )
+        for plane, out in enumerate(outs):
+            args.out[plane] = out.ctypes.data
+            args.row_bytes[plane] = rows.row_bytes[plane]
+            args.file_of[plane] = rows._file_of[plane].ctypes.data
+            args.base_of[plane] = rows._base_of[plane].ctypes.data
+        # One immutable argument block per count: queued calls may still read
+        # theirs while the host queues the next step.
+        self._args: dict[int, _GatherArgs] = {}
+
+    def args(self, count: int) -> int:
+        args = self._args.get(count)
+        if args is None:
+            if not 0 <= count <= self.capacity:
+                raise ValueError("PLE host gather count exceeds its buffers")
+            args = _GatherArgs.from_buffer_copy(self._base)
+            args.count = count
+            args.willneed = int(bool(self.rows._fds) and count <= self.rows.willneed_max)
+            self._args[count] = args
+        return ctypes.addressof(args)
+
+    def __call__(self, count: int) -> None:
+        """Gather synchronously on the calling thread."""
+        self.rows._last_gather = time.monotonic()
+        self._lib.ple_gather(self.args(count))
+
+    def enqueue(self, stream: int, count: int) -> None:
+        """Queue the gather on ``stream`` (a CUstream / cudaStream_t handle)."""
+        self.rows._last_gather = time.monotonic()  # keepalive window
+        error = _launch_host_func()(stream, self.fn, self.args(count))
+        if error:
+            raise RuntimeError(f"cuLaunchHostFunc failed: CUresult {error}")
+
+
 def ple_hash_ids(
     tokens: np.ndarray,
     query_start_loc: np.ndarray,
@@ -589,6 +772,8 @@ def _page_cache_disk_table_cls():
             every = _env_int("VLLM_PLE_MMAP_STATS", 0)
             large = _env_int("VLLM_PLE_MMAP_STATS_LARGE", 0)
             self._stats = ReaderStats(every, large) if every > 0 else None
+            self._stream_gather = bool(_env_int("VLLM_PLE_MMAP_STREAM_GATHER", 0))
+            self._host_gather: HostGather | None = None
             self._sources = set()
             self._frozen = False
             self._lock = threading.RLock()
@@ -613,9 +798,30 @@ def _page_cache_disk_table_cls():
             with self._lock:
                 super().freeze()
                 self._rows.freeze()
+                if self._stream_gather and self._host_gather is None:
+                    try:
+                        _launch_host_func()
+                        self._host_gather = HostGather(
+                            self._rows, self.ids_host.numpy(), self._planes
+                        )
+                        logger.info(
+                            "PLE stream gather: on for gathers of <= %d lookups "
+                            "(VLLM_PLE_MMAP_STATS counts only host gathers)",
+                            self._rows.parallel_lookups,
+                        )
+                    except Exception as exc:
+                        # freeze() runs on every bind: do not retry each step.
+                        self._stream_gather = False
+                        logger.warning("PLE stream gather off, host gather: %s", exc)
 
         def _read_staged(self, count: int) -> None:
             with torch.cuda.device(self.device):
+                gather = self._host_gather
+                if gather is not None and count <= self._rows.parallel_lookups:
+                    # After the ids copy, before the lookup: no host wait.
+                    if count:
+                        gather.enqueue(self._transaction_stream.cuda_stream, count)
+                    return
                 t0 = time.perf_counter()
                 self._ids_ready.synchronize()
                 t1 = time.perf_counter()
