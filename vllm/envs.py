@@ -198,6 +198,8 @@ if TYPE_CHECKING:
     B12X_MOE_WM_MIN_TOKENS: int = 1
     B12X_MOE_WM_SCHEDULE: Literal["item", "flint"] = "item"
     VLLM_B12X_A16_MAX_TOKENS: int = 0
+    VLLM_B12X_NVFP4_MXFP8_MIN_TOKENS: int = 0
+    VLLM_B12X_NVFP4_MXFP8_CHECKPOINT: str | None = None
     VLLM_B12X_MOE_FP4_LAYER_MAX_INPUT_SCALE: Literal["0", "1", "all", "w13", "w2"] = "0"
     VLLM_DEFAULT_MOE_BACKEND: str = "auto"
     VLLM_B12X_DENSE_ACTIVATION_MODE: Literal["auto", "a16", "quantized"] = "auto"
@@ -1713,6 +1715,17 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # at the cutoff, w13 kernel order), and only environment_variables entries
     # reach envs.compile_factors(). Needs a b12x with a16_max_tokens support.
     "VLLM_B12X_A16_MAX_TOKENS": lambda: int(os.getenv("VLLM_B12X_A16_MAX_TOKENS", "0")),
+    # W4A16 NVFP4 dense layers also hold the MXFP8 weights of the checkpoint at
+    # VLLM_B12X_NVFP4_MXFP8_CHECKPOINT (a local snapshot dir) and serve calls of
+    # at least this many rows with them: the W4A16 GEMM wins at decode sizes,
+    # MXFP8 at prefill sizes. 0 (default) = off. Both change the declared b12x
+    # plans, so both stay in the compile factors.
+    "VLLM_B12X_NVFP4_MXFP8_MIN_TOKENS": lambda: int(
+        os.getenv("VLLM_B12X_NVFP4_MXFP8_MIN_TOKENS", "0")
+    ),
+    "VLLM_B12X_NVFP4_MXFP8_CHECKPOINT": lambda: os.getenv(
+        "VLLM_B12X_NVFP4_MXFP8_CHECKPOINT"
+    ),
     # Select layer-wide activation scales for b12x NVFP4 MoE projections.
     "VLLM_B12X_MOE_FP4_LAYER_MAX_INPUT_SCALE": env_with_choices(
         "VLLM_B12X_MOE_FP4_LAYER_MAX_INPUT_SCALE",

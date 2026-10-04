@@ -3,12 +3,17 @@
 
 from __future__ import annotations
 
+import functools
+import json
 from collections.abc import Sequence
 from dataclasses import replace
+from pathlib import Path
 
 import torch
 
+import vllm.envs as envs
 from vllm._custom_ops import scaled_fp4_quant
+from vllm.logger import init_logger
 from vllm.model_executor.kernels.linear.b12x_blockscaled import B12xBlockscaledLinear
 from vllm.model_executor.utils import replace_parameter
 from vllm.platforms import current_platform
@@ -18,6 +23,7 @@ from vllm.utils.b12x import (
     B12xWorkload,
     b12x_layer,
     b12x_layer_prefix,
+    b12x_linear_for,
     get_b12x_blockscaled as _import_b12x_blockscaled,
     get_b12x_dense_activation_mode,
     get_b12x_intrinsics as _import_b12x_intrinsics,
@@ -32,6 +38,99 @@ from vllm.utils.torch_utils import (
 )
 
 from .base import NvFp4LinearKernel, NvFp4LinearLayerConfig
+
+logger = init_logger(__name__)
+
+_E2M1 = (0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, 0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0)
+
+
+@functools.cache
+def _checkpoint_weight_map(path: str) -> dict[str, str]:
+    return json.loads((Path(path) / "model.safetensors.index.json").read_text())["weight_map"]
+
+
+def _relative_difference(layer, weight, scale, rows: int = 64) -> float:
+    """Sampled-row relative L2 difference between the layer's NVFP4 weight
+    (unprocessed ModelOpt layout) and an MXFP8 copy of the same matrix."""
+    index = torch.linspace(0, weight.shape[0] - 1, rows).long()
+    codes = layer.weight.data[index.to(layer.weight.device)].cpu()
+    codes = torch.stack((codes & 15, codes >> 4), -1).flatten(1).long()
+    groups = layer.weight_scale.data[index.to(layer.weight_scale.device)].cpu().float()
+    nvfp4 = (torch.tensor(_E2M1)[codes] * groups.repeat_interleave(16, 1)
+             * float(layer.weight_global_scale))
+    k = weight.shape[1]
+    mxfp8 = weight[index].float() * torch.exp2(
+        scale[index, : k // 32].float() - 127).repeat_interleave(32, 1)
+    return float((nvfp4[:, :k] - mxfp8).norm() / mxfp8.norm())
+
+
+def load_mxfp8_large_m_copy(
+    layer: torch.nn.Module, prefixes: Sequence[tuple[str, ...]],
+) -> tuple[torch.Tensor, torch.Tensor] | None:
+    """MXFP8 weight and E8M0 scales for a W4A16 NVFP4 layer, or None.
+
+    Read from the checkpoint at VLLM_B12X_NVFP4_MXFP8_CHECKPOINT when
+    VLLM_B12X_NVFP4_MXFP8_MIN_TOKENS > 0. ``prefixes`` are alternative
+    checkpoint names for the layer: one name, or a fused layer's shards in
+    fused order. Call before the kernel processes the NVFP4 weights.
+    """
+    if envs.VLLM_B12X_NVFP4_MXFP8_MIN_TOKENS <= 0:
+        return None
+    path = envs.VLLM_B12X_NVFP4_MXFP8_CHECKPOINT
+    if not path:
+        raise ValueError(
+            "VLLM_B12X_NVFP4_MXFP8_MIN_TOKENS needs VLLM_B12X_NVFP4_MXFP8_CHECKPOINT")
+    weight_map = _checkpoint_weight_map(path)
+    names = next((n for n in prefixes
+                  if all(f"{x}.weight_scale" in weight_map for x in n)), None)
+    if names is None:
+        return None
+    from safetensors import safe_open
+
+    def read(key: str) -> torch.Tensor:
+        with safe_open(str(Path(path) / weight_map[key]), framework="pt") as f:
+            return f.get_tensor(key)
+
+    weight = torch.cat([read(f"{x}.weight") for x in names])
+    scale = torch.cat([read(f"{x}.weight_scale") for x in names])
+    if weight.dtype != torch.float8_e4m3fn or scale.dtype != torch.uint8:
+        return None
+    expected = (int(layer.output_size_per_partition), int(layer.input_size_per_partition))
+    if tuple(weight.shape) != expected:
+        # ponytail: whole-tensor reads only; TP>1 would need per-rank slicing.
+        raise ValueError(
+            f"{names}: MXFP8 copy {tuple(weight.shape)} does not match the layer "
+            f"partition {expected}; the large-M copy supports TP=1 only")
+    difference = _relative_difference(layer, weight, scale)
+    if not difference < 0.3:
+        raise ValueError(f"{names}: MXFP8 copy differs from the NVFP4 weights "
+                         f"(relative L2 {difference:.3f}); wrong checkpoint or shard order")
+    logger.info("%s: MXFP8 copy serves rows >= %d (relative L2 vs NVFP4 %.4f)",
+                "+".join(names), envs.VLLM_B12X_NVFP4_MXFP8_MIN_TOKENS, difference)
+    device = layer.weight.device
+    return weight.to(device), scale.to(device)
+
+
+def attach_mxfp8_large_m(
+    layer: torch.nn.Module, weight: torch.Tensor, scale: torch.Tensor,
+) -> None:
+    """Give a processed b12x W4A16 layer an MXFP8 holder for large row counts."""
+    from vllm.model_executor.kernels.linear.mxfp8.b12x import B12xMxfp8LinearKernel
+    from vllm.model_executor.kernels.linear.mxfp8.Mxfp8LinearKernel import (
+        Mxfp8LinearLayerConfig,
+    )
+
+    copy = torch.nn.Module()
+    copy.prefix = f"{_resolve_layer_name(layer.b12x_layer_name)}.mxfp8"
+    copy.weight = torch.nn.Parameter(weight, requires_grad=False)
+    copy.weight_scale = torch.nn.Parameter(scale, requires_grad=False)
+    copy.b12x_preparation_suppressed = True
+    B12xMxfp8LinearKernel(Mxfp8LinearLayerConfig()).process_weights_after_loading(copy)
+    # Not a submodule: the copy stays out of named_parameters and state dicts,
+    # and this reference keeps the weakly registered layer alive.
+    object.__setattr__(layer, "b12x_mxfp8_copy", copy)
+    layer.b12x_large_m_linear = copy.b12x_linear
+    layer.b12x_large_m_min_rows = envs.VLLM_B12X_NVFP4_MXFP8_MIN_TOKENS
 
 
 def _serialized_name(layer: torch.nn.Module, rows: int) -> str:
@@ -296,7 +395,16 @@ class B12xNvFp4LinearKernel(NvFp4LinearKernel):
             raise ValueError("b12x W4A16 preparation requires BF16 activations and N%8=0")
         if packed_input:
             linear = layer.b12x_linear
-            return (linear.unit(workload, name=f"linear.nvfp4.{linear.layer_name}"),)
+            units = [linear.unit(workload, name=f"linear.nvfp4.{linear.layer_name}")]
+            large = getattr(layer, "b12x_large_m_linear", None)
+            if large is not None:
+                # The MXFP8 copy only serves rows >= the cutoff, so it declares
+                # exact-M regimes only for graph sizes at or above it.
+                fixed = tuple(m for m in workload.fixed_token_counts
+                              if m >= layer.b12x_large_m_min_rows)
+                units.append(large.unit(replace(workload, fixed_token_counts=fixed),
+                                        name=f"linear.mxfp8.{large.layer_name}"))
+            return tuple(units)
 
         prefix = _resolve_layer_name(layer.b12x_layer_name)
         plans = layer.b12x_nvfp4_serialized_plans
@@ -324,7 +432,7 @@ class B12xNvFp4LinearKernel(NvFp4LinearKernel):
         )
 
     def get_workspace_size(self, layer: torch.nn.Module, rows: int) -> int:
-        linear = getattr(layer, "b12x_linear", None)
+        linear = b12x_linear_for(layer, rows)
         return 0 if linear is None else linear.get_workspace_size(rows)
 
     def apply_weights(
@@ -340,4 +448,4 @@ class B12xNvFp4LinearKernel(NvFp4LinearKernel):
         )
 
 
-__all__ = ["B12xNvFp4LinearKernel"]
+__all__ = ["B12xNvFp4LinearKernel", "attach_mxfp8_large_m", "load_mxfp8_large_m_copy"]

@@ -376,6 +376,20 @@ def get_b12x_ple_hash() -> ModuleType | None:
     return _get_submodule("b12x.sequence.ple_hash")
 
 
+def b12x_linear_for(layer: torch.nn.Module, rows: int) -> Any:
+    """The block-scaled holder that serves ``rows`` on ``layer``.
+
+    A layer with a large-M holder (W4A16 NVFP4 with an MXFP8 copy) serves
+    ``rows >= layer.b12x_large_m_min_rows`` from it and smaller calls from
+    ``b12x_linear``. Rows are static inside a captured graph, so each graph
+    size binds one holder.
+    """
+    large = getattr(layer, "b12x_large_m_linear", None)
+    if large is not None and rows >= layer.b12x_large_m_min_rows:
+        return large
+    return getattr(layer, "b12x_linear", None)
+
+
 def _b12x_blockscaled_linear(
     source: torch.Tensor,
     bias: torch.Tensor | None,
@@ -383,7 +397,7 @@ def _b12x_blockscaled_linear(
     layer_name: LayerNameType,
 ) -> torch.Tensor:
     layer = b12x_layer(_resolve_layer_name(layer_name))
-    return layer.b12x_linear.run(source, bias)
+    return b12x_linear_for(layer, source.shape[0]).run(source, bias)
 
 
 def _b12x_blockscaled_linear_fake(
@@ -421,7 +435,7 @@ def get_b12x_projection_workspace_sizes(
     """Describe projection scratch without allocating CUDA storage."""
     return tuple(
         holder.get_workspace_size(rows)
-        if (holder := getattr(layer, "b12x_linear", None)) is not None
+        if (holder := b12x_linear_for(layer, rows)) is not None
         else 0
         for layer in layers
     )

@@ -1265,9 +1265,16 @@ class ModelOptNvFp4W4A16LinearMethod(LinearMethodBase):
     process_weights_after_loading -- its value is never used.
     """
 
-    def __init__(self, quant_config: ModelOptNvFp4Config) -> None:
+    def __init__(
+        self,
+        quant_config: ModelOptNvFp4Config,
+        checkpoint_prefixes: tuple[tuple[str, ...], ...] = (),
+    ) -> None:
         self.quant_config = quant_config
         self.marlin_input_dtype = None
+        # Checkpoint names of this layer (alternatives; a fused layer lists its
+        # shards in fused order), for the optional MXFP8 large-M copy.
+        self.checkpoint_prefixes = checkpoint_prefixes
         # `init_nvfp4_linear_kernel(use_a16=True)` is best of both worlds:
         # 1. `use_a16=True` forces  `Marlin`: https://github.com/vllm-project/vllm/commit/e68988a#diff-7135ab92aa94dfacb1ad3c77fc13f9c4ffe0b977f8eac5d86c2afe243e5f92a6R842-R889
         # for `--linear-backend=auto`, avoiding a W4A4 kernel that requires input_scale.
@@ -1377,7 +1384,22 @@ class ModelOptNvFp4W4A16LinearMethod(LinearMethodBase):
         )
         del layer.weight_scale_2
 
+        mxfp8_copy = None
+        if self.checkpoint_prefixes and getattr(layer, "b12x_large_m_linear", None) is None:
+            from vllm.model_executor.kernels.linear.nvfp4.b12x import (
+                B12xNvFp4LinearKernel,
+                load_mxfp8_large_m_copy,
+            )
+
+            mxfp8_copy = load_mxfp8_large_m_copy(layer, self.checkpoint_prefixes)
+            if mxfp8_copy is not None and not isinstance(self.kernel, B12xNvFp4LinearKernel):
+                raise ValueError("VLLM_B12X_NVFP4_MXFP8_MIN_TOKENS needs --linear-backend b12x")
+
         self.kernel.process_weights_after_loading(layer)
+        if mxfp8_copy is not None:
+            from vllm.model_executor.kernels.linear.nvfp4.b12x import attach_mxfp8_large_m
+
+            attach_mxfp8_large_m(layer, *mxfp8_copy)
 
     def apply(
         self,
@@ -2395,6 +2417,18 @@ class ModelOptMixedPrecisionConfig(ModelOptQuantConfigBase):
 
         return tuple(dict.fromkeys(candidates))
 
+    def _checkpoint_prefixes(self, prefix: str) -> tuple[tuple[str, ...], ...]:
+        """Alternative checkpoint names for a layer: each prefix candidate as
+        one name, and unfused into its shards for a packed layer."""
+        shards = (self.packed_modules_mapping or {}).get(prefix.rpartition(".")[2])
+        options = []
+        for candidate in self._quantized_layer_prefix_candidates(prefix):
+            options.append((candidate,))
+            if shards:
+                base = candidate.rpartition(".")[0]
+                options.append(tuple(f"{base}.{shard}" for shard in shards))
+        return tuple(options)
+
     def get_quant_method(
         self, layer: torch.nn.Module, prefix: str
     ) -> "QuantizeMethodBase | None":
@@ -2421,7 +2455,9 @@ class ModelOptMixedPrecisionConfig(ModelOptQuantConfigBase):
             if quant_algo == "NVFP4":
                 return ModelOptNvFp4LinearMethod(self.nvfp4_config)
             if quant_algo == "W4A16_NVFP4":
-                return ModelOptNvFp4W4A16LinearMethod(self.w4a16_nvfp4_config)
+                return ModelOptNvFp4W4A16LinearMethod(
+                    self.w4a16_nvfp4_config, self._checkpoint_prefixes(prefix)
+                )
             if quant_algo == "MXFP8":
                 return ModelOptMxFp8LinearMethod(self.mxfp8_config)
             # Layer not in quantized_layers — leave unquantized
