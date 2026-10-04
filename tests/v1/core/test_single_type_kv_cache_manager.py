@@ -785,3 +785,40 @@ def test_predictor_matches_allocator_blocks_calculation_with_admission_cap():
             f"but allocator pulled {len(new_blocks)}"
         )
         total_computed = num_tokens
+
+
+@pytest.mark.parametrize("spec_blocks,steady,peak", [(4, 5, 6), (0, 1, 2)])
+def test_mamba_align_blocks_held_under_mtp(spec_blocks, steady, peak):
+    """MTP-4 decode in align mode: 1 + spec blocks held steady, +1 at a block
+    boundary. spec_blocks=0 is VLLM_GDN_COMPACT_RECORDS (records off-pool)."""
+    block_size, num_spec = 8, 4
+    spec = MambaSpec(
+        block_size=block_size,
+        shapes=((1, 1),),
+        dtypes=(torch.float32,),
+        mamba_cache_mode="align",
+        num_speculative_blocks=spec_blocks,
+    )
+    pool = BlockPool(num_gpu_blocks=64, enable_caching=True, hash_block_size=8)
+    manager = MambaManager(
+        spec,
+        block_pool=pool,
+        enable_caching=True,
+        kv_cache_group_id=0,
+        scheduler_block_size=block_size,
+    )
+    free = pool.get_num_free_blocks()
+    # Admission of a fresh request: running block plus speculative blocks.
+    assert manager.get_num_blocks_to_allocate("r", 20, [], 0, 0, 20) == 1 + spec_blocks
+    manager.allocate_new_blocks("r", 20, 20)
+    computed, held, rng = 20, [], random.Random(7)
+    for _ in range(40):
+        manager.remove_skipped_blocks("r", computed)
+        target = computed + 1 + num_spec
+        manager.get_num_blocks_to_allocate("r", target, [], computed, computed, target)
+        manager.allocate_new_blocks("r", target, target)
+        held.append(free - pool.get_num_free_blocks())
+        computed += rng.randint(1, 1 + num_spec)
+    assert min(held) == steady and max(held) == peak
+    manager.free("r")
+    assert pool.get_num_free_blocks() == free
