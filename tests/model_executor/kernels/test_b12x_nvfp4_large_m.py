@@ -1,0 +1,306 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+"""W4A16 NVFP4 dense layers with an MXFP8 copy for large row counts
+(VLLM_B12X_NVFP4_MXFP8_MIN_TOKENS / VLLM_B12X_NVFP4_MXFP8_CHECKPOINT)."""
+
+from __future__ import annotations
+
+import json
+import types
+
+import pytest
+import torch
+
+import vllm.model_executor.kernels.linear.nvfp4.b12x as nvfp4_mod
+import vllm.utils.b12x as b12x_utils
+from vllm.model_executor.kernels.linear import B12xNvFp4LinearKernel
+from vllm.utils.b12x import B12xWorkload, b12x_linear_for, register_b12x_layer
+from vllm.utils.torch_utils import _encode_layer_name
+
+LUT = torch.tensor(nvfp4_mod._E2M1)
+QKV = "model.language_model.layers.0.linear_attn.in_proj_qkv"
+Z = "model.language_model.layers.0.linear_attn.in_proj_z"
+
+
+def _holder(tag, workspace=0):
+    calls = []
+    return types.SimpleNamespace(
+        tag=tag, calls=calls, layer_name=tag,
+        run=lambda source, bias: calls.append(source.shape[0]) or source,
+        get_workspace_size=lambda rows: workspace,
+        unit=lambda workload, name: (tag, name, workload),
+    )
+
+
+def _dispatch_layer(min_rows=41):
+    layer = torch.nn.Module()
+    layer.b12x_linear = _holder("nvfp4", workspace=10)
+    layer.b12x_large_m_linear = _holder("mxfp8", workspace=99)
+    layer.b12x_large_m_min_rows = min_rows
+    return layer
+
+
+def test_holder_follows_row_cutoff():
+    layer = _dispatch_layer()
+    assert b12x_linear_for(layer, 1).tag == "nvfp4"
+    assert b12x_linear_for(layer, 40).tag == "nvfp4"
+    assert b12x_linear_for(layer, 41).tag == "mxfp8"
+    assert b12x_linear_for(layer, 8192).tag == "mxfp8"
+    plain = torch.nn.Module()
+    plain.b12x_linear = _holder("only")
+    assert b12x_linear_for(plain, 8192).tag == "only"
+    assert b12x_linear_for(torch.nn.Module(), 4) is None
+
+
+def test_op_body_runs_the_holder_for_its_rows():
+    layer = _dispatch_layer()
+    name = "large-m-op-body-probe"
+    register_b12x_layer(name, layer)
+    for rows in (8, 40, 48, 2048):
+        b12x_utils._b12x_blockscaled_linear(
+            torch.zeros(rows, 4), None, 4, _encode_layer_name(name))
+    assert layer.b12x_linear.calls == [8, 40]
+    assert layer.b12x_large_m_linear.calls == [48, 2048]
+
+
+def test_projection_workspace_is_sized_for_the_serving_holder():
+    # qwen_gdn_input_projections reserves qkvz scratch before the call; a
+    # large-M call must get the MXFP8 holder's size, not the NVFP4 one.
+    layer, other = _dispatch_layer(), torch.nn.Module()
+    assert b12x_utils.get_b12x_projection_workspace_sizes(40, layer, other) == (10, 0)
+    assert b12x_utils.get_b12x_projection_workspace_sizes(41, layer, other) == (99, 0)
+    kernel = object.__new__(B12xNvFp4LinearKernel)
+    assert kernel.get_workspace_size(layer, 40) == 10
+    assert kernel.get_workspace_size(layer, 64) == 99
+
+
+def test_preparation_declares_mxfp8_regimes_only_at_or_above_the_cutoff():
+    layer = _dispatch_layer(min_rows=41)
+    layer.b12x_nvfp4_packed_weight = types.SimpleNamespace(values=torch.empty(1))
+    layer.weight, layer.weight_scale = torch.empty(1), torch.empty(1)
+    layer.b12x_activation_mode = "a16"
+    layer.b12x_bf16_input_supported = True
+    counts = (1, 2, 4, 8, 16, 24, 32, 40, 48, 56, 64, 72, 80, 8192)
+    workload = B12xWorkload(
+        stage="weights", token_counts=counts, fixed_token_counts=counts[:-1],
+        output_dtype=torch.bfloat16, max_tokens=8192, max_seqs=8, max_model_len=4096)
+    kernel = object.__new__(B12xNvFp4LinearKernel)
+    (nv_tag, nv_name, nv_wl), (mx_tag, mx_name, mx_wl) = (
+        kernel.get_b12x_preparation_units(layer, workload))
+    assert (nv_tag, mx_tag) == ("nvfp4", "mxfp8")
+    assert nv_wl is workload  # the NVFP4 plan is unchanged from the plain arm
+    assert mx_wl.fixed_token_counts == (48, 56, 64, 72, 80)
+    assert mx_wl.max_tokens == 8192 and mx_name.startswith("linear.mxfp8.")
+
+
+def test_checkpoint_prefixes_unfuse_packed_layers():
+    from vllm.model_executor.layers.quantization.modelopt import (
+        ModelOptMixedPrecisionConfig as Mixed,
+    )
+
+    config = types.SimpleNamespace(
+        packed_modules_mapping={"in_proj_qkvz": ["in_proj_qkv", "in_proj_z"]},
+        _quantized_layer_prefix_candidates=Mixed._quantized_layer_prefix_candidates,
+    )
+    fused = Mixed._checkpoint_prefixes(
+        config, "language_model.model.layers.0.linear_attn.in_proj_qkvz")
+    assert (QKV, Z) in fused
+    out = Mixed._checkpoint_prefixes(
+        config, "language_model.model.layers.0.linear_attn.out_proj")
+    assert ("model.language_model.layers.0.linear_attn.out_proj",) in out
+
+
+def _nvfp4_layer(rows, k, seed=0):
+    """A W4A16 layer in the unprocessed ModelOpt layout and its decoded weight.
+    Values are products of E2M1 codes, power-of-two group scales and a 0.25
+    global scale, so MXFP8 represents them exactly."""
+    g = torch.Generator().manual_seed(seed)
+    codes = torch.randint(0, 16, (rows, k), generator=g, dtype=torch.uint8)
+    groups = torch.tensor([0.5, 1.0, 2.0])[torch.randint(0, 3, (rows, k // 16), generator=g)]
+    layer = torch.nn.Module()
+    layer.weight = torch.nn.Parameter(codes[:, ::2] | codes[:, 1::2] << 4, requires_grad=False)
+    layer.weight_scale = torch.nn.Parameter(groups.to(torch.float8_e4m3fn), requires_grad=False)
+    layer.weight_global_scale = torch.nn.Parameter(torch.tensor(0.25), requires_grad=False)
+    layer.output_size_per_partition, layer.input_size_per_partition = rows, k
+    return layer, LUT[codes.long()] * groups.repeat_interleave(16, 1) * 0.25
+
+
+def _mxfp8(decoded):
+    blocks = decoded.view(decoded.shape[0], -1, 32)
+    exponent = torch.ceil(torch.log2(blocks.abs().amax(-1).clamp_min(2**-60) / 448))
+    values = (blocks / torch.exp2(exponent)[..., None]).view_as(decoded)
+    return values.to(torch.float8_e4m3fn), (exponent + 127).to(torch.uint8)
+
+
+def _checkpoint(tmp_path, tensors):
+    from safetensors.torch import save_file
+
+    save_file(tensors, str(tmp_path / "shard.safetensors"))
+    (tmp_path / "model.safetensors.index.json").write_text(
+        json.dumps({"weight_map": dict.fromkeys(tensors, "shard.safetensors")}))
+    return str(tmp_path)
+
+
+@pytest.fixture
+def fused_checkpoint(tmp_path, monkeypatch):
+    nvfp4_mod._checkpoint_weight_map.cache_clear()
+    layer, decoded = _nvfp4_layer(96, 64)
+    qkv_w, qkv_s = _mxfp8(decoded[:64])
+    z_w, z_s = _mxfp8(decoded[64:])
+    path = _checkpoint(tmp_path, {
+        f"{QKV}.weight": qkv_w, f"{QKV}.weight_scale": qkv_s,
+        f"{Z}.weight": z_w, f"{Z}.weight_scale": z_s,
+    })
+    monkeypatch.setenv("VLLM_B12X_NVFP4_MXFP8_MIN_TOKENS", "41")
+    monkeypatch.setenv("VLLM_B12X_NVFP4_MXFP8_CHECKPOINT", path)
+    yield layer, decoded
+    nvfp4_mod._checkpoint_weight_map.cache_clear()
+
+
+def test_copy_concatenates_shards_in_fused_order(fused_checkpoint):
+    layer, decoded = fused_checkpoint
+    weight, scale = nvfp4_mod.load_mxfp8_large_m_copy(layer, [("absent.name",), (QKV, Z)])
+    assert weight.shape == (96, 64) and scale.shape == (96, 2)
+    restored = weight.float() * torch.exp2(scale.float() - 127).repeat_interleave(32, 1)
+    torch.testing.assert_close(restored, decoded, rtol=0, atol=0)
+
+
+def test_copy_rejects_wrong_shard_order_and_partition(fused_checkpoint):
+    layer, _ = fused_checkpoint
+    with pytest.raises(ValueError, match="differs from the NVFP4"):
+        nvfp4_mod.load_mxfp8_large_m_copy(layer, [(Z, QKV)])
+    layer.output_size_per_partition = 48  # a TP=2 shard
+    with pytest.raises(ValueError, match="TP=1 only"):
+        nvfp4_mod.load_mxfp8_large_m_copy(layer, [(QKV, Z)])
+
+
+def test_copy_is_off_without_knob_or_names(fused_checkpoint, monkeypatch):
+    layer, _ = fused_checkpoint
+    assert nvfp4_mod.load_mxfp8_large_m_copy(layer, [("absent.name",)]) is None
+    monkeypatch.setenv("VLLM_B12X_NVFP4_MXFP8_MIN_TOKENS", "0")
+    assert nvfp4_mod.load_mxfp8_large_m_copy(layer, [(QKV, Z)]) is None
+    monkeypatch.setenv("VLLM_B12X_NVFP4_MXFP8_MIN_TOKENS", "41")
+    monkeypatch.delenv("VLLM_B12X_NVFP4_MXFP8_CHECKPOINT")
+    with pytest.raises(ValueError, match="needs VLLM_B12X_NVFP4_MXFP8_CHECKPOINT"):
+        nvfp4_mod.load_mxfp8_large_m_copy(layer, [(QKV, Z)])
+
+
+def test_attach_builds_an_unregistered_mxfp8_holder(monkeypatch):
+    import vllm.model_executor.kernels.linear.mxfp8.b12x as mxfp8_mod
+
+    monkeypatch.setenv("VLLM_B12X_NVFP4_MXFP8_MIN_TOKENS", "41")
+    monkeypatch.setattr(mxfp8_mod.B12xMxfp8LinearKernel, "is_supported",
+                        classmethod(lambda cls, compute_capability=None: (True, None)))
+    packed = types.SimpleNamespace(out_features=96, weight=types.SimpleNamespace(values=None))
+    monkeypatch.setattr(mxfp8_mod, "_import_b12x_blockscaled",
+                        lambda: types.SimpleNamespace(pack_weight=lambda w, s: packed))
+    layer = torch.nn.Module()
+    name = "large-m-attach-probe"
+    layer.b12x_layer_name = _encode_layer_name(name)
+    weight = torch.zeros(96, 64, dtype=torch.float8_e4m3fn)
+    nvfp4_mod.attach_mxfp8_large_m(layer, weight, torch.zeros(96, 2, dtype=torch.uint8))
+    assert layer.b12x_large_m_linear.recipe == "mxfp8"
+    assert layer.b12x_large_m_linear.packed is packed
+    assert layer.b12x_large_m_min_rows == 41
+    assert layer.b12x_mxfp8_copy.prefix == f"{name}.mxfp8"
+    assert dict(layer.named_modules()) == {"": layer}
+    assert b12x_utils.b12x_layer(f"{name}.mxfp8") is layer.b12x_mxfp8_copy
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available()
+    or torch.cuda.get_device_capability() not in ((12, 0), (12, 1)),
+    reason="SM120/SM121 required")
+def test_each_path_matches_its_standalone_layer(tmp_path, monkeypatch):
+    """GPU: rows below the cutoff are bit-exact with a plain W4A16 layer, rows at
+    or above it with a plain MXFP8 layer of the same weights, eager and in a graph."""
+    import vllm.model_executor.parameter as parameter
+    from vllm.config import KernelConfig, VllmConfig, set_current_vllm_config
+    from vllm.model_executor.layers.quantization.modelopt import (
+        ModelOptMxFp8Config,
+        ModelOptMxFp8LinearMethod,
+        ModelOptNvFp4Config,
+        ModelOptNvFp4W4A16LinearMethod,
+    )
+    from vllm.v1.worker.workspace import (
+        current_workspace_manager,
+        init_workspace_manager,
+        reset_workspace_manager,
+    )
+
+    from .test_b12x_linear import _prepare
+
+    monkeypatch.setattr(parameter, "get_tensor_model_parallel_rank", lambda: 0)
+    monkeypatch.setattr(parameter, "get_tensor_model_parallel_world_size", lambda: 1)
+    nvfp4_mod._checkpoint_weight_map.cache_clear()
+    device = torch.device("cuda", torch.accelerator.current_device_index())
+    n, k, cutoff = 2560, 6144, 41  # the GDN out_proj shape at TP=1
+    host, decoded = _nvfp4_layer(n, k, seed=3817)
+    mx_w, mx_s = _mxfp8(decoded)
+    name = "model.language_model.layers.0.linear_attn.out_proj"
+    path = _checkpoint(tmp_path, {f"{name}.weight": mx_w, f"{name}.weight_scale": mx_s})
+    counts, fixed = (1, 8, 40, 41, 48, 64, 300), (1, 8, 40, 48, 64)
+    config = VllmConfig(kernel_config=KernelConfig(linear_backend="b12x"))
+
+    def w4a16(prefixes):
+        method = ModelOptNvFp4W4A16LinearMethod(
+            ModelOptNvFp4Config(quant_method="W4A16_NVFP4",
+                                is_checkpoint_nvfp4_serialized=True), prefixes)
+        layer = torch.nn.Module()
+        with torch.device(device):
+            method.create_weights(layer, k, [n], k, n, torch.bfloat16)
+        layer.weight.copy_(host.weight)
+        layer.weight_scale.copy_(host.weight_scale)
+        layer.weight_scale_2.fill_(0.25)
+        method.process_weights_after_loading(layer)
+        return method, layer
+
+    reset_workspace_manager()
+    init_workspace_manager(device)
+    current_workspace_manager().reserve_all(((1,), torch.uint8))
+    sessions = []
+    try:
+        with set_current_vllm_config(config), torch.no_grad():
+            monkeypatch.setenv("VLLM_B12X_NVFP4_MXFP8_MIN_TOKENS", str(cutoff))
+            monkeypatch.setenv("VLLM_B12X_NVFP4_MXFP8_CHECKPOINT", path)
+            both, layer = w4a16(((name,),))
+            assert layer.b12x_large_m_min_rows == cutoff
+            monkeypatch.setenv("VLLM_B12X_NVFP4_MXFP8_MIN_TOKENS", "0")
+            plain_nv, nv_layer = w4a16(((name,),))
+            assert getattr(nv_layer, "b12x_large_m_linear", None) is None
+            plain_mx = ModelOptMxFp8LinearMethod(
+                ModelOptMxFp8Config(is_checkpoint_mxfp8_serialized=True))
+            mx_layer = torch.nn.Module()
+            with torch.device(device):
+                plain_mx.create_weights(mx_layer, k, [n], k, n, torch.bfloat16)
+            mx_layer.weight.copy_(mx_w)
+            mx_layer.weight_scale.copy_(mx_s)
+            plain_mx.process_weights_after_loading(mx_layer)
+            for target, exact in ((layer, fixed), (nv_layer, fixed),
+                                  (mx_layer, tuple(m for m in fixed if m >= cutoff))):
+                sessions.append(_prepare(target, device=device, counts=counts,
+                                         fixed=exact, max_tokens=512)[0])
+            for rows in counts:
+                source = torch.randn(rows, k, dtype=torch.bfloat16, device=device) * 0.125
+                ref_method, ref_layer = ((plain_mx, mx_layer) if rows >= cutoff
+                                         else (plain_nv, nv_layer))
+                expected = ref_method.apply(ref_layer, source)
+                assert torch.equal(both.apply(layer, source), expected), rows
+                exact = (source.float() @ decoded.to(device).T)
+                assert ((expected.float() - exact).norm() / exact.norm()) < 0.05
+                if rows in fixed:
+                    graph = torch.cuda.CUDAGraph()
+                    with sessions[0].capture():
+                        with torch.cuda.graph(graph):
+                            output = both.apply(layer, source)
+                    source.mul_(-0.5)
+                    graph.replay()
+                    torch.accelerator.synchronize(device)
+                    replayed = output.clone()
+                    graph.reset()
+                    assert torch.equal(replayed, ref_method.apply(ref_layer, source)), rows
+    finally:
+        for session in sessions:
+            session.close()
+        reset_workspace_manager()
+        nvfp4_mod._checkpoint_weight_map.cache_clear()
