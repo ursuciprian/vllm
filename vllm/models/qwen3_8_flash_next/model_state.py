@@ -344,6 +344,9 @@ class Qwen3_8FlashNextModelState(MambaHybridModelState):
                     -1,
                 )
             num_decode_draft_tokens_cpu = torch.from_numpy(num_decode_draft_tokens_np)
+            self._debug_check_fresh_record_slots(
+                input_batch, num_accepted_tokens, num_decode_draft_tokens_np
+            )
         if self._align_mode:
             self._prepare_aligned_state_indices(
                 input_batch.seq_lens,
@@ -351,6 +354,7 @@ class Qwen3_8FlashNextModelState(MambaHybridModelState):
                 attn_groups,
                 kv_cache_config,
                 block_tables,
+                input_batch.idx_mapping,
             )
 
         model_metadata = Qwen3_8FlashNextAttnMetadata(

@@ -59,6 +59,12 @@ def get_aligned_state_indices_multi_group_kernel(
     NUM_STATE_SLOTS: tl.constexpr,
     BLOCK_STATE_SLOTS: tl.constexpr,
     BLOCK_ROWS: tl.constexpr,
+    # Compact GDN records (gdn_deferred_commit): columns 1.. are side-buffer
+    # record rows of the batch row's request slot, not block-table entries.
+    # Rows past num_real_requests (graph padding) get the sink row 0.
+    NUM_RECORD_COLUMNS: tl.constexpr = 0,
+    idx_mapping_ptr=None,
+    num_real_requests=0,
 ):
     rows = tl.program_id(0) * BLOCK_ROWS + tl.arange(0, BLOCK_ROWS)
     valid_row = rows < num_requests
@@ -81,6 +87,7 @@ def get_aligned_state_indices_multi_group_kernel(
     block_tables = group_base_addrs.to(tl.pointer_type(tl.int32))
     state_slots = tl.arange(0, BLOCK_STATE_SLOTS)
     valid_state_slot = state_slots < NUM_STATE_SLOTS
+    from_table = state_slots < (1 if NUM_RECORD_COLUMNS > 0 else NUM_STATE_SLOTS)
     state_indices = tl.load(
         block_tables[:, None, None]
         + rows[None, :, None] * block_table_stride_req
@@ -90,13 +97,22 @@ def get_aligned_state_indices_multi_group_kernel(
             valid_group[:, None, None]
             & valid_row[None, :, None]
             & (seq_lens[None, :, None] > 0)
-            & valid_state_slot[None, None, :]
+            & from_table[None, None, :]
         ),
         # Padding must use the recurrent/conv NULL_BLOCK_ID (reserved block 0).
         # MTP0 reuses this buffer directly during full CUDA graph replay;
         # -1 would be interpreted as a real state address before the pool.
         other=0,
     )
+    if NUM_RECORD_COLUMNS > 0:
+        real_row = valid_row & (rows < num_real_requests) & (seq_lens > 0)
+        req_idx = tl.load(idx_mapping_ptr + rows, mask=real_row, other=-1)
+        record = 1 + req_idx[:, None] * NUM_RECORD_COLUMNS + state_slots[None, :] - 1
+        live_record = (req_idx >= 0)[:, None] & (state_slots > 0)[None, :]
+        record = tl.where(live_record, record, 0)
+        state_indices = tl.where(
+            from_table[None, None, :], state_indices, record[None, :, :]
+        )
     tl.store(
         state_indices_ptr
         + groups[:, None, None] * state_indices_stride_0
@@ -534,6 +550,9 @@ def postprocess_mamba_fused_kernel(
     # int32[total_states]: 1 for temporal states of deferred GDN layers. Only
     # read under DEFERRED_TEMPORAL; every other state keeps the shipped copy.
     state_temporal_deferred_ptr=None,
+    # Compact GDN records: DECISION_ONLY also stores the row's request slot.
+    STORE_REQ_IDX: tl.constexpr = False,
+    commit_req_idx_ptr=None,
 ):
     """
     Fused GPU kernel for postprocess_mamba that computes decisions AND performs
@@ -608,6 +627,8 @@ def postprocess_mamba_fused_kernel(
             tl.store(commit_src_col_ptr + bt_row_idx, src_block_idx)
             tl.store(commit_accepted_ptr + bt_row_idx, accept_token_bias + 1)
             tl.store(commit_dst_col_ptr + bt_row_idx, dest_block_idx)
+            if STORE_REQ_IDX:
+                tl.store(commit_req_idx_ptr + bt_row_idx, req_idx)
         return
 
     # For a deferred GDN temporal state the commit already wrote
@@ -721,6 +742,9 @@ def precopy_mamba_align_fused_kernel(
     # int32[total_states]: 1 for temporal states of deferred GDN layers. Only
     # read under DEFERRED_TEMPORAL; every other state keeps the shipped copy.
     state_temporal_deferred_ptr=None,
+    # Compact GDN records: DECISION_ONLY also stores the row's request slot.
+    STORE_REQ_IDX: tl.constexpr = False,
+    commit_req_idx_ptr=None,
 ):
     """Pre-copy mamba "align" state across block boundaries.
 
@@ -767,6 +791,8 @@ def precopy_mamba_align_fused_kernel(
             tl.store(commit_src_col_ptr + batch_idx, src_col)
             tl.store(commit_accepted_ptr + batch_idx, token_bias + 1)
             tl.store(commit_dst_col_ptr + batch_idx, src_col)
+            if STORE_REQ_IDX:
+                tl.store(commit_req_idx_ptr + batch_idx, req_idx)
         return
     temporal_bias = token_bias
     if DEFERRED_TEMPORAL:
@@ -1052,8 +1078,11 @@ class MambaSpecDecodeGPUContext:
     block_table_stride_req: int = 0
 
     # persistent output for the once-per-step, all-group aligned-index launch.
-    # shape: [num_groups, max_num_reqs, 1 + num_speculative_blocks].
+    # shape: [num_groups, max_num_reqs, 1 + num_speculative_blocks], or
+    # 1 + record_columns under compact GDN records.
     aligned_state_indices: torch.Tensor | None = None
+    # Compact GDN records: num_spec record columns per request slot, else 0.
+    record_columns: int = 0
 
     # Per-request staging buffers (CPU+GPU mirrors). The runner stages
     # values into the CPU view in ``_prepare_inputs`` and the fused kernel
@@ -1088,8 +1117,13 @@ class MambaSpecDecodeGPUContext:
         device: torch.device,
         make_buffer: Callable[..., CpuGpuBuffer],
         copy_funcs_by_type: MambaStateCopyFuncsByType | None = None,
+        record_columns: int = 0,
     ) -> "MambaSpecDecodeGPUContext":
-        """Create context with allocated buffers (metadata populated later)."""
+        """Create context with allocated buffers (metadata populated later).
+
+        ``record_columns > 0`` (compact GDN records) makes the aligned-index
+        window ``1 + record_columns`` wide, independent of the mamba page count.
+        """
         layer_groups = get_mamba_layer_groups(kv_cache_config)
         mamba_group_ids = [group.group_id for group in layer_groups]
         mamba_spec = next(iter(layer_groups[0].layer_specs.values()))
@@ -1158,11 +1192,12 @@ class MambaSpecDecodeGPUContext:
                 (
                     len(mamba_group_ids),
                     max_num_reqs,
-                    1 + mamba_spec.num_speculative_blocks,
+                    1 + (record_columns or mamba_spec.num_speculative_blocks),
                 ),
                 dtype=torch.int32,
                 device=device,
             ),
+            record_columns=record_columns,
             mamba_state_idx_buf=make_buffer(max_num_reqs, dtype=torch.int32),
             num_scheduled_tokens_buf=make_buffer(max_num_reqs, dtype=torch.int32),
             num_computed_tokens_buf=make_buffer(max_num_reqs, dtype=torch.int32),
@@ -1381,6 +1416,19 @@ class MambaSpecDecodeGPUContext:
             deferred_layers.extend(layers)
             if layers:
                 self.gdn_deferred_group_ids.append(group.group_id)
+        compact = {
+            getattr(layer, "b12x_gdn_compact_records", False) is True
+            for layer in deferred_layers
+        }
+        if self.record_columns and compact != {True}:
+            raise ValueError(
+                "compact GDN records require every mamba state to be served by "
+                "a deferred b12x GDN layer with compact records"
+            )
+        if True in compact and not self.record_columns:
+            raise ValueError(
+                "compact GDN record layers need the runner's record-column window"
+            )
         if not deferred_layers:
             return
         # Log the real layout: which mamba types share which block table.
@@ -1420,6 +1468,11 @@ class MambaSpecDecodeGPUContext:
             raise ValueError(
                 f"deferred GDN checkpoints: layers disagree on columns {columns}"
             )
+        if self.record_columns and columns != {self.record_columns + 1}:
+            raise ValueError(
+                f"compact GDN records: layer columns {columns} do not match the "
+                f"runner's {self.record_columns} record columns"
+            )
         # block_table may be a [:num_reqs] view of the first step's batch; size
         # the commit buffers by the planned request capacity instead.
         max_num_reqs = int(self.num_accepted_tokens_out.shape[0])
@@ -1434,6 +1487,7 @@ class MambaSpecDecodeGPUContext:
             state_index_columns=next(iter(columns)),
             device=block_tables[0].device,
             groups=groups,
+            compact=bool(self.record_columns),
         )
         logger.info(
             "GDN deferred checkpoints: %d mamba block-table groups, %s deferred "
@@ -1446,9 +1500,15 @@ class MambaSpecDecodeGPUContext:
         self,
         seq_lens: torch.Tensor,
         num_reqs: int,
+        idx_mapping: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        """compute every Mamba group's aligned physical state IDs in one launch."""
+        """compute every Mamba group's aligned physical state IDs in one launch.
+
+        Under compact GDN records, ``idx_mapping`` (batch row -> request slot,
+        the real rows only) supplies the record columns.
+        """
         assert self.is_initialized
+        assert not self.record_columns or idx_mapping is not None
         assert seq_lens.is_cuda
         assert 0 <= num_reqs <= seq_lens.shape[0]
         assert self.aligned_state_indices is not None
@@ -1475,6 +1535,11 @@ class MambaSpecDecodeGPUContext:
             NUM_STATE_SLOTS=num_state_slots,
             BLOCK_STATE_SLOTS=triton.next_power_of_2(num_state_slots),
             BLOCK_ROWS=block_rows,
+            NUM_RECORD_COLUMNS=self.record_columns,
+            idx_mapping_ptr=idx_mapping if self.record_columns else None,
+            num_real_requests=(
+                min(int(idx_mapping.shape[0]), num_reqs) if self.record_columns else 0
+            ),
             num_warps=1,
         )
         return self.aligned_state_indices[:, :num_reqs]
@@ -1547,6 +1612,8 @@ class MambaSpecDecodeGPUContext:
                 commit_src_col_ptr=deferred.src_col,
                 commit_accepted_ptr=deferred.accepted,
                 commit_dst_col_ptr=deferred.dst_col,
+                STORE_REQ_IDX=deferred.compact,
+                commit_req_idx_ptr=deferred.req_idx,
             )
             deferred.commit()
         postprocess_mamba_fused_kernel[grid](
@@ -1605,6 +1672,8 @@ class MambaSpecDecodeGPUContext:
                 commit_src_col_ptr=deferred.src_col,
                 commit_accepted_ptr=deferred.accepted,
                 commit_dst_col_ptr=deferred.dst_col,
+                STORE_REQ_IDX=deferred.compact,
+                commit_req_idx_ptr=deferred.req_idx,
             )
             deferred.commit()
         precopy_mamba_align_fused_kernel[grid](
@@ -1677,6 +1746,8 @@ class MambaSpecDecodeGPUContext:
                 NUM_GROUPS=self.num_groups,
                 NUM_CAPTURES=NUM_BOUNDARY_CHECKPOINT_SLOTS,
                 KIND=RESPONSE_CHECKPOINT_SLOT,
+                STORE_REQ_IDX=deferred.compact,
+                commit_req_idx_ptr=deferred.req_idx,
             )
             deferred.commit(export=True)
         checkpoint_mamba_states_kernel[
@@ -1768,6 +1839,8 @@ class MambaSpecDecodeGPUContext:
                 commit_src_col_ptr=deferred.src_col,
                 commit_accepted_ptr=deferred.accepted,
                 commit_dst_col_ptr=deferred.dst_col,
+                STORE_REQ_IDX=deferred.compact,
+                commit_req_idx_ptr=deferred.req_idx,
             )
             deferred.commit()
         postprocess_mamba_fused_kernel[grid](

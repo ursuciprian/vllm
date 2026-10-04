@@ -112,6 +112,9 @@ class _B12xGdnDecodeStaging:
     state_indices: torch.Tensor
     num_seqs: torch.Tensor
     num_tokens: torch.Tensor
+    # Compact GDN records: [1 + max_seqs * num_spec, record width] FP32 side
+    # buffer (row 0 is the padding sink). Allocated once, never reallocated.
+    records: torch.Tensor | None = None
 
     @classmethod
     def allocate(
@@ -125,6 +128,7 @@ class _B12xGdnDecodeStaging:
         packed_qkv_width: int,
         head_dim: int,
         device: torch.device,
+        record_width: int = 0,
     ) -> "_B12xGdnDecodeStaging":
         factory = dict(device=device, dtype=torch.bfloat16)
         return cls(
@@ -147,6 +151,16 @@ class _B12xGdnDecodeStaging:
             ),
             num_seqs=torch.zeros(1, dtype=torch.int32, device=device),
             num_tokens=torch.zeros(1, dtype=torch.int32, device=device),
+            records=(
+                torch.zeros(
+                    1 + max_seqs * (state_index_columns - 1),
+                    record_width,
+                    dtype=torch.float32,
+                    device=device,
+                )
+                if record_width
+                else None
+            ),
         )
 
     def is_compatible(
@@ -160,9 +174,18 @@ class _B12xGdnDecodeStaging:
         packed_qkv_width: int,
         head_dim: int,
         device: torch.device,
+        record_width: int = 0,
     ) -> bool:
+        records_ok = (
+            self.records is None
+            if not record_width
+            else self.records is not None
+            and self.records.shape[1] == record_width
+            and self.records.shape[0] >= 1 + max_seqs * (state_index_columns - 1)
+        )
         return (
-            self.max_tokens >= max_tokens
+            records_ok
+            and self.max_tokens >= max_tokens
             and self.max_seqs >= max_seqs
             and self.state_index_columns >= state_index_columns
             and self.key_heads == key_heads
@@ -812,6 +835,11 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             decode_kernel=self.gdn_decode_kernel,
             prefill_backend=self.gdn_prefill_backend,
         )
+        self._b12x_gdn_compact_records = gdn_deferred_commit.resolve_compact(
+            vllm_config,
+            decode_kernel=self.gdn_decode_kernel,
+            prefill_backend=self.gdn_prefill_backend,
+        )
         if self.gdn_decode_kernel == "b12x":
             self._initialize_b12x_gdn_decode(vllm_config)
         if self.gdn_prefill_backend == "b12x":
@@ -853,15 +881,24 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         # instead of constructing an executable declaration.
         caps = self._make_b12x_gdn_caps(max_state_slots=1)
         self._b12x_packed_qkv_width = caps.packed_qkv_width
+        self._b12x_record_width = (
+            caps.record_width if self._b12x_gdn_compact_records else 0
+        )
         self._b12x_decode_staging = None
 
     # Read by vllm.v1.worker.gdn_deferred_commit through the forward context,
     # so it must exist on every GDN layer, not only the b12x ones.
     _b12x_gdn_deferred_checkpoints: bool = False
+    _b12x_gdn_compact_records: bool = False
+    _b12x_record_width: int = 0
 
     @property
     def b12x_gdn_deferred_checkpoints(self) -> bool:
         return bool(self._b12x_gdn_deferred_checkpoints)
+
+    @property
+    def b12x_gdn_compact_records(self) -> bool:
+        return bool(self._b12x_gdn_compact_records)
 
     @property
     def b12x_gdn_state_index_columns(self) -> int:
@@ -890,6 +927,11 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             gate_activation=self.norm.activation,
             qk_l2norm=True,
             deferred_checkpoints=self._b12x_gdn_deferred_checkpoints,
+            **(
+                {"external_records": True}
+                if self._b12x_gdn_compact_records
+                else {}
+            ),
         )
 
     def _make_b12x_gdn_plan(self, max_state_slots: int):
@@ -918,6 +960,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                 packed_qkv_width=self._b12x_packed_qkv_width,
                 head_dim=self.head_v_dim,
                 device=device,
+                record_width=self._b12x_record_width,
             )
             self._b12x_decode_staging = staging
         if not staging.is_compatible(
@@ -929,6 +972,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             packed_qkv_width=self._b12x_packed_qkv_width,
             head_dim=self.head_v_dim,
             device=device,
+            record_width=self._b12x_record_width,
         ):
             raise PreparationResourceUnavailableError(
                 "GDN decode staging does not cover the published capacity"
@@ -1119,6 +1163,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             recurrent_state=slots, query_start_loc=query_start_loc,
             num_accepted_tokens=accepted, state_indices=state_indices,
             num_seqs=num_seqs, num_tokens=num_tokens, output=output,
+            **self._b12x_records_kwargs(staging),
         )
         return PreparedCall(
             run=lambda: state.run(binding), produce=produce, reset=reset,
@@ -1297,7 +1342,11 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             num_seqs=staging.num_seqs if num_seqs is None else num_seqs,
             num_tokens=staging.num_tokens,
             output=staging.output if output is None else output,
+            **self._b12x_records_kwargs(staging),
         )
+
+    def _b12x_records_kwargs(self, staging: _B12xGdnDecodeStaging) -> dict:
+        return {"records": staging.records} if self._b12x_gdn_compact_records else {}
 
     def commit_b12x_gdn_deferred(
         self,
@@ -2952,6 +3001,11 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                 attn_metadata=attn_metadata,
             )
             return
+        if self._b12x_gdn_compact_records and attn_metadata.num_spec_decodes:
+            # Columns 1.. are side-buffer record rows, not pool blocks.
+            raise RuntimeError(
+                "compact GDN records: spec-decode rows reached a non-b12x path"
+            )
         self._forward_core(
             mixed_qkv=mixed_qkv,
             b=b.contiguous(),

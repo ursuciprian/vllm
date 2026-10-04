@@ -67,6 +67,17 @@ touching the window (commit-then-export):
   reads the window and writes only the destination, so the window's base and
   records are intact for the block-boundary commit that follows in the same
   step, and for the next decode step.
+
+``VLLM_GDN_COMPACT_RECORDS=1`` moves the records out of the KV pool. Every
+mamba spec drops its speculative blocks (``num_speculative_blocks = 0``), and
+each deferred GDN layer binds a side buffer of ``1 + max_num_reqs * num_spec``
+record rows. Request slot ``req_idx`` (stable for the request's lifetime, unlike
+its batch row) owns rows ``record_row(req_idx, j) = 1 + req_idx * num_spec +
+j - 1`` for ``j = 1 .. num_spec``; row 0 is a sink for CUDA-graph padding rows,
+whose state-index cells are all ``NULL_BLOCK_ID = 0``. The aligned-index kernel
+writes those ids into columns ``1 ..`` and the commit gather derives them from
+the ``req_idx`` the decision kernels store. A reused slot never replays its
+previous owner's records: a new request starts at ``num_accepted_tokens = 1``.
 """
 
 from __future__ import annotations
@@ -91,6 +102,7 @@ def refuse_reasons(
     *,
     decode_kernel: str | None = "b12x",
     prefill_backend: str | None = "b12x",
+    compact: bool = False,
 ) -> list[str]:
     """Why deferred GDN checkpoints cannot be used for this configuration.
 
@@ -127,11 +139,60 @@ def refuse_reasons(
             "has nothing to defer without speculative tokens "
             f"(num_speculative_tokens={num_spec})"
         )
+    if compact:
+        if not requested():
+            reasons.append(
+                "compact records require VLLM_GDN_DEFERRED_CHECKPOINTS=1 (the "
+                "Triton/FLA paths write full checkpoints into the draft blocks)"
+            )
+        if not getattr(vllm_config, "use_v2_model_runner", False):
+            reasons.append(
+                "compact records require the V2 model runner (records are "
+                "indexed by its stable request-state slot)"
+            )
     return reasons
 
 
 def requested() -> bool:
     return bool(envs.VLLM_GDN_DEFERRED_CHECKPOINTS)
+
+
+def compact_requested() -> bool:
+    return bool(envs.VLLM_GDN_COMPACT_RECORDS)
+
+
+def resolve_compact(
+    vllm_config: "VllmConfig",
+    *,
+    decode_kernel: str | None,
+    prefill_backend: str | None,
+) -> bool:
+    """Like :func:`resolve` for ``VLLM_GDN_COMPACT_RECORDS``: fail closed."""
+    if not compact_requested():
+        return False
+    reasons = refuse_reasons(
+        vllm_config,
+        decode_kernel=decode_kernel,
+        prefill_backend=prefill_backend,
+        compact=True,
+    )
+    if reasons:
+        raise ValueError(
+            "VLLM_GDN_COMPACT_RECORDS=1 but the compact GDN record path "
+            + "; ".join(reasons)
+            + ". Unset it or fix the configuration."
+        )
+    logger.info_once(
+        "GDN compact records enabled: deferred records live in per-layer side "
+        "buffers indexed by request slot; mamba groups hold no speculative blocks."
+    )
+    return True
+
+
+@triton.jit
+def _record_row(req_idx, column, NUM_SPEC: tl.constexpr):
+    """Side-buffer row of request slot ``req_idx``'s record ``column`` (>= 1)."""
+    return 1 + req_idx * NUM_SPEC + column - 1
 
 
 def resolve(
@@ -178,6 +239,8 @@ def gather_gdn_commit_windows_kernel(
     COLUMNS: tl.constexpr,
     EXPLICIT_DST: tl.constexpr = False,
     explicit_destination_ptr=None,  # [MAX_REQS] block ids, read iff EXPLICIT_DST
+    COMPACT: tl.constexpr = False,
+    commit_req_idx_ptr=None,  # [MAX_REQS] request slot per row, read iff COMPACT
 ):
     """Shape one mamba group's commit windows the way b12x's commit expects.
 
@@ -190,6 +253,8 @@ def gather_gdn_commit_windows_kernel(
     -1 = skip) under ``EXPLICIT_DST`` -- the boundary export, whose
     destination is a capture block outside the table. With no committing row,
     ``num_seqs`` is 0 and b12x's commit exits without touching the pool.
+    Under ``COMPACT`` columns 1.. are the row's side-buffer record rows, from
+    its request slot, and only column 0 comes from the block table.
     """
     rows = tl.arange(0, BLOCK)
     in_range = rows < MAX_REQS
@@ -197,9 +262,21 @@ def gather_gdn_commit_windows_kernel(
     dst = tl.load(commit_dst_col_ptr + rows, mask=in_range, other=-1)
     live = in_range & (src >= 0)
     row_base = block_table_ptr + rows.to(tl.int64) * block_table_stride_req
-    for column in tl.static_range(COLUMNS):
-        block = tl.load(row_base + src + column, mask=live, other=0)
-        tl.store(out_state_indices_ptr + rows * COLUMNS + column, block, mask=in_range)
+    if COMPACT:
+        req_idx = tl.load(commit_req_idx_ptr + rows, mask=live, other=0)
+        block = tl.load(row_base + src, mask=live, other=0)
+        tl.store(out_state_indices_ptr + rows * COLUMNS, block, mask=in_range)
+        for column in tl.static_range(1, COLUMNS):
+            record = tl.where(live, _record_row(req_idx, column, COLUMNS - 1), 0)
+            tl.store(
+                out_state_indices_ptr + rows * COLUMNS + column, record, mask=in_range
+            )
+    else:
+        for column in tl.static_range(COLUMNS):
+            block = tl.load(row_base + src + column, mask=live, other=0)
+            tl.store(
+                out_state_indices_ptr + rows * COLUMNS + column, block, mask=in_range
+            )
     if EXPLICIT_DST:
         destination = tl.load(explicit_destination_ptr + rows, mask=live, other=-1)
         live = live & (destination >= 0)
@@ -208,12 +285,14 @@ def gather_gdn_commit_windows_kernel(
     # b12x refuses (silently skips) a destination that names one of the
     # row's record blocks. dst <= src makes that impossible unless the block
     # table repeats an id; count it on device so it is observable without a
-    # host sync on the hot path (GdnDeferredCommit.alias_errors).
-    aliased = tl.zeros([BLOCK], dtype=tl.int32)
-    for column in tl.static_range(1, COLUMNS):
-        record = tl.load(row_base + src + column, mask=live, other=-2)
-        aliased += (live & (record == destination)).to(tl.int32)
-    tl.atomic_add(alias_errors_ptr, tl.sum(aliased, axis=0))
+    # host sync on the hot path (GdnDeferredCommit.alias_errors). Compact
+    # records are not pool blocks, so there is nothing to alias or count.
+    if not COMPACT:
+        aliased = tl.zeros([BLOCK], dtype=tl.int32)
+        for column in tl.static_range(1, COLUMNS):
+            record = tl.load(row_base + src + column, mask=live, other=-2)
+            aliased += (live & (record == destination)).to(tl.int32)
+        tl.atomic_add(alias_errors_ptr, tl.sum(aliased, axis=0))
     tl.store(
         out_destination_ptr + rows, tl.where(live, destination, -1), mask=in_range
     )
@@ -235,6 +314,8 @@ def boundary_export_decision_kernel(
     NUM_GROUPS: tl.constexpr,
     NUM_CAPTURES: tl.constexpr,
     KIND: tl.constexpr,
+    STORE_REQ_IDX: tl.constexpr = False,
+    commit_req_idx_ptr=None,  # [MAX_REQS] out, written iff STORE_REQ_IDX
 ):
     """Turn a capture of speculative column ``b > 0`` into an export commit.
 
@@ -253,6 +334,8 @@ def boundary_export_decision_kernel(
         return
     tl.store(commit_src_col_ptr + batch_idx, tl.load(state_idx_ptr + req_idx))
     tl.store(commit_accepted_ptr + batch_idx, bias + 1)
+    if STORE_REQ_IDX:
+        tl.store(commit_req_idx_ptr + batch_idx, req_idx)
     for group in tl.static_range(NUM_GROUPS):
         block = tl.load(
             destination_blocks_ptr
@@ -300,9 +383,11 @@ class GdnDeferredCommit:
         state_index_columns: int,
         device: torch.device,
         groups: list[tuple[torch.Tensor, list[Any]]],
+        compact: bool = False,
     ) -> None:
         self.max_num_reqs = int(max_num_reqs)
         self.state_index_columns = int(state_index_columns)
+        self.compact = bool(compact)
         factory = dict(dtype=torch.int32, device=device)
         # Decision buffers, batch-row order, shared by every group. The commit
         # resets them to -1 after use, so rows the decision kernel does not
@@ -310,6 +395,8 @@ class GdnDeferredCommit:
         self.src_col = torch.full((self.max_num_reqs,), -1, **factory)
         self.dst_col = torch.full((self.max_num_reqs,), -1, **factory)
         self.accepted = torch.ones((self.max_num_reqs,), **factory)
+        # Request slot per row (compact records); read only for live rows.
+        self.req_idx = torch.zeros((self.max_num_reqs,), **factory)
         # Device-side count of commits b12x would refuse; read it when
         # debugging, never on the hot path.
         self.alias_errors = torch.zeros((1,), **factory)
@@ -361,6 +448,8 @@ class GdnDeferredCommit:
                 COLUMNS=self.state_index_columns,
                 EXPLICIT_DST=export,
                 explicit_destination_ptr=self.export_destination[index],
+                COMPACT=self.compact,
+                commit_req_idx_ptr=self.req_idx,
             )
             for layer in group.layers:
                 layer.commit_b12x_gdn_deferred(
