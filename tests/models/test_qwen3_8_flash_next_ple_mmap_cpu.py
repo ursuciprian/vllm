@@ -297,23 +297,24 @@ def test_willneed_pass_names_every_row(checkpoint, monkeypatch):
     assert not calls
 
 
-def test_prefill_willneed_advises_each_page_and_keeps_rows(checkpoint, monkeypatch):
-    """r13: a prefill-sized gather advises each distinct page it copies once,
-    row k of every job before row k + 1 of any, and copies the same rows."""
+def test_prefill_willneed_advises_each_row_and_keeps_rows(checkpoint, monkeypatch):
+    """r13: a prefill-sized gather advises every row it copies (both planes,
+    local rows only) and copies the same rows as without the readahead."""
     import os
-    import threading
     import time
 
     calls = []
     monkeypatch.setattr(os, "posix_fadvise", lambda *a: calls.append(a), raising=False)
     monkeypatch.setattr(os, "POSIX_FADV_WILLNEED", 3, raising=False)
-    planes, sources = checkpoint
+    planes, _ = checkpoint
+    lo, hi = 256, 640  # a TP rank: rows outside are zeroed, never advised
     rows, _ = _rows(
-        checkpoint, willneed_max=64, parallel_lookups=32, chunk=16, prefill_willneed=True
+        checkpoint, lo, hi, willneed_max=64, parallel_lookups=32, chunk=16,
+        prefill_willneed=True,
     )
     copy = ple_mmap._copy_rows
 
-    def slow_copy(*job):  # a cold copy: the helper gets to advise every page
+    def slow_copy(*job):  # a cold copy: the helper gets to advise every row
         time.sleep(0.05)
         copy(*job)
 
@@ -321,30 +322,39 @@ def test_prefill_willneed_advises_each_page_and_keeps_rows(checkpoint, monkeypat
     ids = np.random.default_rng(3).integers(-3, TABLE_ROWS + 3, 500, dtype=np.int64)
     outs = tuple(np.full((ids.size, b), 0xAB, np.uint8) for b in ROW_BYTES)
     rows.gather(ids, outs)
-    for out, want in zip(outs, _expected(planes, ids, 0, TABLE_ROWS)):
+    for out, want in zip(outs, _expected(planes, ids, lo, hi)):
         np.testing.assert_array_equal(out, want)
-
-    page = ple_mmap.mmap.PAGESIZE
-    path_of = {rows._fds[i]: path for path, i in rows._file_index.items()}
-    source = {(plane, shard): (str(path), off) for plane, shard, path, off in sources}
-    want = set()
-    for i in np.unique(ids[(ids >= 0) & (ids < TABLE_ROWS)]).tolist():
-        shard = i // SHARD_ROWS
-        for plane, row_bytes in enumerate(ROW_BYTES):
-            path, off = source[(plane, shard)]
-            want.add((path, (off + (i - shard * SHARD_ROWS) * row_bytes) // page))
-    got = [(path_of[fd], offset // page) for fd, offset, _, advice in calls]
-    assert len(got) == len(set(got)) == rows.last_advised  # one call per page
-    assert set(got) == want and all(c[3] == 3 for c in calls)
+    local = ids[(ids >= lo) & (ids < hi)]
+    assert rows.last_advised == len(calls) == 2 * local.size
+    got = sorted(os.pread(fd, length, offset) for fd, offset, length, _ in calls)
+    want = sorted(p[i].tobytes() for p in planes for i in local.tolist())
+    assert got == want and all(c[3] == 3 for c in calls)
 
     calls.clear()  # decode-sized: only the existing per-row pass, no helper
-    rows.gather(np.arange(40, dtype=np.int64), tuple(np.zeros((40, b), np.uint8)
-                                                   for b in ROW_BYTES))
+    small = np.arange(lo, lo + 40, dtype=np.int64)
+    rows.gather(small, tuple(np.zeros((40, b), np.uint8) for b in ROW_BYTES))
     assert rows.last_advised == 0 and len(calls) == 2 * 40
 
+
+def test_prefill_willneed_order_follows_the_pool(checkpoint, monkeypatch):
+    """Advice runs one wave of ``workers`` jobs at a time, row k of each job in
+    the wave before row k + 1 of any, and stops as soon as the copy is done."""
+    import os
+    import threading
+
+    calls = []
+    monkeypatch.setattr(os, "posix_fadvise", lambda *a: calls.append(a), raising=False)
+    monkeypatch.setattr(os, "POSIX_FADV_WILLNEED", 3, raising=False)
+    rows, _ = _rows(checkpoint, workers=2, prefill_willneed=True)
+    fd = rows._fds[0]
+    jobs = [(None, None, None, np.array(o)) for o in ([0, 1, 2], [10, 11], [20], [30, 31])]
+    ahead = [(0, 80)] * len(jobs)
+    assert rows._advise(jobs, ahead, threading.Event()) == 8
+    assert [c[1] for c in calls] == [0, 10, 1, 11, 2, 20, 30, 31]
+    assert all(c[0] == fd and c[2] == 80 for c in calls)
     stop = threading.Event()
-    stop.set()  # the copy finished first: no advice at all
-    assert rows._advise([(None, None, None, np.arange(4))], [(0, 80)], stop) == 0
+    stop.set()
+    assert rows._advise(jobs, ahead, stop) == 0
 
 
 def test_prewarm_reads_each_local_plane_once(checkpoint, caplog):

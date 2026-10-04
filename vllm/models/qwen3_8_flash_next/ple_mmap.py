@@ -57,7 +57,7 @@ def reader_knobs() -> dict[str, object]:
         prewarm=os.environ.get("VLLM_PLE_MMAP_PREWARM", "").strip(),
         madvise=os.environ.get("VLLM_PLE_MMAP_MADV", "random").strip() or "random",
         keepalive_ms=_env_int("VLLM_PLE_MMAP_KEEPALIVE_MS", 0),
-        prefill_willneed=_env_int("VLLM_PLE_MMAP_PREFILL_WILLNEED", 0) > 0,
+        prefill_willneed=bool(_env_int("VLLM_PLE_MMAP_PREFILL_WILLNEED", 0)),
     )
 
 
@@ -180,10 +180,10 @@ class PageCacheRows:
         plane) once in a background thread after freeze, into the page cache.
       madvise: "random" (no readahead per fault, the old behaviour) or "normal".
       prefill_willneed: gathers above ``willneed_max`` (prefill chunks) get a
-        helper thread that queues posix_fadvise(WILLNEED) for their rows, one
-        row per copy job in turn, while the pool copies. Cold rows are then
-        read at device queue depth instead of one blocking fault per worker.
-        The helper stops when the copy is done, so a warm gather pays ~nothing.
+        helper thread that queues posix_fadvise(WILLNEED) for their rows in the
+        order the pool copies them, while it copies. Cold rows are then read at
+        device queue depth instead of one blocking fault per worker. The helper
+        stops when the copy is done, so a warm gather pays ~nothing.
       keepalive_ms: while gathers are recent, one 4 KiB O_DIRECT read every
         keepalive_ms. An NVMe drive idle for the kernel's APST timeout (100 ms)
         drops to a low-power state, and the first miss of the next gather pays
@@ -442,32 +442,29 @@ class PageCacheRows:
                 _copy_rows(*job)
 
     def _advise(self, jobs, ahead, stop: threading.Event) -> int:
-        """WILLNEED every distinct page of ``jobs``, row k of each job before
-        row k + 1 of any, so the pool's next faults are already in flight.
-        Returns the number of calls made before ``stop``."""
-        files = np.concatenate([np.full(j[3].size, a[0]) for j, a in zip(jobs, ahead)])
-        sizes = np.concatenate([np.full(j[3].size, a[1]) for j, a in zip(jobs, ahead)])
-        offsets = np.concatenate([j[3] for j in jobs])
-        rank = np.concatenate([np.arange(j[3].size) for j in jobs])
-        order = np.argsort(rank, kind="stable")
-        files, offsets, sizes = files[order], offsets[order], sizes[order]
-        _, first = np.unique(
-            files * (1 << 44) + offsets // mmap.PAGESIZE, return_index=True
-        )
-        keep = np.sort(first)  # one call per page, in interleaved job order
-        if stop.is_set():
-            return 0
+        """WILLNEED the rows of ``jobs`` in the order the pool copies them: one
+        wave of ``workers`` jobs at a time, row k of each job in the wave before
+        row k + 1 of any. Stops as soon as ``stop`` is set (the copy is done);
+        returns the number of calls made."""
         fadvise, willneed, fds = os.posix_fadvise, os.POSIX_FADV_WILLNEED, self._fds
         calls = 0
         try:
-            for file, offset, size in zip(
-                files[keep].tolist(), offsets[keep].tolist(), sizes[keep].tolist()
-            ):
-                if not calls % 256 and stop.is_set():
-                    break
-                fadvise(fds[file], offset, size, willneed)
-                calls += 1
-        except OSError as exc:  # advice only: the copy faults the rows in anyway
+            for wave in range(0, len(jobs), self.workers):
+                group = [
+                    (fds[file], row_bytes, job[3].tolist())
+                    for job, (file, row_bytes) in zip(
+                        jobs[wave : wave + self.workers],
+                        ahead[wave : wave + self.workers],
+                    )
+                ]
+                for k in range(max(len(g[2]) for g in group)):
+                    for fd, row_bytes, offsets in group:
+                        if k < len(offsets):
+                            if stop.is_set():
+                                return calls
+                            fadvise(fd, offsets[k], row_bytes, willneed)
+                            calls += 1
+        except Exception as exc:  # advice only: the copy faults the rows in anyway
             logger.warning("PLE prefill WILLNEED stopped: %s", exc)
         return calls
 
