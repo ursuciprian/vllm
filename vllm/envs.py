@@ -193,6 +193,7 @@ if TYPE_CHECKING:
     VLLM_HUMMING_USE_F16_ACCUM: bool = False
     VLLM_HUMMING_MOE_GEMM_TYPE: Literal["indexed", "grouped", "auto"] | None = None
     VLLM_B12X_MOE_FP4_FORCE_A16: bool = False
+    VLLM_NVFP4_MOE_MARLIN: bool = False
     B12X_MOE_DECODE_BACKEND: Literal["auto", "wm"] = "auto"
     B12X_MOE_WM_MAX_TOKENS: int = 32
     B12X_MOE_WM_MIN_TOKENS: int = 1
@@ -1687,6 +1688,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Force b12x FP4 MoE to use BF16 activations.
     "VLLM_B12X_MOE_FP4_FORCE_A16": lambda: bool(
         int(os.getenv("VLLM_B12X_MOE_FP4_FORCE_A16", "0"))
+    ),
+    # ModelOpt MIXED_PRECISION: serve the NVFP4 (W4A4) routed experts weight-only
+    # on Marlin (same NVFP4 weights and scales, BF16 activations) whatever
+    # --moe-backend says; W4A16_NVFP4 experts (e.g. an MTP drafter) and every
+    # other layer keep their backend. MUST live here: it changes the MoE kernels
+    # in the compiled graph, so a warm torch.compile cache must not be reused.
+    "VLLM_NVFP4_MOE_MARLIN": lambda: bool(
+        int(os.getenv("VLLM_NVFP4_MOE_MARLIN", "0"))
     ),
     # b12x NVFP4 MoE decode backend. "wm" pins decode token counts up to
     # B12X_MOE_WM_MAX_TOKENS to the weight-major kernel. b12x reads both

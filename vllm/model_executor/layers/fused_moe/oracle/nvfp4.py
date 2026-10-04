@@ -27,6 +27,9 @@ from vllm.model_executor.layers.quantization.utils.flashinfer_fp4_moe import (
     prepare_nvfp4_moe_layer_for_fi_or_cutlass,
     prepare_nvfp4_moe_layer_for_flashinfer_cutedsl,
 )
+from vllm.model_executor.layers.quantization.utils.marlin_utils import (
+    marlin_make_workspace_new,
+)
 from vllm.model_executor.layers.quantization.utils.marlin_utils_fp4 import (
     prepare_nvfp4_moe_layer_for_marlin,
 )
@@ -36,6 +39,7 @@ from vllm.model_executor.layers.quantization.utils.nvfp4_emulation_utils import 
 from vllm.model_executor.layers.quantization.utils.quant_utils import (
     QuantKey,
 )
+from vllm.model_executor.weight_transfer import allocate_weights
 from vllm.utils.flashinfer import has_flashinfer_b12x_moe_activation
 
 logger = init_logger(__name__)
@@ -321,6 +325,18 @@ def select_nvfp4_moe_backend(
     )
 
 
+def _prepare_marlin_pooled(layer: RoutedExperts, **kwargs):
+    """Marlin repack with the repacked weights taken from the loader's weight
+    allocator, like the checkpoint tensors they replace. Under the b12x loader
+    the freed originals stay in its pool; allocating the repacked copies there
+    reuses them layer by layer instead of adding a second copy of all experts.
+    The Marlin workspace is runtime scratch, so it is made outside the pool."""
+    layer.workspace = marlin_make_workspace_new(
+        layer.w13_weight.device, 4, existing=getattr(layer, "workspace", None)
+    )
+    return allocate_weights(prepare_nvfp4_moe_layer_for_marlin, layer=layer, **kwargs)
+
+
 def convert_to_nvfp4_moe_kernel_format(
     nvfp4_backend: NvFp4MoeBackend,
     layer: RoutedExperts,
@@ -470,7 +486,7 @@ def convert_to_nvfp4_moe_kernel_format(
             w2,
             w2_scale,
             w2_scale_2,
-        ) = prepare_nvfp4_moe_layer_for_marlin(
+        ) = _prepare_marlin_pooled(
             layer=layer,
             w13=w13,
             w13_scale=w13_scale,

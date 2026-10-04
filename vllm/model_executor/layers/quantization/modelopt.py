@@ -2433,6 +2433,17 @@ class ModelOptMixedPrecisionConfig(ModelOptQuantConfigBase):
                     quant_config=self.fp8_config,
                     moe_config=layer.moe_config,
                 )
+            if quant_algo == "NVFP4" and envs.VLLM_NVFP4_MOE_MARLIN:
+                # Same NVFP4 weights, weight-only on Marlin with BF16
+                # activations; the layer's moe_config keeps --moe-backend.
+                import dataclasses
+
+                return ModelOptNvFp4FusedMoE(
+                    quant_config=self.w4a16_nvfp4_config,
+                    moe_config=dataclasses.replace(
+                        layer.moe_config, moe_backend="marlin"
+                    ),
+                )
             if quant_algo == "NVFP4":
                 return ModelOptNvFp4FusedMoE(
                     quant_config=self.nvfp4_config,
