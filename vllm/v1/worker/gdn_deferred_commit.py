@@ -150,6 +150,11 @@ def refuse_reasons(
                 "compact records require the V2 model runner (records are "
                 "indexed by its stable request-state slot)"
             )
+        parallel_config = getattr(vllm_config, "parallel_config", None)
+        if getattr(parallel_config, "data_parallel_size", 1) > 1:
+            # DP dummy batches map their rows to request slots 0..n-1 and
+            # would write live requests' record rows.
+            reasons.append("compact records do not support data parallelism")
     return reasons
 
 

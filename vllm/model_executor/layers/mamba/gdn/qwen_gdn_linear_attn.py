@@ -963,6 +963,12 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                 record_width=self._b12x_record_width,
             )
             self._b12x_decode_staging = staging
+            if staging.records is not None:
+                logger.info_once(
+                    "GDN compact records: %.1f MiB side buffer per GDN layer, "
+                    "outside the KV budget",
+                    staging.records.nbytes / 2**20,
+                )
         if not staging.is_compatible(
             max_tokens=self._b12x_max_tokens,
             max_seqs=self._b12x_max_seqs,

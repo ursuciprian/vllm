@@ -701,6 +701,10 @@ def test_compact_refuses_without_deferred_or_the_v2_runner(monkeypatch):
     with pytest.raises(ValueError, match="b12x GDN decode kernel"):
         gdc.resolve_compact(v2, decode_kernel="triton", prefill_backend="b12x")
     assert gdc.resolve_compact(v2, **b12x) is True
+    dp_config = SimpleNamespace(data_parallel_size=2)
+    dp = SimpleNamespace(**vars(v2), parallel_config=dp_config)
+    with pytest.raises(ValueError, match="data parallelism"):
+        gdc.resolve_compact(dp, **b12x)
 
 
 def test_compact_drops_speculative_blocks_from_every_mamba_spec(monkeypatch):
