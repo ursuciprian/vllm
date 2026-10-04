@@ -6,6 +6,7 @@ from math import prod
 
 import torch
 
+from vllm import envs
 from vllm.config import VllmConfig
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.utils.torch_utils import get_dtype_size
@@ -68,6 +69,18 @@ class MambaBase(AttentionLayerBase):
         mamba_block_size = vllm_config.cache_config.mamba_block_size
         assert mamba_block_size is not None
         page_size_padded = vllm_config.cache_config.mamba_page_size_padded
+        # Compact GDN records (gdn_deferred_commit) keep the draft-step records
+        # out of the pool, so no mamba layer needs speculative blocks; the
+        # GDN layers fail closed when the rest of the configuration refuses.
+        compact = envs.VLLM_GDN_COMPACT_RECORDS
+        if compact and self.mamba_type not in (
+            MambaAttentionBackendEnum.GDN_ATTN,
+            MambaAttentionBackendEnum.SHORT_CONV,
+        ):
+            raise ValueError(
+                "VLLM_GDN_COMPACT_RECORDS=1 supports GDN and short-conv layers "
+                f"only, got {self.mamba_type}"
+            )
         return MambaSpec(
             shapes=tuple(self.get_state_shape()),
             dtypes=self.get_state_dtype(),
@@ -79,7 +92,7 @@ class MambaBase(AttentionLayerBase):
             # never writes the baseline's per-draft-token state slots.
             num_speculative_blocks=(
                 0
-                if vllm_config.cache_config.use_kda_recoverssm
+                if vllm_config.cache_config.use_kda_recoverssm or compact
                 else vllm_config.num_speculative_tokens
             ),
         )

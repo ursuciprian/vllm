@@ -130,6 +130,7 @@ if TYPE_CHECKING:
     VLLM_ENABLE_FLA_PACKED_RECURRENT_DECODE: bool = True
     VLLM_GDN_DECODE_KERNEL: Literal["b12x", "cuda", "triton"] = "cuda"
     VLLM_GDN_DEFERRED_CHECKPOINTS: bool = False
+    VLLM_GDN_COMPACT_RECORDS: bool = False
     VLLM_GDN_UNIFORM_DECODE_META_SKIP: bool = False
     VLLM_DISABLE_PYNCCL: bool = False
     VLLM_USE_OINK_OPS: bool = False
@@ -1276,6 +1277,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     "VLLM_GDN_DEFERRED_CHECKPOINTS": lambda: (
         os.getenv("VLLM_GDN_DEFERRED_CHECKPOINTS", "0").lower()
+        in ("true", "1", "yes", "on")
+    ),
+    # With deferred GDN checkpoints, keep the draft-step records in a per-layer
+    # side buffer indexed by request slot instead of the mamba speculative
+    # blocks, which drops those blocks from the KV pool. Off by default.
+    "VLLM_GDN_COMPACT_RECORDS": lambda: (
+        os.getenv("VLLM_GDN_COMPACT_RECORDS", "0").lower()
         in ("true", "1", "yes", "on")
     ),
     # Disable pynccl (using torch.distributed instead)
@@ -2587,6 +2595,9 @@ def compile_factors() -> dict[str, object]:
 
         try:
             raw = getter()
+            # Hashed only when on, so the off key stays the pre-knob key.
+            if factor == "VLLM_GDN_COMPACT_RECORDS" and not raw:
+                continue
         except Exception as exc:  # pragma: no cover - defensive logging
             logger.warning(
                 "Skipping environment variable %s while hashing compile factors: %s",

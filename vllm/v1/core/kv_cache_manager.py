@@ -216,9 +216,16 @@ class KVCacheManager:
         self._boundary_restore_lookahead = max(
             num_lookahead_tokens,
             # Include the extra DFlash drafter slot for direct manager callers.
+            # Compact GDN records leave no speculative blocks to count, so the
+            # drafter lookahead stands in and the horizon stays as before.
             max(
                 (
-                    manager.kv_cache_spec.num_speculative_blocks + 1
+                    (
+                        num_lookahead_tokens
+                        if envs.VLLM_GDN_COMPACT_RECORDS
+                        else manager.kv_cache_spec.num_speculative_blocks
+                    )
+                    + 1
                     for manager in self.coordinator.single_type_managers
                     if isinstance(manager.kv_cache_spec, MambaSpec)
                 ),

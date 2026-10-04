@@ -1,5 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import logging
+from collections.abc import Iterable
 from dataclasses import dataclass
 from typing import Any
 
@@ -9,6 +11,7 @@ import torch.nn as nn
 
 from vllm.config import VllmConfig
 from vllm.config.compilation import CUDAGraphMode
+from vllm.logger import init_logger
 from vllm.triton_utils import tl, triton
 from vllm.v1.attention.backends.gdn_attn import GDNAttentionMetadataBuilder
 from vllm.v1.attention.backends.mamba2_attn import Mamba2AttentionMetadataBuilder
@@ -16,6 +19,7 @@ from vllm.v1.attention.backends.short_conv_attn import ShortConvAttentionMetadat
 from vllm.v1.core.sched.output import NewRequestData
 from vllm.v1.kv_cache_interface import KVCacheConfig, MambaSpec
 from vllm.v1.utils import CpuGpuBuffer
+from vllm.v1.worker.gdn_deferred_commit import compact_requested
 from vllm.v1.worker.gpu.attn_utils import build_attn_metadata
 from vllm.v1.worker.gpu.input_batch import InputBatch
 from vllm.v1.worker.gpu.mm.encoder_cache import EncoderCache
@@ -30,6 +34,29 @@ from vllm.v1.worker.mamba_utils import (
     resolve_mamba_state_copy_funcs,
 )
 from vllm.v1.worker.utils import AttentionGroup
+
+logger = init_logger(__name__)
+
+
+def check_fresh_record_slots(
+    fresh: set[int],
+    req_indices: Iterable[int],
+    is_spec_row: Iterable[bool],
+    accepted: Iterable[int],
+) -> None:
+    """Compact GDN records: a reused request slot must not replay records.
+
+    Its first spec-decode step has to start at ``num_accepted_tokens == 1``, so
+    zero of the previous owner's records are replayed. Debug-only (host sync).
+    """
+    for req_idx, spec, num in zip(req_indices, is_spec_row, accepted):
+        if spec and req_idx in fresh:
+            fresh.discard(req_idx)
+            assert num == 1, (
+                f"compact GDN records: fresh request slot {req_idx} starts its "
+                f"first spec step at num_accepted_tokens={num}, replaying "
+                f"{num - 1} stale records"
+            )
 
 
 @dataclass
@@ -72,6 +99,9 @@ class MambaHybridAttnMetadata(ModelSpecificAttnMetadata):
 class MambaHybridModelState(DefaultModelState):
     """Model state for hybrid attention + Mamba / linear-attention models."""
 
+    # Compact GDN records debug check (check_fresh_record_slots); None = off.
+    _fresh_record_slots: set[int] | None = None
+
     def __init__(
         self,
         vllm_config: VllmConfig,
@@ -109,11 +139,20 @@ class MambaHybridModelState(DefaultModelState):
             self._aligned_metadata_groups: list[list[AttentionGroup]] | None = None
             self._aligned_metadata_builders: list[tuple[int, Any]] = []
             self._aligned_metadata_ctx: MambaSpecDecodeGPUContext | None = None
+        self._fresh_record_slots: set[int] | None = (
+            set()
+            if self._align_mode
+            and compact_requested()
+            and logger.isEnabledFor(logging.DEBUG)
+            else None
+        )
 
     def add_request(self, req_index: int, new_req_data: NewRequestData) -> None:
         super().add_request(req_index, new_req_data)
         # Must reset the speculative acceptance count in this idx which could be stale.
         self.num_accepted_tokens_gpu[req_index].fill_(1)
+        if self._fresh_record_slots is not None:
+            self._fresh_record_slots.add(req_index)
         if self._align_mode:
             # The saved column indexes recurrent blocks, not target attention pages.
             block_size = self.cache_config.mamba_block_size
@@ -164,6 +203,11 @@ class MambaHybridModelState(DefaultModelState):
                     n, dtype=dtype, device=self.device
                 ),
                 copy_funcs_by_type=self._mamba_copy_funcs_by_type,
+                record_columns=(
+                    self.vllm_config.num_speculative_tokens
+                    if compact_requested()
+                    else 0
+                ),
             )
         ctx = self._mamba_ctx
         if not ctx.is_initialized:
@@ -186,6 +230,7 @@ class MambaHybridModelState(DefaultModelState):
         attn_groups: list[list[AttentionGroup]],
         kv_cache_config: KVCacheConfig,
         block_tables: tuple[torch.Tensor, ...],
+        idx_mapping: torch.Tensor | None = None,
     ) -> None:
         mamba_group_ids, _ = self._get_mamba_group_info(kv_cache_config)
         if self._aligned_metadata_groups is not attn_groups:
@@ -207,7 +252,23 @@ class MambaHybridModelState(DefaultModelState):
             for group_idx, builder in self._aligned_metadata_builders:
                 builder.mamba_aligned_state_indices = group_views[group_idx]
             self._aligned_metadata_ctx = ctx
-        ctx.compute_aligned_state_indices(seq_lens, num_reqs)
+        ctx.compute_aligned_state_indices(seq_lens, num_reqs, idx_mapping)
+
+    def _debug_check_fresh_record_slots(
+        self,
+        input_batch: InputBatch,
+        num_accepted_tokens: torch.Tensor,
+        num_decode_draft_tokens_np: np.ndarray,
+    ) -> None:
+        if self._fresh_record_slots is None or not self._fresh_record_slots:
+            return
+        n = input_batch.num_reqs
+        check_fresh_record_slots(
+            self._fresh_record_slots,
+            input_batch.idx_mapping_np[:n].tolist(),
+            (num_decode_draft_tokens_np[:n] >= 0).tolist(),
+            num_accepted_tokens[:n].tolist(),
+        )
 
     def preprocess_state(
         self,
@@ -313,6 +374,9 @@ class MambaHybridModelState(DefaultModelState):
                     spec_decode_mask, num_draft_tokens_per_req, -1
                 )
             num_decode_draft_tokens_cpu = torch.from_numpy(num_decode_draft_tokens_np)
+            self._debug_check_fresh_record_slots(
+                input_batch, num_accepted_tokens, num_decode_draft_tokens_np
+            )
 
         if self._align_mode:
             self._prepare_aligned_state_indices(
@@ -321,6 +385,7 @@ class MambaHybridModelState(DefaultModelState):
                 attn_groups,
                 kv_cache_config,
                 block_tables,
+                input_batch.idx_mapping,
             )
 
         mamba_attn_metadata = MambaHybridAttnMetadata(
