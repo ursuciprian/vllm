@@ -84,7 +84,7 @@ def load_mxfp8_large_m_copy(
     names = next((n for n in prefixes
                   if all(f"{x}.weight_scale" in weight_map for x in n)), None)
     if names is None:
-        return None
+        raise ValueError(f"no MXFP8 weights in {path} for any of {list(prefixes)}")
     from safetensors import safe_open
 
     def read(key: str) -> torch.Tensor:
@@ -94,7 +94,7 @@ def load_mxfp8_large_m_copy(
     weight = torch.cat([read(f"{x}.weight") for x in names])
     scale = torch.cat([read(f"{x}.weight_scale") for x in names])
     if weight.dtype != torch.float8_e4m3fn or scale.dtype != torch.uint8:
-        return None
+        raise ValueError(f"{names}: {weight.dtype}/{scale.dtype} in {path} is not MXFP8")
     expected = (int(layer.output_size_per_partition), int(layer.input_size_per_partition))
     if tuple(weight.shape) != expected:
         # ponytail: whole-tensor reads only; TP>1 would need per-rank slicing.
