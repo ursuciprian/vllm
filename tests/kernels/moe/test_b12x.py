@@ -1252,6 +1252,63 @@ def test_b12x_moe_cuda_graph_replay(
 
 
 @pytest.mark.skipif(not _has_b12x_moe(), reason="requires b12x MoE on SM120")
+@torch.inference_mode()
+def test_b12x_w4a16_moe_tail_routing_keeps_tail_rows_exact(workspace_init) -> None:
+    """MTP draft-prefill tail routing must not change the rows that are used."""
+    from vllm.models.qwen3_8_flash_next.tail_routing import TailRouting
+
+    with set_current_vllm_config(
+        VllmConfig(parallel_config=ParallelConfig(pipeline_parallel_size=1))
+    ):
+        case = _make_b12x_moe_case("nvfp4", None, tokens=20, seed=29)
+        kernel, session, _ = _make_b12x_moe_kernel(
+            case.hidden_states,
+            case.w1,
+            case.w2,
+            case.topk,
+            case.activation,
+            case.quant_config,
+        )
+        topk_weights, topk_ids, _ = fused_topk(
+            case.hidden_states, case.score, case.topk, renormalize=False
+        )
+        tails = torch.tensor([2, 9, 10, 17], device="cuda")
+        routing = TailRouting(20, "cuda")
+        routing.begin(
+            torch.tensor([0, 5, 10, 15, 20], dtype=torch.int32, device="cuda"),
+            tails,
+            4,
+        )
+        sources = routing.select(20)
+
+        def apply(weights: torch.Tensor, ids: torch.Tensor) -> torch.Tensor:
+            return kernel.apply(
+                hidden_states=case.hidden_states,
+                w1=case.w1,
+                w2=case.w2,
+                topk_weights=weights,
+                topk_ids=ids,
+                activation=case.activation,
+                global_num_experts=case.w1.shape[0],
+                expert_map=None,
+                apply_router_weight_on_input=False,
+            )
+
+        try:
+            full = apply(topk_weights, topk_ids).clone()
+            routed = apply(
+                topk_weights.index_select(0, sources),
+                topk_ids.index_select(0, sources),
+            )
+            torch.accelerator.synchronize()
+        finally:
+            session.close()
+
+    assert torch.isfinite(routed).all()
+    assert torch.equal(routed[tails], full[tails])
+
+
+@pytest.mark.skipif(not _has_b12x_moe(), reason="requires b12x MoE on SM120")
 @pytest.mark.parametrize(
     "weight_dtype,activation_dtype",
     [("nvfp4", "nvfp4"), ("mxfp4", "mxfp8"), ("nvfp4", None)],
