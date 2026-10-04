@@ -2438,6 +2438,14 @@ class ModelOptMixedPrecisionConfig(ModelOptQuantConfigBase):
                 # activations; the layer's moe_config keeps --moe-backend.
                 import dataclasses
 
+                n = layer.moe_config.intermediate_size_per_partition
+                if n % 64:
+                    # Marlin would pad N; the MoE runner sizes its workspace
+                    # lease from the unpadded N.
+                    raise ValueError(
+                        f"VLLM_NVFP4_MOE_MARLIN needs an intermediate size per "
+                        f"partition divisible by 64, got {n} at {prefix}"
+                    )
                 return ModelOptNvFp4FusedMoE(
                     quant_config=self.w4a16_nvfp4_config,
                     moe_config=dataclasses.replace(

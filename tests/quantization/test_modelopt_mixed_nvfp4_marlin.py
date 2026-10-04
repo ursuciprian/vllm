@@ -58,6 +58,7 @@ def _resolve(monkeypatch, knob, prefix):
 
     monkeypatch.setattr(modelopt, "select_nvfp4_moe_backend", fake_select)
     monkeypatch.setenv("VLLM_NVFP4_MOE_MARLIN", "1" if knob else "0")
+    envs.disable_envs_cache()  # a cached envs would ignore setenv
     layer = _experts()
     method = _config().get_quant_method(layer, prefix)
     assert layer.moe_config.moe_backend == "b12x"  # the layer config is never changed
