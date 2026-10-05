@@ -51,12 +51,17 @@ def _checkpoint_weight_map(path: str) -> dict[str, str]:
 
 def _relative_difference(layer, weight, scale, rows: int = 64) -> float:
     """Sampled-row relative L2 difference between the layer's NVFP4 weight
-    (unprocessed ModelOpt layout) and an MXFP8 copy of the same matrix."""
-    index = torch.linspace(0, weight.shape[0] - 1, rows).long()
+    (unprocessed ModelOpt layout) and an MXFP8 copy of the same matrix.
+
+    Runs under the loader's default dtype (BF16), so every tensor built here
+    has an explicit dtype and device: a BF16 linspace rounds the last row of a
+    16384-row weight up to 16384."""
+    index = torch.arange(rows, device="cpu") * (weight.shape[0] - 1) // (rows - 1)
     codes = layer.weight.data[index.to(layer.weight.device)].cpu()
     codes = torch.stack((codes & 15, codes >> 4), -1).flatten(1).long()
     groups = layer.weight_scale.data[index.to(layer.weight_scale.device)].cpu().float()
-    nvfp4 = (torch.tensor(_E2M1)[codes] * groups.repeat_interleave(16, 1)
+    lut = torch.tensor(_E2M1, dtype=torch.float32, device="cpu")
+    nvfp4 = (lut[codes] * groups.repeat_interleave(16, 1)
              * float(layer.weight_global_scale))
     k = weight.shape[1]
     mxfp8 = weight[index].float() * torch.exp2(

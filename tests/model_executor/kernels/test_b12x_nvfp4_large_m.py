@@ -174,6 +174,42 @@ def test_copy_rejects_wrong_shard_order_and_partition(fused_checkpoint):
         nvfp4_mod.load_mxfp8_large_m_copy(layer, [(QKV, Z)])
 
 
+@pytest.mark.parametrize("shards,k", [
+    (((QKV, 10240), (Z, 6144)), 2560),  # in_proj_qkvz at TP=1
+    ((("model.language_model.layers.0.linear_attn.out_proj", 2560),), 6144),
+], ids=["qkvz", "out"])
+def test_check_at_gdn_shapes_under_the_loader_default_dtype(
+        tmp_path, monkeypatch, shards, k):
+    """The base loader runs process_weights_after_loading under
+    set_default_torch_dtype(bfloat16), with the weights still in the ModelOpt
+    layout. A sampled-row index built in BF16 rounds row 16383 up to 16384
+    (2559 to 2560 for out_proj), past the end of the weight: a device-side
+    assert at boot on GPU, an IndexError here."""
+    from vllm.utils.torch_utils import set_default_torch_dtype
+
+    nvfp4_mod._checkpoint_weight_map.cache_clear()
+    layer, decoded = _nvfp4_layer(sum(rows for _, rows in shards), k, seed=63)
+    tensors, start = {}, 0
+    for name, rows in shards:
+        tensors[f"{name}.weight"], tensors[f"{name}.weight_scale"] = _mxfp8(
+            decoded[start:start + rows])
+        start += rows
+    path = _checkpoint(tmp_path, tensors)
+    monkeypatch.setenv("VLLM_B12X_NVFP4_MXFP8_MIN_TOKENS", "41")
+    monkeypatch.setenv("VLLM_B12X_NVFP4_MXFP8_CHECKPOINT", path)
+    names = tuple(name for name, _ in shards)
+    try:
+        with set_default_torch_dtype(torch.bfloat16):
+            weight, scale = nvfp4_mod.load_mxfp8_large_m_copy(layer, [names])
+            assert weight.shape == decoded.shape
+            assert scale.shape == (decoded.shape[0], k // 32)
+            if len(names) > 1:  # the check still fails loudly on a mismatched copy
+                with pytest.raises(ValueError, match="differs from the NVFP4"):
+                    nvfp4_mod.load_mxfp8_large_m_copy(layer, [names[::-1]])
+    finally:
+        nvfp4_mod._checkpoint_weight_map.cache_clear()
+
+
 def test_copy_is_off_without_knob_or_names(fused_checkpoint, monkeypatch):
     layer, _ = fused_checkpoint
     with pytest.raises(ValueError, match="no MXFP8 weights"):
@@ -228,6 +264,7 @@ def test_each_path_matches_its_standalone_layer(tmp_path, monkeypatch):
         init_workspace_manager,
         reset_workspace_manager,
     )
+    from vllm.utils.torch_utils import set_default_torch_dtype
 
     from test_b12x_linear import _prepare  # same directory, no package
 
@@ -253,7 +290,8 @@ def test_each_path_matches_its_standalone_layer(tmp_path, monkeypatch):
         layer.weight.copy_(host.weight)
         layer.weight_scale.copy_(host.weight_scale)
         layer.weight_scale_2.fill_(0.25)
-        method.process_weights_after_loading(layer)
+        with set_default_torch_dtype(torch.bfloat16):  # as the base loader runs it
+            method.process_weights_after_loading(layer)
         return method, layer
 
     reset_workspace_manager()
@@ -277,7 +315,8 @@ def test_each_path_matches_its_standalone_layer(tmp_path, monkeypatch):
                 plain_mx.create_weights(mx_layer, k, [n], k, n, torch.bfloat16)
             mx_layer.weight.copy_(mx_w)
             mx_layer.weight_scale.copy_(mx_s)
-            plain_mx.process_weights_after_loading(mx_layer)
+            with set_default_torch_dtype(torch.bfloat16):
+                plain_mx.process_weights_after_loading(mx_layer)
             for target, exact in ((layer, fixed), (nv_layer, fixed),
                                   (mx_layer, tuple(m for m in fixed if m >= cutoff))):
                 sessions.append(_prepare(target, device=device, counts=counts,
