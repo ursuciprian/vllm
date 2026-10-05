@@ -349,3 +349,19 @@ def test_each_path_matches_its_standalone_layer(tmp_path, monkeypatch):
             session.close()
         reset_workspace_manager()
         nvfp4_mod._checkpoint_weight_map.cache_clear()
+
+
+@pytest.mark.parametrize(
+    "name, value",
+    (("VLLM_B12X_NVFP4_MXFP8_MIN_TOKENS", "41"),
+     ("VLLM_B12X_NVFP4_MXFP8_CHECKPOINT", "/snapshots/mxfp8")),
+)
+def test_dispatch_knobs_are_compile_factors(monkeypatch, name, value):
+    # Both change the declared b12x plans, so a warm AOT cache must not load across them.
+    import vllm.envs as envs
+
+    envs.disable_envs_cache()
+    monkeypatch.delenv(name, raising=False)
+    off = envs.compile_factors()
+    monkeypatch.setenv(name, value)
+    assert envs.compile_factors() != off
