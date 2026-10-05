@@ -2,9 +2,12 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """CPU-only tests for Qwen3.8-Flash-Next configuration plumbing."""
 
+import json
 from types import SimpleNamespace
 
 import pytest
+import torch
+from safetensors.torch import save_file
 
 from vllm.config.speculative import SpeculativeConfig
 from vllm.config.vllm import DEFAULT_V2_MODEL_RUNNER_ARCHITECTURES
@@ -20,7 +23,7 @@ from vllm.models.qwen3_8_flash_next.config import (
     Qwen4ExpConfig,
     Qwen4ExpTextConfig,
 )
-from vllm.transformers_utils.config import _CONFIG_REGISTRY
+from vllm.transformers_utils.config import _CONFIG_REGISTRY, get_config
 from vllm.transformers_utils.model_arch_config_convertor import (
     MODEL_ARCH_CONFIG_CONVERTORS,
 )
@@ -72,6 +75,76 @@ def test_ple_embedding_storage_dtype_is_preserved(
     )
 
     assert config.ple_embedding_dtype == expected_dtype
+
+
+@pytest.mark.parametrize(
+    "config_cls",
+    [
+        Qwen4ExpConfig,
+        Qwen4ExpTextConfig,
+        Qwen3_8FlashNextConfig,
+        Qwen3_8FlashNextTextConfig,
+    ],
+)
+@pytest.mark.parametrize(
+    ("dtype", "expected"),
+    [
+        (torch.bfloat16, "bfloat16"),
+        (torch.float8_e4m3fn, "float8_e4m3fn"),
+        (torch.uint8, "nvfp4"),
+    ],
+)
+def test_omitted_ple_dtype_is_resolved_from_checkpoint_headers(
+    tmp_path, config_cls, dtype, expected
+) -> None:
+    config_dict = config_cls(**_TEXT_CONFIG, ple_layer_ids=[1]).to_dict()
+    config_dict.get("text_config", config_dict).pop("ple_embedding_dtype")
+    (tmp_path / "config.json").write_text(json.dumps(config_dict))
+    save_file(
+        {
+            "model.language_model.layers.1.ple.ple_embedding."
+            "ngram_embedding.shard_0.weight": torch.zeros((2, 8), dtype=dtype),
+        },
+        tmp_path / "model.safetensors",
+    )
+
+    config = get_config(str(tmp_path), trust_remote_code=False)
+
+    assert config.get_text_config().ple_embedding_dtype == expected
+
+
+def test_mixed_ple_dtypes_are_rejected(tmp_path) -> None:
+    config_dict = Qwen4ExpConfig(text_config=_TEXT_CONFIG | {"ple_layer_ids": [1]})
+    config_dict = config_dict.to_dict()
+    config_dict["text_config"].pop("ple_embedding_dtype")
+    (tmp_path / "config.json").write_text(json.dumps(config_dict))
+    prefix = "model.language_model.layers.1.ple.ple_embedding.ngram_embedding"
+    save_file(
+        {
+            f"{prefix}.shard_0.weight": torch.zeros((2, 8), dtype=torch.uint8),
+            f"{prefix}.shard_1.weight": torch.zeros((2, 8), dtype=torch.bfloat16),
+        },
+        tmp_path / "model.safetensors",
+    )
+
+    with pytest.raises(ValueError, match="Unsupported PLE checkpoint storage"):
+        get_config(str(tmp_path), trust_remote_code=False)
+
+
+def test_explicit_ple_dtype_does_not_probe_checkpoint(tmp_path, monkeypatch) -> None:
+    config = Qwen4ExpConfig(
+        text_config=_TEXT_CONFIG
+        | {"ple_layer_ids": [1], "ple_embedding_dtype": "nvfp4"}
+    )
+    (tmp_path / "config.json").write_text(json.dumps(config.to_dict()))
+    monkeypatch.setattr(
+        "vllm.transformers_utils.config.get_safetensors_params_metadata",
+        lambda *a, **k: pytest.fail("checkpoint headers probed"),
+    )
+
+    config = get_config(str(tmp_path), trust_remote_code=False)
+
+    assert config.get_text_config().ple_embedding_dtype == "nvfp4"
 
 
 @pytest.mark.parametrize("enabled", [True, False])
