@@ -131,6 +131,40 @@ def test_mixed_ple_dtypes_are_rejected(tmp_path) -> None:
         get_config(str(tmp_path), trust_remote_code=False)
 
 
+@pytest.mark.parametrize("ple_layer_ids", [[1], []])
+def test_quantized_layers_ple_entry_is_used_without_probing(
+    tmp_path, monkeypatch, ple_layer_ids
+) -> None:
+    config_dict = Qwen4ExpConfig(
+        text_config=_TEXT_CONFIG | {"ple_layer_ids": ple_layer_ids}
+    ).to_dict()
+    config_dict["text_config"].pop("ple_embedding_dtype")
+    config_dict["quantization_config"] = {
+        "quant_method": "modelopt",
+        "quant_algo": "MIXED_PRECISION",
+        "quantized_layers": {
+            "model.language_model.layers.1.ple.ple_embedding.ngram_embedding": {
+                "quant_algo": "NVFP4",
+                "group_size": 16,
+            },
+            "model.language_model.layers.0.mlp.experts": {
+                "quant_algo": "NVFP4",
+                "group_size": 16,
+            },
+        },
+    }
+    (tmp_path / "config.json").write_text(json.dumps(config_dict))
+    monkeypatch.setattr(
+        "vllm.transformers_utils.config.get_safetensors_params_metadata",
+        lambda *a, **k: pytest.fail("checkpoint headers probed"),
+    )
+
+    config = get_config(str(tmp_path), trust_remote_code=False)
+
+    expected = "nvfp4" if ple_layer_ids else "bfloat16"
+    assert config.get_text_config().ple_embedding_dtype == expected
+
+
 def test_explicit_ple_dtype_does_not_probe_checkpoint(tmp_path, monkeypatch) -> None:
     config = Qwen4ExpConfig(
         text_config=_TEXT_CONFIG

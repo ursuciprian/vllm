@@ -32,15 +32,32 @@ def resolve_ple_embedding_dtype(
     model: str | Path,
     revision: str | None,
 ) -> None:
-    """Infer an omitted PLE table dtype from the checkpoint's safetensors headers.
+    """Infer an omitted PLE table dtype from the quantization config or headers.
 
     Port of upstream 14c7bc398 (resolver only; storage-policy defaults unchanged).
     Checkpoints from local-inference-lab rev 6909a5be on drop
-    text_config.ple_embedding_dtype; without this the NVFP4 table loads as BF16.
+    text_config.ple_embedding_dtype and declare the NVFP4 table in
+    quantization_config.quantized_layers; without this it loads as BF16.
+    The quantized_layers entry is read first (no I/O); the safetensors
+    headers are the fallback.
     """
     text_config = config.get_text_config()
     text_config_dict = config_dict.get("text_config", config_dict)
     if not text_config.ple_layer_ids or text_config_dict.get("ple_embedding_dtype"):
+        return
+
+    qc = config_dict.get("quantization_config") or {}
+    layers = qc.get("quantization", qc).get("quantized_layers") or {}
+    algos = {
+        str(info.get("quant_algo", "")).upper()
+        for name, info in layers.items()
+        if name.endswith(".ple.ple_embedding.ngram_embedding")
+    }
+    if algos == {"NVFP4"}:
+        text_config.ple_embedding_dtype = "nvfp4"
+        logger.info(
+            "Resolved PLE embedding storage dtype from quantized_layers: nvfp4"
+        )
         return
 
     from vllm.transformers_utils.config import get_safetensors_params_metadata
@@ -53,6 +70,12 @@ def resolve_ple_embedding_dtype(
         and name.endswith(".weight")
     }
     if not dtypes:
+        logger.warning(
+            "PLE embedding dtype not declared and no PLE shard headers found for "
+            "%s; keeping %s",
+            model,
+            text_config.ple_embedding_dtype,
+        )
         return
     if len(dtypes) != 1 or not dtypes <= _PLE_STORAGE_DTYPES.keys():
         raise ValueError(
