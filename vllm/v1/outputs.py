@@ -366,6 +366,10 @@ class ModelRunnerOutput:
     # None when the scheduled draft lengths are exact.
     num_verified_draft_tokens: list[int] | None = None
 
+    # MTP confidence gate: per request, the leading drafts verified this step
+    # whose proposal probability met VLLM_MTP_CONFIDENCE_THRESHOLD.
+    num_confident_draft_tokens: list[int] | None = None
+
     # Per-step routed experts data captured by the worker.
     # ``routing_data`` shape: (num_scheduled_tokens, num_layers,
     #                         num_experts_per_tok); expert IDs as uint8/uint16.

@@ -227,6 +227,9 @@ class Request:
         # the scheduler when --per-request-spec-decode-metrics is set (eagerly on
         # add_request, then observed each verify step); stays None otherwise.
         self.spec_decode_metrics: RequestSpecDecodeMetrics | None = None
+        # MTP confidence gate: whether every draft of this request's last
+        # verified round met VLLM_MTP_CONFIDENCE_THRESHOLD.
+        self.spec_chain_confident = False
 
         self.block_hashes: list[BlockHash] = []
         # Store the block hasher without binding self to avoid creating a

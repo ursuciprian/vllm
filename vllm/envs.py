@@ -215,6 +215,8 @@ if TYPE_CHECKING:
     VLLM_GDN_SPEC_DECODE_METADATA_FASTPATH: bool = True
     VLLM_MTP_NVFP4_LM_HEAD: bool = True
     VLLM_MTP_DRAFT_VOCAB: str = ""
+    VLLM_MTP_CONFIDENCE_THRESHOLD: float = 0.0
+    VLLM_MTP_CONFIDENCE_BASE_DEPTH: int = 4
     VLLM_QWEN38_HC_MXFP8: str = "off"
     VLLM_QWEN38_B12X_GEMV: str = "off"
     VLLM_QWEN3_8_FLASH_NEXT_OVERLAP: bool = True
@@ -1792,6 +1794,24 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # only environment_variables entries reach envs.compile_factors(). The key
     # hashes the path, not the file, so name files by K (ids-K65536.txt.gz).
     "VLLM_MTP_DRAFT_VOCAB": lambda: os.getenv("VLLM_MTP_DRAFT_VOCAB", "").strip(),
+    # Confidence-gated MTP draft depth. With a threshold in (0, 1] and a
+    # num_speculative_tokens_per_batch_size schedule in the speculative config,
+    # the scheduler drafts the schedule's depth for a batch only when, in every
+    # request's last verified round, the drafter gave each of its drafts a
+    # proposal probability >= the threshold (the chain never "stopped").
+    # Otherwise it drafts VLLM_MTP_CONFIDENCE_BASE_DEPTH. The depth is chosen
+    # from past rounds only, so rejection sampling stays exact. 0 = off.
+    # Hashed into compile_factors only when on: the arms that set it also raise
+    # num_speculative_tokens, which changes the b12x plans a boot declares but
+    # is not part of the torch AOT key (memory note
+    # b12x-plan-population-env-cache-key).
+    "VLLM_MTP_CONFIDENCE_THRESHOLD": lambda: float(
+        os.getenv("VLLM_MTP_CONFIDENCE_THRESHOLD", "0") or 0
+    ),
+    # Depth drafted while the confidence gate is closed. Scheduler-only.
+    "VLLM_MTP_CONFIDENCE_BASE_DEPTH": lambda: int(
+        os.getenv("VLLM_MTP_CONFIDENCE_BASE_DEPTH", "4") or 4
+    ),
     # Which Qwen3.8-Flash-Next BF16 projections are quantized to MXFP8 online.
     # MUST live here rather than behind a bare os.getenv: it changes how many
     # b12x plans a boot creates, and b12x plan handles are a process-local
@@ -2543,6 +2563,8 @@ def compile_factors() -> dict[str, object]:
         "VLLM_PLE_MMAP_PREFILL_WILLNEED",
         # Shared GDN prefill staging: buffer ownership inside a custom op, no graph change.
         "VLLM_GDN_SHARED_PREFILL_STAGING",
+        # Depth drafted while the MTP confidence gate is closed: scheduler-only.
+        "VLLM_MTP_CONFIDENCE_BASE_DEPTH",
         # Location-only derived paths: where a cache/config directory lives
         # cannot affect compiled artifacts, and hashing them means relocating
         # HOME or the XDG roots silently invalidates every compile cache
@@ -2627,7 +2649,10 @@ def compile_factors() -> dict[str, object]:
         try:
             raw = getter()
             # Hashed only when on, so the off key stays the pre-knob key.
-            if factor == "VLLM_GDN_COMPACT_RECORDS" and not raw:
+            if factor in (
+                "VLLM_GDN_COMPACT_RECORDS",
+                "VLLM_MTP_CONFIDENCE_THRESHOLD",
+            ) and not raw:
                 continue
         except Exception as exc:  # pragma: no cover - defensive logging
             logger.warning(

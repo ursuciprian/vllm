@@ -76,7 +76,11 @@ from vllm.v1.request import Request, RequestStatus, StreamingUpdate
 from vllm.v1.spec_decode.dynamic.acceptance_length import (
     BatchSizeAcceptanceLengthController,
 )
-from vllm.v1.spec_decode.dynamic.utils import build_dynamic_sd_schedule_lookup
+from vllm.v1.spec_decode.dynamic.utils import (
+    build_dynamic_sd_schedule_lookup,
+    gated_num_spec_tokens,
+    mtp_confidence_gate,
+)
 from vllm.v1.spec_decode.metrics import SpecDecodingStats
 from vllm.v1.structured_output import StructuredOutputGrammar, StructuredOutputManager
 from vllm.v1.utils import record_function_or_nullcontext
@@ -311,7 +315,12 @@ class Scheduler(SchedulerInterface):
         self.acceptance_length_controller: (
             BatchSizeAcceptanceLengthController | None
         ) = None
+        # MTP confidence gate: base depth when on (VLLM_MTP_CONFIDENCE_THRESHOLD).
+        self.confidence_gate_base_depth: int | None = None
         if speculative_config is not None:
+            gate = mtp_confidence_gate(speculative_config)
+            if gate is not None:
+                self.confidence_gate_base_depth = gate[1]
             if speculative_config.num_speculative_tokens_per_batch_size:
                 self.dynamic_sd_lookup = build_dynamic_sd_schedule_lookup(
                     speculative_config.num_speculative_tokens_per_batch_size,
@@ -1928,6 +1937,15 @@ class Scheduler(SchedulerInterface):
             )
         elif self.dynamic_sd_lookup is not None and batch_size > 0:
             num_spec_tokens_to_schedule = self.dynamic_sd_lookup[batch_size]
+            if self.confidence_gate_base_depth is not None:
+                num_spec_tokens_to_schedule = gated_num_spec_tokens(
+                    num_spec_tokens_to_schedule,
+                    self.confidence_gate_base_depth,
+                    (
+                        self.requests[req_id].spec_chain_confident
+                        for req_id in num_scheduled_tokens
+                    ),
+                )
 
         scheduled_encoder_input_stats = None
         if (
@@ -2729,6 +2747,12 @@ class Scheduler(SchedulerInterface):
                     )
                 num_sampled = self.num_sampled_tokens_per_step
                 num_accepted = max(len(generated_token_ids) - num_sampled, 0)
+                if model_runner_output.num_confident_draft_tokens is not None:
+                    request.spec_chain_confident = (
+                        num_draft_tokens > 0
+                        and model_runner_output.num_confident_draft_tokens[req_index]
+                        >= num_draft_tokens
+                    )
                 assert num_accepted <= num_draft_tokens, (
                     f"{req_id}: accepted={num_accepted}, "
                     f"valid_drafts={num_draft_tokens}, "

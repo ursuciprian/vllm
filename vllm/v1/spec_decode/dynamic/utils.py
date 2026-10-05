@@ -146,3 +146,69 @@ def build_dynamic_sd_schedule_lookup(
         )
 
     return dense_schedule
+
+
+def mtp_confidence_gate(speculative_config) -> tuple[float, int] | None:
+    """``(threshold, base_depth)`` when the MTP confidence gate is on, else None.
+
+    The gate (VLLM_MTP_CONFIDENCE_THRESHOLD > 0) lowers the depth of the
+    ``num_speculative_tokens_per_batch_size`` schedule to the base depth unless
+    every request's last drafting chain was confident end to end. It reads the
+    drafter's proposal probabilities, so it needs probabilistic draft sampling,
+    and it needs the schedule so graphs exist for both depths. A bad setup
+    raises at startup instead of serving uncaptured shapes.
+    """
+    import vllm.envs as envs
+
+    threshold = envs.VLLM_MTP_CONFIDENCE_THRESHOLD
+    if threshold <= 0:
+        return None
+    base = envs.VLLM_MTP_CONFIDENCE_BASE_DEPTH
+    if threshold > 1:
+        raise ValueError(f"VLLM_MTP_CONFIDENCE_THRESHOLD={threshold} must be <= 1.")
+    if speculative_config is None:
+        raise ValueError("VLLM_MTP_CONFIDENCE_THRESHOLD needs speculative decoding.")
+    if speculative_config.method != "mtp":
+        raise ValueError("VLLM_MTP_CONFIDENCE_THRESHOLD only supports method='mtp'.")
+    if not speculative_config.num_speculative_tokens_per_batch_size:
+        raise ValueError(
+            "VLLM_MTP_CONFIDENCE_THRESHOLD needs num_speculative_tokens_per_batch_size"
+            " in the speculative config (the depth it opens up to)."
+        )
+    if speculative_config.uses_acceptance_length_adaptation():
+        raise ValueError(
+            "VLLM_MTP_CONFIDENCE_THRESHOLD and adaptive_speculative_tokens_window "
+            "both choose the depth; set one."
+        )
+    if speculative_config.draft_sample_method != "probabilistic":
+        raise ValueError(
+            "VLLM_MTP_CONFIDENCE_THRESHOLD reads the drafter's proposal "
+            "probabilities: set draft_sample_method='probabilistic'."
+        )
+    if not 1 <= base < speculative_config.num_speculative_tokens:
+        raise ValueError(
+            f"VLLM_MTP_CONFIDENCE_BASE_DEPTH={base} must be in "
+            f"[1, num_speculative_tokens={speculative_config.num_speculative_tokens})."
+        )
+    return threshold, base
+
+
+def mtp_confidence_gate_max_batch_size(
+    dense_schedule: list[int], base_depth: int
+) -> int:
+    """Largest batch size whose scheduled depth exceeds the gate's base depth.
+
+    ``dense_schedule`` is ``build_dynamic_sd_schedule_lookup``'s output. Above
+    this size the gate can never open, so the drafter skips the confidence math.
+    """
+    return max(
+        (bs for bs, depth in enumerate(dense_schedule) if bs and depth > base_depth),
+        default=0,
+    )
+
+
+def gated_num_spec_tokens(depth: int, base_depth: int, confident) -> int:
+    """This step's depth: ``depth`` only if every request's last chain held."""
+    if depth <= base_depth:
+        return depth
+    return depth if all(confident) else base_depth

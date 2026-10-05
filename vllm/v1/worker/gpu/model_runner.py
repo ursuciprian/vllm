@@ -71,6 +71,10 @@ from vllm.v1.outputs import (
     ModelRunnerOutput,
     RoutedExpertsTensors,
 )
+from vllm.v1.spec_decode.dynamic.utils import (
+    build_dynamic_sd_schedule_lookup,
+    mtp_confidence_gate_max_batch_size,
+)
 from vllm.v1.worker.block_table import get_block_table_width
 from vllm.v1.worker.cp_utils import check_attention_cp_compatibility
 from vllm.v1.worker.gpu import pcp_manager as pcp
@@ -265,6 +269,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         if self.speculative_config is not None:
             if self.is_last_pp_rank:
                 self.speculator = init_speculator(self.vllm_config, self.device)
+                self._init_confidence_gate()
 
             if self.speculative_config.method in (
                 "eagle3",
@@ -2037,6 +2042,30 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             return output_intermediate_tensors
         return None
 
+    def _init_confidence_gate(self) -> None:
+        """Largest batch the MTP confidence gate can open for (0 = gate off)."""
+        self._confidence_gate_max_reqs = 0
+        gate = getattr(self.speculator, "confidence_gate", None)
+        if gate is None:
+            return
+        assert self.speculative_config is not None
+        dense = build_dynamic_sd_schedule_lookup(
+            self.speculative_config.num_speculative_tokens_per_batch_size,
+            vllm_max_batch_size=self.scheduler_config.max_num_seqs,
+            vllm_num_speculative_tokens=self.speculative_config.num_speculative_tokens,
+        )
+        self._confidence_gate_max_reqs = mtp_confidence_gate_max_batch_size(
+            dense, gate[1]
+        )
+        logger.info(
+            "MTP confidence gate on: threshold %.2f, base depth %d, schedule %s, "
+            "opens for batches of up to %d requests.",
+            gate[0],
+            gate[1],
+            self.speculative_config.num_speculative_tokens_per_batch_size,
+            self._confidence_gate_max_reqs,
+        )
+
     @torch.inference_mode()
     @step_eplb_after()
     def sample_tokens(
@@ -2124,6 +2153,15 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             and input_batch.num_draft_tokens_per_req is not None
             else None
         )
+        # MTP confidence gate: the confident run of the drafts verified in this
+        # step (recorded when they were proposed), snapshotted before propose()
+        # overwrites it.
+        draft_confident_len = getattr(self.speculator, "draft_confident_len", None)
+        num_confident_draft_tokens = (
+            draft_confident_len[input_batch.idx_mapping]
+            if draft_confident_len is not None and input_batch.num_draft_tokens > 0
+            else None
+        )
         # Start async output copy here so that it can overlap with speculator proposal.
         boundary_state = (
             None if boundary_logits_only else self.boundary_checkpoint_state
@@ -2139,6 +2177,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 check_ep_fault=self.check_ep_fault,
                 routed_experts=routed_experts,
                 num_verified_draft_tokens=num_verified_draft_tokens,
+                num_confident_draft_tokens=num_confident_draft_tokens,
             )
         else:
             boundary_capture = torch.empty(
@@ -2195,6 +2234,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 routed_experts=routed_experts,
                 boundary_checkpoint_tokens=boundary_capture[0],
                 num_verified_draft_tokens=num_verified_draft_tokens,
+                num_confident_draft_tokens=num_confident_draft_tokens,
             )
 
         draft_tokens_for_next_step: torch.Tensor | None = None
@@ -2214,6 +2254,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             self.req_states.draft_tokens[
                 input_batch.idx_mapping, :num_spec_tokens_to_schedule
             ] = draft_tokens_for_next_step
+            if draft_confident_len is not None:
+                # Replayed drafts carry no proposal probabilities: gate closed.
+                draft_confident_len[input_batch.idx_mapping] = 0
         elif self.speculator is not None and num_spec_tokens_to_schedule > 0:
             assert self.sampler is not None
             # Let the target override the hidden state fed to the drafter
@@ -2263,6 +2306,12 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 ]
             else:
                 draft_tokens_for_next_step = draft_tokens
+            if draft_confident_len is not None:
+                self.speculator.record_draft_confidence(
+                    input_batch.idx_mapping,
+                    num_draft_tokens,
+                    input_batch.num_reqs <= self._confidence_gate_max_reqs,
+                )
             if self.adaptive_verification is not None:
                 self.adaptive_verification.record_confidences(
                     self.speculator.draft_token_confidence_probs, input_batch

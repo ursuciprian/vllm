@@ -16,6 +16,7 @@ from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.model_executor.models import supports_multimodal_embeddings
 from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.v1.kv_cache_interface import KVCacheConfig
+from vllm.v1.spec_decode.dynamic.utils import mtp_confidence_gate
 from vllm.v1.worker.gpu.attn_utils import (
     build_attn_metadata,
     init_attn_backend,
@@ -25,6 +26,10 @@ from vllm.v1.worker.gpu.cp_utils import prepare_dcp_local_seq_lens
 from vllm.v1.worker.gpu.input_batch import InputBatch, InputBuffers
 from vllm.v1.worker.gpu.model_states.interface import ModelState
 from vllm.v1.worker.gpu.sample.gumbel import gumbel_sample
+from vllm.v1.worker.gpu.spec_decode.draft_confidence import (
+    confident_run_length,
+    draft_token_probs,
+)
 from vllm.v1.worker.utils import AttentionGroup
 
 logger = init_logger(__name__)
@@ -158,7 +163,43 @@ class DraftModelSpeculator(BaseSpeculator):
                 device=device,
             )
 
+        # MTP confidence gate: confident run of each request's latest drafts,
+        # by request state slot. The model runner reports it with the verify
+        # step that checks those drafts; the scheduler picks the next depth.
+        self.confidence_gate = mtp_confidence_gate(self.speculative_config)
+        self.draft_confident_len: torch.Tensor | None = None
+        if self.confidence_gate is not None:
+            self.draft_confident_len = torch.zeros(
+                self.max_num_reqs, dtype=torch.int32, device=device
+            )
+
         self.supports_mm_inputs = False
+
+    def record_draft_confidence(
+        self, idx_mapping: torch.Tensor, num_drafts: int, gate_open_possible: bool
+    ) -> None:
+        """Store the confident run of the drafts just proposed for this batch.
+
+        Called after propose(). When the batch is too large for the gate to
+        open, only zeros are stored and the vocab pass is skipped.
+        """
+        assert self.draft_confident_len is not None
+        assert self.confidence_gate is not None
+        num_reqs = idx_mapping.shape[0]
+        if not gate_open_possible or num_drafts == 0:
+            self.draft_confident_len[idx_mapping] = 0
+            return
+        assert self.draft_logits is not None
+        q = draft_token_probs(
+            self.draft_logits,
+            self.draft_tokens[:num_reqs],
+            idx_mapping,
+            self.temperature,
+            num_drafts,
+        )
+        self.draft_confident_len[idx_mapping] = confident_run_length(
+            q, self.confidence_gate[0]
+        )
 
     @abstractmethod
     def load_draft_model(
