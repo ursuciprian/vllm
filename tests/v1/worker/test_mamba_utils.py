@@ -277,11 +277,12 @@ def test_aligned_state_indices_graph_replay_masks_padding_and_refreshes_blocks()
     with torch.cuda.graph(graph):
         compute()
     graph.replay()
-    assert indices[:, :, 0].tolist() == [[0, 5, -1, -1], [100, 105, -1, -1]]
+    # Padding rows get the null block 0, not -1 (MTP0 graph replay reads them).
+    assert indices[:, :, 0].tolist() == [[0, 5, 0, 0], [100, 105, 0, 0]]
 
     seq_lens.copy_(torch.tensor([17, 0, 33, 0], dtype=torch.int32, device="cuda"))
     graph.replay()
-    assert indices[:, :, 0].tolist() == [[1, -1, 10, -1], [101, -1, 110, -1]]
+    assert indices[:, :, 0].tolist() == [[1, 0, 10, 0], [101, 0, 110, 0]]
 
 
 def test_gpu_context_reinterprets_high_data_ptrs_for_int64_metadata():
