@@ -265,6 +265,7 @@ def test_aligned_state_indices_graph_replay_masks_padding_and_refreshes_blocks()
         block_table_stride_req=4,
         block_size=16,
         num_groups=2,
+        record_columns=0,
     )
     seq_lens = torch.tensor([16, 17, 0, 0], dtype=torch.int32, device="cuda")
 
