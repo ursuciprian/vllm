@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import math
+from collections.abc import Callable
 from dataclasses import dataclass, replace
 from typing import Any, ClassVar, cast
 
@@ -284,6 +285,22 @@ class Qwen3_8FlashNextQSAMetadataBuilder(B12xPagedMetadataBuilder):
             block_table=blk_table,
             slot_mapping=slot_mapping,
         )
+
+
+def fit_block_to_page(
+    block_size: int, unit: int, page_bytes: Callable[[int], int], budget: int
+) -> int:
+    """Largest divisor of ``block_size`` that is a multiple of ``unit`` and whose
+    page fits ``budget`` bytes. A divisor keeps the scheduler block (the LCM of
+    the group block sizes) unchanged."""
+    for parts in range(1, block_size // unit + 1):
+        fitted, rest = divmod(block_size, parts)
+        if not rest and fitted % unit == 0 and page_bytes(fitted) <= budget:
+            return fitted
+    raise ValueError(
+        f"no {unit}-aligned divisor of block size {block_size} has a page "
+        f"within {budget} bytes"
+    )
 
 
 class Qwen3_8FlashNextQSABackend(B12xPagedAttentionBackend):
@@ -1350,16 +1367,41 @@ class Qwen3_8FlashNextQSAAttention(nn.Module, AttentionLayerBase):
     def get_attn_backend(self) -> type[AttentionBackend]:
         return self.attn_backend
 
-    def get_kv_cache_spec(self, vllm_config: VllmConfig) -> KVCacheSpec:
+    def _cache_spec(self, block_size: int, cache_dtype: str) -> AttentionSpec:
         base = FullAttentionSpec(
-            block_size=int(vllm_config.cache_config.block_size),
+            block_size=block_size,
             num_kv_heads=self.num_kv_heads,
             head_size=self.head_dim,
             head_size_v=self.head_dim,
-            dtype=self.kv_cache_torch_dtype,
-            kv_quant_mode=get_kv_quant_mode(self.kv_cache_dtype),
+            dtype=kv_cache_dtype_str_to_dtype(cache_dtype, self._qsa_model_config),
+            kv_quant_mode=get_kv_quant_mode(cache_dtype),
         )
         return self.attn_backend.customize_spec(base)
+
+    def get_kv_cache_spec(self, vllm_config: VllmConfig) -> KVCacheSpec:
+        block_size = int(vllm_config.cache_config.block_size)
+        spec = self._cache_spec(block_size, self.kv_cache_dtype)
+        target_dtype = vllm_config.cache_config.cache_dtype
+        if target_dtype == self.kv_cache_dtype:
+            return spec
+        # A drafter layer with a wider KV dtype than the target (speculative
+        # kv_cache_dtype "auto" over an fp8 target) has a larger page at the
+        # target block size. Every group shares one block pool whose block is
+        # the largest page, so that page would pad all GDN and target pages
+        # (k57: 3.29 MB -> 6.39 MB, 4568 -> 2353 blocks). Keep the page within
+        # the target's by giving the drafter group fewer tokens per block.
+        budget = self._cache_spec(block_size, target_dtype).page_size_bytes
+        if spec.page_size_bytes <= budget:
+            return spec
+        fitted = fit_block_to_page(
+            block_size,
+            math.lcm(_QSA_MANAGER_BLOCK_ALIGNMENT, self.raw_ring_capacity),
+            lambda b: self._cache_spec(b, self.kv_cache_dtype).page_size_bytes,
+            budget,
+        )
+        return replace(
+            self._cache_spec(fitted, self.kv_cache_dtype), page_size_padded=budget
+        )
 
     def snapshot_speculative_interval_starts(self) -> None:
         self._raw_interval_start_snapshot.copy_(self._raw_interval_start_positions)
