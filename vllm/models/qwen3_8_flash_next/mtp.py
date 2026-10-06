@@ -766,7 +766,10 @@ class Qwen3_8FlashNextMTP(
             )
         self.quant_config = vllm_config.quant_config
         super().__init__()
-        self.has_own_lm_head = envs.VLLM_MTP_NVFP4_LM_HEAD
+        bf16_head = envs.VLLM_MTP_BF16_LM_HEAD
+        if bf16_head and config.tie_word_embeddings:
+            raise ValueError("BF16 draft head requires untied word embeddings")
+        self.has_own_lm_head = envs.VLLM_MTP_NVFP4_LM_HEAD and not bf16_head
         if (
             self.has_own_lm_head
             and envs.is_set("VLLM_MTP_NVFP4_LM_HEAD")
@@ -807,7 +810,11 @@ class Qwen3_8FlashNextMTP(
             head_kwargs = dict(
                 quant_config=self.quant_config,
                 prefix=maybe_prefix(prefix, "lm_head"),
-                lm_head_quantization="nvfp4" if self.has_own_lm_head else None,
+                lm_head_quantization=(
+                    "bf16"
+                    if bf16_head
+                    else ("nvfp4" if self.has_own_lm_head else None)
+                ),
             )
             if self.draft_vocab_ids is None:
                 self.lm_head = ParallelLMHead(
@@ -817,7 +824,13 @@ class Qwen3_8FlashNextMTP(
                 self.lm_head = DraftVocabLMHead(
                     self.draft_vocab_ids, config.hidden_size, **head_kwargs
                 )
-            self.has_own_lm_head = self.lm_head.runtime_lm_head_quantization == "nvfp4"
+            # A BF16 own head must never be swapped for the target's
+            # (MXFP8) head either.
+            self.has_own_lm_head = (
+                bf16_head or self.lm_head.runtime_lm_head_quantization == "nvfp4"
+            )
+            if bf16_head:
+                logger.info("MTP draft head: own BF16 copy, no runtime quantization")
             if config.tie_word_embeddings:
                 self.lm_head = self.lm_head.tie_weights(self.model.embed_tokens)
         else:

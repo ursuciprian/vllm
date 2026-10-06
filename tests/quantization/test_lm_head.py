@@ -86,6 +86,36 @@ def test_runtime_mxfp8_only_selects_lm_head(
 
 
 @pytest.mark.cpu_test
+def test_bf16_draft_head_ignores_global_mxfp8_and_is_never_shared(
+    monkeypatch, mxfp8_head_config
+):
+    """VLLM_MTP_BF16_LM_HEAD: the draft head stays BF16 while the target head
+    is MXFP8, and a head of another dtype is never swapped for the target's."""
+    from vllm.model_executor.layers.quantization.online import mxfp8
+    from vllm.v1.worker.gpu.spec_decode.eagle.utils import _should_share
+
+    monkeypatch.setenv("VLLM_MXFP8_LM_HEAD", "1")
+    monkeypatch.setattr(mxfp8, "init_mxfp8_linear_kernel", lambda: None)
+    target = ParallelLMHead(256, 128, params_dtype=torch.bfloat16, disable_tp=True)
+    draft = ParallelLMHead(
+        256,
+        128,
+        params_dtype=torch.bfloat16,
+        disable_tp=True,
+        lm_head_quantization="bf16",
+    )
+    assert isinstance(target.quant_method, mxfp8.Mxfp8OnlineLinearMethod)
+    assert isinstance(draft.quant_method, UnquantizedEmbeddingMethod)
+    assert draft.runtime_lm_head_quantization is None
+    assert draft.weight.dtype == torch.bfloat16
+    own = SimpleNamespace(has_own_lm_head=True)
+    other = SimpleNamespace(weight=torch.zeros(256, 128, dtype=torch.float8_e4m3fn))
+    assert not _should_share(own, "has_own_lm_head", draft, other)
+    same = SimpleNamespace(weight=draft.weight.detach().clone())
+    assert _should_share(own, "has_own_lm_head", draft, same)
+
+
+@pytest.mark.cpu_test
 def test_runtime_mxfp8_rejects_quantized_checkpoint(monkeypatch, mxfp8_head_config):
     monkeypatch.setenv("VLLM_MXFP8_LM_HEAD", "1")
     quant_config = SimpleNamespace(get_quant_method=lambda *args, **kwargs: object())

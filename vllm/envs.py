@@ -214,6 +214,7 @@ if TYPE_CHECKING:
     VLLM_QWEN3_8_FLASH_NEXT_MTP_COMPACT: bool = True
     VLLM_GDN_SPEC_DECODE_METADATA_FASTPATH: bool = True
     VLLM_MTP_NVFP4_LM_HEAD: bool = True
+    VLLM_MTP_BF16_LM_HEAD: bool = False
     VLLM_MTP_DRAFT_VOCAB: str = ""
     VLLM_QWEN38_HC_MXFP8: str = "off"
     VLLM_QWEN38_B12X_GEMV: str = "off"
@@ -1781,6 +1782,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     "VLLM_MTP_NVFP4_LM_HEAD": lambda: bool(
         int(os.getenv("VLLM_MTP_NVFP4_LM_HEAD", "1"))
+    ),
+    # Qwen3.8-Flash-Next MTP: the draft keeps its own full-precision (BF16)
+    # copy of the checkpoint lm_head, with no runtime quantization, even when
+    # VLLM_MXFP8_LM_HEAD quantizes the target head. Overrides
+    # VLLM_MTP_NVFP4_LM_HEAD. Measurement knob (drafter precision ceiling);
+    # changes the draft head GEMM, so it must be a compile factor.
+    "VLLM_MTP_BF16_LM_HEAD": lambda: bool(
+        int(os.getenv("VLLM_MTP_BF16_LM_HEAD", "0"))
     ),
     # Qwen3.8-Flash-Next MTP draft head restricted to a token-id subset: a
     # text file (optionally .gz) with one target-vocab id per line, '#'

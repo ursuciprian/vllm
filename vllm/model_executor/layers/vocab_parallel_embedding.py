@@ -318,7 +318,7 @@ class VocabParallelEmbedding(PluggableLayer):
         prefix: str = "",
         *,
         disable_tp: bool = False,
-        lm_head_quantization: Literal["mxfp8", "nvfp4"] | None = None,
+        lm_head_quantization: Literal["mxfp8", "nvfp4", "bf16"] | None = None,
     ):
         super().__init__()
 
@@ -362,7 +362,10 @@ class VocabParallelEmbedding(PluggableLayer):
 
         is_embedding_layer = not isinstance(self, ParallelLMHead)
         head_quantization = lm_head_quantization
-        if head_quantization is None and envs.VLLM_MXFP8_LM_HEAD:
+        if head_quantization == "bf16":
+            # Explicitly unquantized: the global MXFP8 head default does not apply.
+            head_quantization = None
+        elif head_quantization is None and envs.VLLM_MXFP8_LM_HEAD:
             head_quantization = "mxfp8"
         self.runtime_lm_head_quantization: Literal["mxfp8", "nvfp4"] | None = None
         if not is_embedding_layer and head_quantization is not None:
@@ -681,7 +684,7 @@ class ParallelLMHead(VocabParallelEmbedding):
         prefix: str = "",
         *,
         disable_tp: bool = False,
-        lm_head_quantization: Literal["mxfp8", "nvfp4"] | None = None,
+        lm_head_quantization: Literal["mxfp8", "nvfp4", "bf16"] | None = None,
     ):
         super().__init__(
             num_embeddings,
