@@ -821,6 +821,15 @@ class Qwen3_8FlashNextQSAAttention(nn.Module, AttentionLayerBase):
         self.kv_sharing_target_layer_name = None
         self.kv_cache = torch.tensor([])
         set_default_quant_scales(self, register_buffer=True)
+        k_scale = envs.VLLM_QWEN38_MTP_K_SCALE
+        if (
+            k_scale != 1.0
+            and self.layer_id >= int(config.num_hidden_layers)
+            and self.kv_cache_kernel_dtype == current_platform.fp8_dtype()
+        ):
+            self._k_scale.fill_(k_scale)
+            self._k_scale_float = k_scale
+            self._k_scale_cpu.fill_(k_scale)
 
         self.attn_backend = Qwen3_8FlashNextQSABackend
         self.impl = Qwen3_8FlashNextQSAImpl(

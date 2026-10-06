@@ -196,3 +196,11 @@ def test_prefix_hit_with_half_block_drafter_group():
     again = make_request("b", prompt, 1512, sha256)
     _, hit, _ = manager.get_computed_blocks(again)
     assert hit > 0 and hit % BLOCK == 0 and hit < len(prompt)
+
+
+def test_drafter_k_scale_env_keeps_compile_key(monkeypatch):
+    from vllm import envs
+
+    monkeypatch.setenv("VLLM_QWEN38_MTP_K_SCALE", "0.25")
+    assert envs.VLLM_QWEN38_MTP_K_SCALE == 0.25
+    assert "VLLM_QWEN38_MTP_K_SCALE" not in envs.compile_factors()
