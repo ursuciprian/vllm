@@ -20,6 +20,7 @@ from vllm.v1.worker.gpu.model_states.interface import ModelState
 from vllm.v1.worker.gpu.spec_decode.autoregressive.cudagraph_utils import (
     SpeculatorCudaGraphManager,
 )
+from vllm.v1.worker.gpu.spec_decode.draft_confidence import draft_token_probs
 from vllm.v1.worker.gpu.spec_decode.speculator import DraftModelSpeculator
 from vllm.v1.worker.utils import AttentionGroup, get_uniform_decode_token_count
 
@@ -213,6 +214,17 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
             progress_bar_desc="Capturing prefill CUDA graphs",
         )
         self.on_prefill_end(self.max_num_reqs)
+
+        if self.draft_confident_len is not None:
+            # JIT the confidence kernel now, not on the first served step.
+            assert self.draft_logits is not None
+            draft_token_probs(
+                self.draft_logits,
+                self.draft_tokens[:1],
+                self.idx_mapping[:1],
+                self.temperature,
+                self.num_speculative_steps,
+            )
 
         if self.num_speculative_steps == 1:
             return

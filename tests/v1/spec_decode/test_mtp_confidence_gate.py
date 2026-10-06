@@ -124,7 +124,10 @@ def test_threshold_hashed_only_when_on(monkeypatch):
 
     monkeypatch.setenv("VLLM_MTP_CONFIDENCE_THRESHOLD", "0.7")
     on = envs.compile_factors()
-    assert "VLLM_MTP_CONFIDENCE_THRESHOLD" in on
+    assert on["VLLM_MTP_CONFIDENCE_THRESHOLD"] is True
+    # A threshold sweep shares one compile key.
+    monkeypatch.setenv("VLLM_MTP_CONFIDENCE_THRESHOLD", "0.8")
+    assert envs.compile_factors() == on
     assert {k: v for k, v in on.items() if k != "VLLM_MTP_CONFIDENCE_THRESHOLD"} == off
 
 
@@ -244,14 +247,16 @@ def _gate_scheduler(monkeypatch):
     from vllm.v1.core.sched.scheduler import Scheduler
     from vllm.v1.structured_output import StructuredOutputManager
 
-    monkeypatch.setenv("VLLM_MTP_CONFIDENCE_THRESHOLD", "0.7")
-    monkeypatch.setenv("VLLM_MTP_CONFIDENCE_BASE_DEPTH", "4")
+    monkeypatch.delenv("VLLM_MTP_CONFIDENCE_THRESHOLD", raising=False)
     try:
         base = create_scheduler(
             max_num_seqs=8, max_num_batched_tokens=8192, num_speculative_tokens=6
         )
     except OSError as e:  # model config needs the HF hub or its cache
         pytest.skip(f"no model config: {e}")
+    # The helper builds an ngram config; switch it to a gated MTP one.
+    monkeypatch.setenv("VLLM_MTP_CONFIDENCE_THRESHOLD", "0.7")
+    monkeypatch.setenv("VLLM_MTP_CONFIDENCE_BASE_DEPTH", "4")
     spec = base.vllm_config.speculative_config
     spec.num_speculative_tokens_per_batch_size = [(1, 2, 6), (3, 8, 4)]
     spec.method = "mtp"

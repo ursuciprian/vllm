@@ -178,3 +178,69 @@ def test_greedy_depth6_emits_depth4_tokens():
         return out[:length]
 
     assert run(6) == run(4) == chain[:length].tolist()
+
+
+@pytest.mark.parametrize("temperature", [0.7, 1.0])
+def test_rejection_sample_exact_at_base_depth_under_max_depth(temperature):
+    """The gate's closed step: 4 drafts verified while num_speculative_steps=6.
+
+    Each request has 5 logit rows (cu_num_logits stride 5) and the draft-logit
+    cache still holds stale columns 4-5 from an earlier 6-draft round; they must
+    not leak into the emitted distribution.
+    """
+    torch.manual_seed(3)
+    vocab, trials, max_steps, depth = 64, 40_000, 6, 4
+    target_logits_pos = torch.randn(depth + 1, vocab, device=DEVICE) * 2
+    draft_logits_pos = target_logits_pos[:depth] + torch.randn(
+        depth, vocab, device=DEVICE
+    )
+    draft_probs = torch.softmax(draft_logits_pos / temperature, dim=-1)
+    drafts = torch.stack(
+        [
+            torch.multinomial(draft_probs[i], trials, replacement=True)
+            for i in range(depth)
+        ],
+        dim=1,
+    )
+    draft_logits = torch.randn(trials, max_steps, vocab, device=DEVICE) * 5  # stale
+    draft_logits[:, :depth] = draft_logits_pos[None]
+    draft_sampled = torch.zeros(trials, depth + 1, dtype=torch.int64, device=DEVICE)
+    draft_sampled[:, 1:] = drafts
+    n = trials * (depth + 1)
+    out, num_sampled = rejection_sample(
+        target_logits=(target_logits_pos / temperature).repeat(trials, 1),
+        draft_logits=draft_logits,
+        draft_sampled=draft_sampled.reshape(-1),
+        cu_num_logits=torch.arange(trials + 1, dtype=torch.int32, device=DEVICE)
+        * (depth + 1),
+        pos=torch.arange(n, dtype=torch.int32, device=DEVICE),
+        idx_mapping=torch.arange(trials, dtype=torch.int32, device=DEVICE),
+        expanded_idx_mapping=torch.arange(
+            trials, dtype=torch.int32, device=DEVICE
+        ).repeat_interleave(depth + 1),
+        expanded_local_pos=torch.arange(
+            depth + 1, dtype=torch.int32, device=DEVICE
+        ).repeat(trials),
+        temperature=torch.full((trials,), temperature, device=DEVICE),
+        seed=torch.arange(trials, dtype=torch.int64, device=DEVICE),
+        num_speculative_steps=max_steps,
+    )
+    assert bool((num_sampled <= depth + 1).all())
+    target_probs = torch.softmax(target_logits_pos / temperature, dim=-1)
+    for i in range(depth + 1):
+        emitted = num_sampled > i
+        cnt = int(emitted.sum())
+        if cnt < 2000:
+            continue
+        observed = torch.bincount(out[emitted, i], minlength=vocab).float()
+        expected = target_probs[i] * cnt
+        ok = expected >= 5
+        obs = torch.cat([observed[ok], observed[~ok].sum()[None]])
+        exp = torch.cat([expected[ok], expected[~ok].sum()[None]])
+        if exp[-1] < 5:
+            obs, exp = obs[:-1], exp[:-1]
+        chi2 = ((obs - exp) ** 2 / exp).sum().item()
+        df = obs.numel() - 1
+        assert chi2 < df + 10 * (2 * df) ** 0.5, (
+            f"position {i}: chi2={chi2:.1f} df={df}"
+        )

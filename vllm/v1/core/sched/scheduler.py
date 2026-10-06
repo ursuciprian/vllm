@@ -2245,6 +2245,7 @@ class Scheduler(SchedulerInterface):
         request.num_computed_tokens = 0
         if request.spec_token_ids:
             request.spec_token_ids = []
+        request.spec_chain_confident = False
         # Async scheduling: mark all in-flight output as stale. Its tokens are
         # still delivered on return (dropping them would perturb spec-decode
         # acceptance) but must not mutate the reset counters; each step drains
@@ -2747,7 +2748,10 @@ class Scheduler(SchedulerInterface):
                     )
                 num_sampled = self.num_sampled_tokens_per_step
                 num_accepted = max(len(generated_token_ids) - num_sampled, 0)
-                if model_runner_output.num_confident_draft_tokens is not None:
+                if (
+                    model_runner_output.num_confident_draft_tokens is not None
+                    and not output_is_stale
+                ):
                     request.spec_chain_confident = (
                         num_draft_tokens > 0
                         and model_runner_output.num_confident_draft_tokens[req_index]
