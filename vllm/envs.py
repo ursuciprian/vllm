@@ -215,6 +215,9 @@ if TYPE_CHECKING:
     VLLM_GDN_SPEC_DECODE_METADATA_FASTPATH: bool = True
     VLLM_MTP_NVFP4_LM_HEAD: bool = True
     VLLM_MTP_DRAFT_VOCAB: str = ""
+    VLLM_MTP_CAPTURE_DIR: str = ""
+    VLLM_MTP_CAPTURE_TOPK: int = 20
+    VLLM_MTP_CAPTURE_TAIL: int = 6144
     VLLM_QWEN38_HC_MXFP8: str = "off"
     VLLM_QWEN38_B12X_GEMV: str = "off"
     VLLM_QWEN3_8_FLASH_NEXT_OVERLAP: bool = True
@@ -1792,6 +1795,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # only environment_variables entries reach envs.compile_factors(). The key
     # hashes the path, not the file, so name files by K (ids-K65536.txt.gz).
     "VLLM_MTP_DRAFT_VOCAB": lambda: os.getenv("VLLM_MTP_DRAFT_VOCAB", "").strip(),
+    # MTP refit capture (vllm/v1/worker/gpu/mtp_capture.py): directory for
+    # shards of the target's MTP input state and top-k log-probs over prefill
+    # rows. Empty = off. TOPK ids per row; TAIL = rows at positions
+    # >= prefill_len - TAIL are stored. Host-side only (no plan or graph
+    # change), so all three are listed in compile_factors' ignored set.
+    "VLLM_MTP_CAPTURE_DIR": lambda: os.getenv("VLLM_MTP_CAPTURE_DIR", "").strip(),
+    "VLLM_MTP_CAPTURE_TOPK": lambda: int(os.getenv("VLLM_MTP_CAPTURE_TOPK", "20")),
+    "VLLM_MTP_CAPTURE_TAIL": lambda: int(os.getenv("VLLM_MTP_CAPTURE_TAIL", "6144")),
     # Which Qwen3.8-Flash-Next BF16 projections are quantized to MXFP8 online.
     # MUST live here rather than behind a bare os.getenv: it changes how many
     # b12x plans a boot creates, and b12x plan handles are a process-local
@@ -2543,6 +2554,10 @@ def compile_factors() -> dict[str, object]:
         "VLLM_PLE_MMAP_PREFILL_WILLNEED",
         # Shared GDN prefill staging: buffer ownership inside a custom op, no graph change.
         "VLLM_GDN_SHARED_PREFILL_STAGING",
+        # MTP refit capture: eager head + copy after the forward, no plan change.
+        "VLLM_MTP_CAPTURE_DIR",
+        "VLLM_MTP_CAPTURE_TOPK",
+        "VLLM_MTP_CAPTURE_TAIL",
         # Location-only derived paths: where a cache/config directory lives
         # cannot affect compiled artifacts, and hashing them means relocating
         # HOME or the XDG roots silently invalidates every compile cache

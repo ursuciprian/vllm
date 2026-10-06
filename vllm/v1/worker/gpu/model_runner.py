@@ -258,6 +258,12 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             self.encoder_cache = EncoderCache()
         self.ec_connector = get_ec_connector(vllm_config, self.encoder_cache)
 
+        self.mtp_capture = None
+        if envs.VLLM_MTP_CAPTURE_DIR:
+            from vllm.v1.worker.gpu.mtp_capture import MtpCapture
+
+            self.mtp_capture = MtpCapture.from_config(vllm_config)
+
         # Speculative decoding.
         self.speculator = None
         self.use_aux_hidden_state_outputs = False
@@ -2089,6 +2095,14 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         sampler_output, num_sampled, num_rejected = self.sample(
             hidden_states, input_batch, grammar_output
         )
+        if self.mtp_capture is not None:
+            self.mtp_capture.on_step(
+                input_batch,
+                self.model.get_mtp_target_hidden_states(),
+                hidden_states,
+                self.model.compute_logits,
+                self.req_states.all_token_ids.gpu,
+            )
 
         if self.pp_handler is not None:
             # Broadcast to non-last PP ranks (handles spec decode multi-token).
@@ -2356,6 +2370,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         """Release GPU tensors (model weights, KV caches, workspace) so that
         memory is reclaimable when running in the same process."""
         torch.accelerator.synchronize()
+        if getattr(self, "mtp_capture", None) is not None:
+            self.mtp_capture.close()
         self.cudagraph_manager = None
         self.boundary_checkpoint_state = None
         if hasattr(self, "kv_caches"):
