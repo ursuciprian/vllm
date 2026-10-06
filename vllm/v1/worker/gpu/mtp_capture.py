@@ -22,6 +22,9 @@ int32) and drafts (``on_drafts``) are set in the shard holding the request's
 last prefill chunk. Chunked prefill
 splits a request across steps and shards; readers stitch by id and position.
 
+Rows still buffered are written 30 s after the last step and at shutdown:
+wait more than 35 s after the last request before stopping the server.
+
 Host-side only: an eager head call, a top-k and a device-to-host copy after
 the target forward. It declares no b12x plan and changes no graph, so its
 knobs stay out of ``envs.compile_factors()``.
@@ -30,6 +33,7 @@ knobs stay out of ``envs.compile_factors()``.
 from __future__ import annotations
 
 import atexit
+import contextlib
 import hashlib
 import json
 import os
@@ -40,6 +44,10 @@ from typing import Any
 
 import numpy as np
 import torch
+
+from vllm.logger import init_logger
+
+logger = init_logger(__name__)
 
 SHARD_ROWS = 65536
 LOGITS_CHUNK_ROWS = 512
@@ -97,8 +105,13 @@ class MtpCapture:
 
         parallel = vllm_config.parallel_config
         spec = vllm_config.speculative_config
-        if parallel.tensor_parallel_size * parallel.pipeline_parallel_size != 1:
-            raise ValueError("VLLM_MTP_CAPTURE_DIR supports TP=1, PP=1 only")
+        if (
+            parallel.tensor_parallel_size
+            * parallel.pipeline_parallel_size
+            * parallel.data_parallel_size
+            != 1
+        ):
+            raise ValueError("VLLM_MTP_CAPTURE_DIR supports TP=1, PP=1, DP=1 only")
         if spec is None or spec.method != "mtp":
             raise ValueError("VLLM_MTP_CAPTURE_DIR needs MTP speculative decoding")
         if vllm_config.cache_config.enable_prefix_caching:
@@ -223,14 +236,24 @@ class MtpCapture:
             ),
         }
         path = os.path.join(self.out_dir, f"shard-{shard:05d}.safetensors")
-        save_file(tensors, path + ".tmp", metadata=meta)
-        os.replace(path + ".tmp", path)
+        try:
+            save_file(tensors, path + ".tmp", metadata=meta)
+            os.replace(path + ".tmp", path)
+        except Exception:
+            logger.exception(
+                "MTP capture: shard %s lost (%d rows, %d requests)",
+                path,
+                tensors["tokens"].shape[0],
+                len(requests),
+            )
+            raise
 
     def _idle_flush(self) -> None:
         while not self._closed:
             time.sleep(5.0)
             if time.monotonic() - self._last_step > IDLE_FLUSH_S:
-                self.flush()
+                with contextlib.suppress(Exception):  # logged in flush
+                    self.flush()
 
     def close(self) -> None:
         if not self._closed:
