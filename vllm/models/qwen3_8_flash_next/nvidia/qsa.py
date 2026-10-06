@@ -84,11 +84,12 @@ from .indexer_qsa import QSAIndexer
 
 _QSA_COMPRESS_RATIO = 4
 _QSA_INDEX_HEAD_DIM = 128
-# The supported speculative envelope is zero to four draft tokens. Its raw
-# ring is either 4 or 8 rows, so eight is the static manager-page alignment
-# that is valid for every supported runtime configuration.
+# The supported speculative envelope is zero to six draft tokens. Its raw
+# ring is 4, 8 or 12 rows (b12x indexes it modulo its capacity). Eight is the
+# static manager-page alignment; bind_kv_cache also requires the page to be a
+# multiple of the ring (the hybrid 3,024-token page is, for 8 and 12).
 _QSA_MANAGER_BLOCK_ALIGNMENT = 8
-_QSA_MAX_SPECULATIVE_TOKENS = 4
+_QSA_MAX_SPECULATIVE_TOKENS = 6
 _QSA_SPLITTING_OP = "vllm::qwen3_8_flash_next_qsa_with_output"
 _QSA_PROJECTED_READ_OP = "vllm::qwen3_8_flash_next_qsa_run_projected"
 
@@ -828,7 +829,7 @@ class Qwen3_8FlashNextQSAAttention(nn.Module, AttentionLayerBase):
         self.max_speculative_tokens = int(vllm_config.num_speculative_tokens)
         if self.max_speculative_tokens > _QSA_MAX_SPECULATIVE_TOKENS:
             raise NotImplementedError(
-                "QSA currently supports at most four speculative tokens"
+                "QSA currently supports at most six speculative tokens"
             )
         self.compress_ratio = int(config.indexer_compress_ratio)
         self.budget = int(config.indexer_budget)
