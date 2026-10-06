@@ -310,8 +310,6 @@ class DraftModelSpeculator(BaseSpeculator):
         ):
             if hasattr(self, name):
                 setattr(self, name, None)
-        if hasattr(self, "fused_decode_managers"):
-            self.fused_decode_managers = {}
 
     def _build_draft_attn_metadata(
         self,

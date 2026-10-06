@@ -205,6 +205,10 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
             self.decode_cudagraph_manager
         )
 
+    def reset_attn(self) -> None:
+        super().reset_attn()
+        self.fused_decode_managers = {}
+
     def capture(self) -> None:
         logger.info("Capturing model for speculator...")
         # Reset indices to zeros to prevent stale values from prior
@@ -264,7 +268,7 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
             else {self.num_speculative_steps: self.decode_cudagraph_manager}
         )
         try:
-            for depth, manager in sorted(managers.items()):
+            for depth, manager in sorted(managers.items(), reverse=True):
                 self.fused_num_steps = depth
                 manager.capture(
                     decode_fn,
@@ -438,8 +442,10 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
         self.on_multi_step_decode_begin(num_reqs)
         # Generate the remaining draft tokens.
         try:
+            # The step count of this round: fused graphs are keyed by it, and
+            # update_draft_inputs treats its last step as final.
+            self.fused_num_steps = num_speculative_tokens
             if self.use_fused_multi_step_decode:
-                self.fused_num_steps = num_speculative_tokens
                 self._fused_multi_step_decode(
                     num_reqs,
                     dummy_run and skip_attn_for_dummy_run,
@@ -784,7 +790,7 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
             self.sample_src_positions,
             num_reqs,
             self.max_model_len,
-            self.num_speculative_steps,
+            self.fused_num_steps,
             advance_draft_positions=self.advance_draft_positions,
             mrope_positions=self.mrope_positions,
         )

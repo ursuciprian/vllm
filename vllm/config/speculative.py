@@ -641,6 +641,15 @@ class SpeculativeConfig:
                 # Convert to tuple to make it hashable
                 factors.append(tuple(layer_ids))
 
+        # A batch-size depth schedule (and the MTP confidence gate's base depth)
+        # sets which exact-M b12x plans the weights stage declares; plan handles
+        # are baked into AOT graphs, so the depths belong in the key. Only when a
+        # schedule is set, so other configs keep their key.
+        if self.num_speculative_tokens_per_batch_size:
+            from vllm.v1.spec_decode.dynamic.utils import batch_size_schedule_depths
+
+            factors.append(("schedule_depths", tuple(batch_size_schedule_depths(self))))
+
         hash_str = safe_hash(str(factors).encode(), usedforsecurity=False).hexdigest()
         return hash_str
 

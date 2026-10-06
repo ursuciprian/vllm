@@ -1801,15 +1801,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # proposal probability >= the threshold (the chain never "stopped").
     # Otherwise it drafts VLLM_MTP_CONFIDENCE_BASE_DEPTH. The depth is chosen
     # from past rounds only, so rejection sampling stays exact. 0 = off.
-    # Hashed into compile_factors as on/off only when on: the arms that set it also raise
+    # Hashed into compile_factors as on/off, only when on: arms that set it raise
     # num_speculative_tokens, which changes the b12x plans a boot declares but
     # is not part of the torch AOT key (memory note
     # b12x-plan-population-env-cache-key).
     "VLLM_MTP_CONFIDENCE_THRESHOLD": lambda: float(
         os.getenv("VLLM_MTP_CONFIDENCE_THRESHOLD", "0") or 0
     ),
-    # Depth drafted while the confidence gate is closed. Picks one more set of
-    # captured graph shapes, but declares no b12x plans: not a compile factor.
+    # Depth drafted while the confidence gate is closed. Adds captured graph
+    # shapes and exact-M b12x plans: hashed while the gate is on.
     "VLLM_MTP_CONFIDENCE_BASE_DEPTH": lambda: int(
         os.getenv("VLLM_MTP_CONFIDENCE_BASE_DEPTH", "4") or 4
     ),
@@ -2564,8 +2564,6 @@ def compile_factors() -> dict[str, object]:
         "VLLM_PLE_MMAP_PREFILL_WILLNEED",
         # Shared GDN prefill staging: buffer ownership inside a custom op, no graph change.
         "VLLM_GDN_SHARED_PREFILL_STAGING",
-        # Depth drafted while the MTP confidence gate is closed: graph shapes only.
-        "VLLM_MTP_CONFIDENCE_BASE_DEPTH",
         # Location-only derived paths: where a cache/config directory lives
         # cannot affect compiled artifacts, and hashing them means relocating
         # HOME or the XDG roots silently invalidates every compile cache
@@ -2654,6 +2652,11 @@ def compile_factors() -> dict[str, object]:
                 "VLLM_GDN_COMPACT_RECORDS",
                 "VLLM_MTP_CONFIDENCE_THRESHOLD",
             ) and not raw:
+                continue
+            # The base depth adds exact-M plans only while the gate is on.
+            if factor == "VLLM_MTP_CONFIDENCE_BASE_DEPTH" and not (
+                environment_variables["VLLM_MTP_CONFIDENCE_THRESHOLD"]()
+            ):
                 continue
             # Only on/off matters for the graphs: a threshold sweep shares a key.
             if factor == "VLLM_MTP_CONFIDENCE_THRESHOLD":

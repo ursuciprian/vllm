@@ -118,7 +118,11 @@ def _planned_decode_counts(
     # uniform decode at several query lengths; the graph manager captures each,
     # so each needs its exact-M regimes here too.
     query_lens = {query_len}
-    if spec is not None and spec.num_speculative_tokens_per_batch_size:
+    if (
+        spec is not None
+        and spec.num_speculative_tokens_per_batch_size
+        and not spec.uses_acceptance_length_adaptation()
+    ):
         from vllm.v1.spec_decode.dynamic.utils import batch_size_schedule_depths
 
         extra = query_len - int(speculative_tokens)

@@ -137,16 +137,18 @@ def test_threshold_hashed_only_when_on(monkeypatch):
     monkeypatch.setenv("VLLM_MTP_CONFIDENCE_BASE_DEPTH", "3")
     off = envs.compile_factors()
     assert "VLLM_MTP_CONFIDENCE_THRESHOLD" not in off
-    # Base depth is scheduler-only: never a compile factor.
+    # The base depth only matters while the gate is on.
     assert "VLLM_MTP_CONFIDENCE_BASE_DEPTH" not in off
 
     monkeypatch.setenv("VLLM_MTP_CONFIDENCE_THRESHOLD", "0.7")
     on = envs.compile_factors()
     assert on["VLLM_MTP_CONFIDENCE_THRESHOLD"] is True
-    # A threshold sweep shares one compile key.
+    assert on["VLLM_MTP_CONFIDENCE_BASE_DEPTH"] == 3
+    # A threshold sweep shares one compile key; a base-depth change does not.
     monkeypatch.setenv("VLLM_MTP_CONFIDENCE_THRESHOLD", "0.8")
     assert envs.compile_factors() == on
-    assert {k: v for k, v in on.items() if k != "VLLM_MTP_CONFIDENCE_THRESHOLD"} == off
+    monkeypatch.setenv("VLLM_MTP_CONFIDENCE_BASE_DEPTH", "2")
+    assert envs.compile_factors() != on
 
 
 # --------------------------------------------------------------------------

@@ -494,6 +494,9 @@ def test_uniform_spec_metadata_gpu_below_max_depth(query_len: int) -> None:
     )
     assert (builder.spec_token_indx[num_reqs * query_len :] == -71).all()
     assert metadata.num_spec_decode_tokens == num_reqs * query_len
+    torch.testing.assert_close(metadata.num_accepted_tokens, counts[:num_reqs])
+    assert metadata.spec_sequence_masks.all()
+    assert not builder.spec_sequence_masks[num_reqs:].any()
 
 
 @pytest.mark.parametrize(
