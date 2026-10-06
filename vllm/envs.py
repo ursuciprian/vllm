@@ -212,6 +212,7 @@ if TYPE_CHECKING:
     VLLM_MTP_NVFP4_LM_HEAD: bool = True
     VLLM_MTP_DRAFT_VOCAB: str = ""
     VLLM_QWEN38_HC_MXFP8: str = "off"
+    VLLM_QWEN38_MTP_K_SCALE: float = 1.0
     VLLM_QWEN3_8_FLASH_NEXT_OVERLAP: bool = True
     VLLM_B12X_MLA_CKV_GATHER: bool = False
     VLLM_B12X_MLA_CKV_GATHER_MIN_TOKENS: int = 16
@@ -1758,6 +1759,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # only environment_variables entries reach envs.compile_factors(). The key
     # hashes the path, not the file, so name files by K (ids-K65536.txt.gz).
     "VLLM_MTP_DRAFT_VOCAB": lambda: os.getenv("VLLM_MTP_DRAFT_VOCAB", "").strip(),
+    # Qwen3.8-Flash-Next: per-tensor K scale of the MTP drafter's fp8 KV cache
+    # (K is stored as K / scale). 1.0 = unscaled.
+    "VLLM_QWEN38_MTP_K_SCALE": lambda: float(
+        os.getenv("VLLM_QWEN38_MTP_K_SCALE", "1.0")
+    ),
     # Which Qwen3.8-Flash-Next BF16 projections are quantized to MXFP8 online.
     # MUST live here rather than behind a bare os.getenv: it changes how many
     # b12x plans a boot creates, and b12x plan handles are a process-local
@@ -2470,6 +2476,8 @@ def compile_factors() -> dict[str, object]:
         "VLLM_ENABLE_STARTUP_PLAN",
         # Scheduler-only prefix-cache policy; does not affect compiled graphs.
         "VLLM_PREFIX_DROP_EXACT",
+        # Drafter KV K scale: a runtime buffer read inside custom ops.
+        "VLLM_QWEN38_MTP_K_SCALE",
         # Location-only derived paths: where a cache/config directory lives
         # cannot affect compiled artifacts, and hashing them means relocating
         # HOME or the XDG roots silently invalidates every compile cache
