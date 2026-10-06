@@ -73,6 +73,9 @@ def select_rows(batch: Any, tail: int) -> list[tuple[int, int, int, bool]]:
     return out
 
 
+DRAFT_TOPK = 20
+
+
 class MtpCapture:
     def __init__(self, out_dir: str, topk: int = 20, tail: int = 6144) -> None:
         if topk < 1 or tail < 1:
@@ -199,19 +202,34 @@ class MtpCapture:
 
     @torch.inference_mode()
     def on_drafts(
-        self, batch: Any, sampled: torch.Tensor, drafts: torch.Tensor
+        self,
+        batch: Any,
+        sampled: torch.Tensor,
+        drafts: torch.Tensor,
+        draft_logits: torch.Tensor | None = None,
     ) -> None:
         """For requests whose prefill ended this step, keep [sampled token, draft
         tokens...] as ``drafts`` in their metadata: the vLLM drafter's own chain
         from the last prefill row (greedy at T=0), the reference for the refit's
-        GPU parity check."""
+        GPU parity check. With ``draft_logits`` (the probabilistic drafter's
+        pre-temperature cache, [max_num_reqs, steps, vocab], row = the request's
+        state index) also keep ``draft_topk``: per draft step the top
+        ``DRAFT_TOPK`` [ids, logits] the served drafter produced."""
         if self._finals:
             first = sampled[: batch.num_reqs, 0].cpu().tolist()
             chain = drafts[: batch.num_reqs].cpu().tolist()
+            topk = None
+            if draft_logits is not None:
+                n = drafts.shape[1]
+                rows = batch.idx_mapping[[i for i, _ in self._finals]].long()
+                v, ids = draft_logits[rows, :n].float().topk(DRAFT_TOPK, dim=-1)
+                topk = {i: [ids[j].tolist(), v[j].tolist()] for j, (i, _) in enumerate(self._finals)}
             with self._lock:
                 for i, rid in self._finals:
                     if rid in self._reqs:
                         self._reqs[rid]["drafts"] = [first[i], *chain[i]]
+                        if topk is not None:
+                            self._reqs[rid]["draft_topk"] = topk[i]
             self._finals = []
         if self._num_rows >= SHARD_ROWS:
             self.flush()

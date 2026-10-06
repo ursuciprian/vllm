@@ -2269,7 +2269,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 )
                 if self.mtp_capture is not None:
                     self.mtp_capture.on_drafts(
-                        input_batch, sampler_output.sampled_token_ids, draft_tokens
+                        input_batch,
+                        sampler_output.sampled_token_ids,
+                        draft_tokens,
+                        getattr(self.speculator, "draft_logits", None),
                     )
             num_draft_tokens = draft_tokens.shape[1]
             if num_draft_tokens > 0:

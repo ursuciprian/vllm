@@ -26,6 +26,7 @@ def _batch(chunks, tokens):
         num_reqs=len(chunks),
         req_ids=[c[0] for c in chunks],
         idx_mapping_np=np.array([c[1] for c in chunks]),
+        idx_mapping=torch.tensor([c[1] for c in chunks]),
         query_start_loc_np=qsl,
         num_computed_tokens_np=np.array([c[2] for c in chunks]),
         prefill_len_np=np.array([c[4] for c in chunks]),
@@ -73,7 +74,10 @@ def test_two_chunks_stitch_shapes_topk_and_sha1(tmp_path, monkeypatch):
         cap.on_step(b, multi, sample, head, all_ids)
         k = b.num_reqs
         sampled = torch.arange(k)[:, None] + 100 * len(seen)  # unique per step
-        cap.on_drafts(b, sampled, torch.arange(4).repeat(k + 1, 1))  # padded rows
+        vocab = torch.arange(64).float()
+        # request state r, step j: logits peak at token 10 * r + j
+        dl = torch.stack([torch.stack([-(vocab - (10 * r + j)).abs() for j in range(4)]) for r in range(3)])
+        cap.on_drafts(b, sampled, torch.arange(4).repeat(k + 1, 1), dl)  # padded rows
         for i, c in enumerate(chunks):
             r0 = int(b.query_start_loc_np[i])
             for p in range(c[2], c[2] + c[3]):
@@ -89,6 +93,10 @@ def test_two_chunks_stitch_shapes_topk_and_sha1(tmp_path, monkeypatch):
     # a: final chunk in step 2 (batch row 0); b: final in step 1 (batch row 1)
     assert reqs[0]["drafts"][1:] == reqs[1]["drafts"][1:] == [0, 1, 2, 3]
     assert reqs[1]["drafts"][0] == 1 and reqs[0]["drafts"][0] == 100 * 12
+    for r in (0, 1):  # served draft top-k per step, read at the request's state row
+        ids, vals = reqs[r]["draft_topk"]
+        assert [x[0] for x in ids] == [10 * r + j for j in range(4)] and len(ids[0]) == 20
+        assert vals[0][0] == 0.0 and vals[0][1] == -1.0
     n = t["tokens"].shape[0]
     assert n == 10 + 4
     assert t["hidden"].shape == (n, 4 * H) and t["hidden"].dtype == torch.bfloat16
