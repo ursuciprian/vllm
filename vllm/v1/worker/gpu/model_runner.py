@@ -2267,6 +2267,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     num_spec_tokens_to_schedule,
                     self.num_speculative_steps,
                 )
+                if self.mtp_capture is not None:
+                    self.mtp_capture.on_drafts(
+                        input_batch, sampler_output.sampled_token_ids, draft_tokens
+                    )
             num_draft_tokens = draft_tokens.shape[1]
             if num_draft_tokens > 0:
                 self.req_states.draft_tokens[

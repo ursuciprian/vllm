@@ -71,6 +71,9 @@ def test_two_chunks_stitch_shapes_topk_and_sha1(tmp_path, monkeypatch):
         multi = torch.randn(n + 2, 4 * H, dtype=torch.bfloat16)  # +2 padded rows
         sample = torch.randn(n + 2, H, dtype=torch.bfloat16)
         cap.on_step(b, multi, sample, head, all_ids)
+        k = b.num_reqs
+        sampled = torch.arange(k)[:, None] + 100 * len(seen)  # unique per step
+        cap.on_drafts(b, sampled, torch.arange(4).repeat(k + 1, 1))  # padded rows
         for i, c in enumerate(chunks):
             r0 = int(b.query_start_loc_np[i])
             for p in range(c[2], c[2] + c[3]):
@@ -83,6 +86,9 @@ def test_two_chunks_stitch_shapes_topk_and_sha1(tmp_path, monkeypatch):
     for r, rid in ((0, "a"), (1, "b")):
         want = hashlib.sha1(tokens[r].astype("<i4").tobytes()).hexdigest()
         assert reqs[r]["sha1"] == want and reqs[r]["prefill_len"] == plen[r]
+    # a: final chunk in step 2 (batch row 0); b: final in step 1 (batch row 1)
+    assert reqs[0]["drafts"][1:] == reqs[1]["drafts"][1:] == [0, 1, 2, 3]
+    assert reqs[1]["drafts"][0] == 1 and reqs[0]["drafts"][0] == 100 * 12
     n = t["tokens"].shape[0]
     assert n == 10 + 4
     assert t["hidden"].shape == (n, 4 * H) and t["hidden"].dtype == torch.bfloat16

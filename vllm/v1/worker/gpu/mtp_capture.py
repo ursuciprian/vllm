@@ -17,8 +17,9 @@ softmax at T=1, computed with the target's own head. Rows are written as
     req            [N]            int32 index into metadata ``requests``
 
 ``__metadata__["requests"]`` is a JSON list of ``{"id", "prefill_len",
-"sha1"}``; sha1 (of the request's full token list as little-endian int32) is
-set in the shard holding the request's last prefill chunk. Chunked prefill
+"sha1", "drafts"?}``; sha1 (of the request's full token list as little-endian
+int32) and drafts (``on_drafts``) are set in the shard holding the request's
+last prefill chunk. Chunked prefill
 splits a request across steps and shards; readers stitch by id and position.
 
 Host-side only: an eager head call, a top-k and a device-to-host copy after
@@ -85,6 +86,7 @@ class MtpCapture:
             default=-1,
         )
         self._last_step = time.monotonic()
+        self._finals: list[tuple[int, str]] = []
         self._closed = False
         threading.Thread(target=self._idle_flush, daemon=True).start()
         atexit.register(self.close)
@@ -120,6 +122,9 @@ class MtpCapture:
         all_token_ids: torch.Tensor,
     ) -> None:
         self._last_step = time.monotonic()
+        self._finals = []
+        if self._num_rows >= SHARD_ROWS:
+            self.flush()
         sel = select_rows(batch, self.tail)
         if not sel:
             return
@@ -177,8 +182,25 @@ class MtpCapture:
             for k, v in part.items():
                 self._rows.setdefault(k, []).append(v)
             self._num_rows += int(rows.shape[0])
-            full = self._num_rows >= SHARD_ROWS
-        if full:
+        self._finals = [(i, batch.req_ids[i]) for i, _, _, last in sel if last]
+
+    @torch.inference_mode()
+    def on_drafts(
+        self, batch: Any, sampled: torch.Tensor, drafts: torch.Tensor
+    ) -> None:
+        """For requests whose prefill ended this step, keep [sampled token, draft
+        tokens...] as ``drafts`` in their metadata: the vLLM drafter's own chain
+        from the last prefill row (greedy at T=0), the reference for the refit's
+        GPU parity check."""
+        if self._finals:
+            first = sampled[: batch.num_reqs, 0].cpu().tolist()
+            chain = drafts[: batch.num_reqs].cpu().tolist()
+            with self._lock:
+                for i, rid in self._finals:
+                    if rid in self._reqs:
+                        self._reqs[rid]["drafts"] = [first[i], *chain[i]]
+            self._finals = []
+        if self._num_rows >= SHARD_ROWS:
             self.flush()
 
     def flush(self) -> None:
