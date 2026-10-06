@@ -409,6 +409,93 @@ def test_uniform_spec_decode_reuses_metadata_with_new_accepted_states(
         )
 
 
+@pytest.mark.parametrize("num_reqs", [1, 3])
+@pytest.mark.parametrize("query_len", [2, 5])
+def test_uniform_spec_decode_below_max_depth_matches_generic(
+    monkeypatch, num_reqs: int, query_len: int
+):
+    """A batch-size depth schedule runs uniform steps with fewer drafts than
+    num_speculative_tokens; the fast path must build what the generic one does."""
+    monkeypatch.setenv("VLLM_GDN_SPEC_DECODE_METADATA_FASTPATH", "1")
+    builder = _create_gdn_builder(5, full_cuda_graph=True)
+    builder.vllm_config.cache_config.mamba_cache_mode = "align"
+    builder.mamba_aligned_state_indices = torch.arange(
+        num_reqs * 6, dtype=torch.int32
+    ).reshape(num_reqs, 6)
+    common = create_common_attn_metadata(
+        BatchSpec(seq_lens=[64] * num_reqs, query_lens=[query_len] * num_reqs),
+        BLOCK_SIZE,
+        DEVICE,
+    ).replace(is_prefilling=torch.zeros(num_reqs, dtype=torch.bool))
+    drafts = torch.full((num_reqs,), query_len - 1, dtype=torch.int32)
+    accepted = torch.ones(num_reqs, dtype=torch.int32)
+    fast = builder.build(0, common, accepted, drafts)
+    assert fast.is_uniform_spec_decode
+    fields = (
+        "spec_query_start_loc",
+        "spec_state_indices_tensor",
+        "spec_sequence_masks",
+        "spec_token_indx",
+        "num_accepted_tokens",
+    )
+    fast_values = {f: getattr(fast, f).clone() for f in fields}
+    builder._reuse_spec_decode_inputs = False
+    generic = builder.build(0, common, accepted, drafts)
+    assert not generic.is_uniform_spec_decode
+    for field in fields:
+        torch.testing.assert_close(fast_values[field], getattr(generic, field))
+    assert fast.num_spec_decode_tokens == generic.num_spec_decode_tokens
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("query_len", [2, 5, 7])
+def test_uniform_spec_metadata_gpu_below_max_depth(query_len: int) -> None:
+    """The fill kernel keeps all state columns but lays tokens out by query_len."""
+    device = torch.device("cuda")
+    window, num_reqs, capacity = 7, 3, 8
+    builder = GDNAttentionMetadataBuilder.__new__(GDNAttentionMetadataBuilder)
+    builder.num_spec = window - 1
+    builder._reuse_spec_decode_inputs = True
+    source = torch.arange(capacity * 9, dtype=torch.int32, device=device).reshape(
+        capacity, 9
+    )
+    counts = torch.full((capacity,), 2, dtype=torch.int32, device=device)
+    builder.mamba_aligned_state_indices = source
+    builder.spec_state_indices_tensor = torch.full(
+        (capacity, window), -71, dtype=torch.int32, device=device
+    )
+    builder.num_accepted_tokens = torch.full_like(counts, -71)
+    builder.spec_sequence_masks = torch.zeros(capacity, dtype=torch.bool, device=device)
+    builder.spec_token_indx = torch.full(
+        (capacity * window,), -71, dtype=torch.int32, device=device
+    )
+    builder.non_spec_token_indx = torch.empty_like(builder.spec_token_indx)
+    builder.spec_query_start_loc = torch.full(
+        (capacity + 1,), -71, dtype=torch.int32, device=device
+    )
+    builder._uniform_spec_masks_cpu = torch.ones(capacity, dtype=torch.bool)
+    common = SimpleNamespace(
+        num_reqs=num_reqs,
+        num_actual_tokens=num_reqs * query_len,
+        seq_lens=torch.full((num_reqs,), 128, dtype=torch.int32, device=device),
+    )
+    metadata = builder._build_uniform_spec_decode(common, counts)
+    torch.accelerator.synchronize()
+    torch.testing.assert_close(
+        metadata.spec_state_indices_tensor, source[:num_reqs, :window]
+    )
+    torch.testing.assert_close(
+        metadata.spec_token_indx,
+        torch.arange(num_reqs * query_len, dtype=torch.int32, device=device),
+    )
+    torch.testing.assert_close(
+        metadata.spec_query_start_loc,
+        torch.arange(num_reqs + 1, dtype=torch.int32, device=device) * query_len,
+    )
+    assert (builder.spec_token_indx[num_reqs * query_len :] == -71).all()
+    assert metadata.num_spec_decode_tokens == num_reqs * query_len
+
+
 @pytest.mark.parametrize(
     "query_lens,drafts", [([4, 0], [3, -1]), ([4, 1], [3, -1]), ([3, 4], [2, 3])]
 )

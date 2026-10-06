@@ -34,7 +34,7 @@ from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
 from vllm.utils.math_utils import round_up
 from vllm.v1.kv_cache_interface import KVCacheConfig
-from vllm.v1.spec_decode.dynamic.utils import mtp_confidence_gate
+from vllm.v1.spec_decode.dynamic.utils import batch_size_schedule_depths
 from vllm.v1.worker.gpu.attn_utils import build_slot_mappings_by_layer
 from vllm.v1.worker.gpu.block_table import BlockTables
 from vllm.v1.worker.gpu.cp_utils import prepare_dcp_local_seq_lens
@@ -410,24 +410,13 @@ class CudaGraphManager:
             and speculative_config.uses_batch_size_dynamic_speculative_decoding()
             and self.decode_query_len >= self.vllm_config.num_speculative_tokens
         ):
-            num_spec_per_batch_size = (
-                speculative_config.num_speculative_tokens_per_batch_size
-            )
-            assert num_spec_per_batch_size is not None
             num_new_sampled_tokens_per_step = (
                 self.decode_query_len - self.vllm_config.num_speculative_tokens
             )
-            depths = {
-                min(entry[2], self.vllm_config.num_speculative_tokens)
-                for entry in num_spec_per_batch_size
-            }
-            # The MTP confidence gate also schedules its base depth.
-            gate = mtp_confidence_gate(speculative_config)
-            if gate is not None:
-                depths.add(gate[1])
-            decode_query_lens = sorted(
-                depth + num_new_sampled_tokens_per_step for depth in depths
-            )
+            decode_query_lens = [
+                depth + num_new_sampled_tokens_per_step
+                for depth in batch_size_schedule_depths(speculative_config)
+            ]
         else:
             decode_query_lens = [self.decode_query_len]
 
@@ -1024,6 +1013,9 @@ def _profiling_cudagraph_managers(runner: "GPUModelRunner") -> list[CudaGraphMan
             if isinstance(candidate, CudaGraphManager) and all(
                 candidate is not manager for manager in managers
             ):
+                managers.append(candidate)
+        for candidate in getattr(speculator, "fused_decode_managers", {}).values():
+            if all(candidate is not manager for manager in managers):
                 managers.append(candidate)
     return managers
 

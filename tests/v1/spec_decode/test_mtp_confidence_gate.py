@@ -10,6 +10,7 @@ import pytest
 import torch
 
 from vllm.v1.spec_decode.dynamic.utils import (
+    batch_size_schedule_depths,
     build_dynamic_sd_schedule_lookup,
     gated_num_spec_tokens,
     mtp_confidence_gate,
@@ -97,6 +98,23 @@ def test_gated_depth():
 def test_gate_max_batch_size(schedule, expected):
     dense = build_dynamic_sd_schedule_lookup(schedule, 8, 6)
     assert mtp_confidence_gate_max_batch_size(dense, 4) == expected
+
+
+def test_schedule_depths_include_gate_base(gate_env, monkeypatch):
+    spec = _spec()
+    monkeypatch.delenv("VLLM_MTP_CONFIDENCE_THRESHOLD", raising=False)
+    assert batch_size_schedule_depths(spec) == [4, 6]
+    assert batch_size_schedule_depths(
+        _spec(num_speculative_tokens_per_batch_size=[(1, 8, 6)])
+    ) == [6]
+    gate_env("0.9", "4")
+    assert batch_size_schedule_depths(
+        _spec(num_speculative_tokens_per_batch_size=[(1, 8, 6)])
+    ) == [4, 6]
+    # Depths above num_speculative_tokens clamp.
+    assert batch_size_schedule_depths(
+        _spec(num_speculative_tokens_per_batch_size=[(1, 2, 9), (3, 8, 4)])
+    ) == [4, 6]
 
 
 def test_confident_run_length():
@@ -318,3 +336,36 @@ def test_scheduler_follows_confident_runs(monkeypatch):
     scheduler.update_from_output(out, output([1, 2, 3], confident=[6]))
     scheduler.update_draft_token_ids(DraftTokenIds([rid], [[1, 2, 3, 4]]))
     assert scheduler.schedule().num_spec_tokens_to_schedule == 6
+
+
+def test_weights_stage_plans_every_schedule_depth(monkeypatch):
+    """Depth-4 verify sizes need exact-M b12x plans next to the depth-6 ones.
+
+    k51: without them 442 dense layers served M = 5/10/20/25 from the
+    capacity regime and every depth-4 step was 10-16 ms slower than v3d.
+    """
+    from vllm.model_executor.warmup.b12x_prepare import _planned_decode_counts
+
+    monkeypatch.delenv("VLLM_MTP_CONFIDENCE_THRESHOLD", raising=False)
+    capture = (1, 2, 4, 8, 16, 24, 32, 40, 48, 56, 64, 72, 80)
+
+    def counts(schedule):
+        spec = _spec(num_speculative_tokens_per_batch_size=schedule)
+        spec.enable_adaptive_verification = False
+        worker = SimpleNamespace(
+            model_runner=SimpleNamespace(decode_query_len=7),
+            scheduler_config=SimpleNamespace(max_num_seqs=8),
+            vllm_config=SimpleNamespace(
+                compilation_config=SimpleNamespace(max_cudagraph_capture_size=80),
+                speculative_config=spec,
+            ),
+        )
+        return set(
+            _planned_decode_counts(worker, capture_sizes=capture, speculative_tokens=6)
+        )
+
+    with_schedule = counts([(1, 2, 6), (3, 8, 4)])
+    assert {5, 10, 20, 25, 40} <= with_schedule  # depth 4 at c1, c2, c4, c5, c8
+    assert {7, 14, 28, 35, 56} <= with_schedule  # depth 6
+    without = counts(None)
+    assert {5, 10, 20, 25} & without == set()

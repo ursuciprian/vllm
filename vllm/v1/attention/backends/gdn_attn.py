@@ -41,24 +41,27 @@ def _fill_uniform_spec_metadata(
     source_stride,
     accepted_stride,
     WINDOW: tl.constexpr,
+    QUERY_LEN: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
-    token = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
-    row = token // WINDOW
-    column = token % WINDOW
+    # WINDOW = state-index columns per request (num_spec + 1); QUERY_LEN =
+    # tokens per request this step (<= WINDOW under a batch-size depth schedule).
+    slot = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    row = slot // WINDOW
+    column = slot % WINDOW
     live = row < num_reqs
     state = tl.load(source + row.to(tl.int64) * source_stride + column, live, other=0)
-    tl.store(state_indices + token, state, live)
-    tl.store(token_indices + token, token, live)
+    tl.store(state_indices + slot, state, live)
+    tl.store(token_indices + slot, slot, slot < num_reqs * QUERY_LEN)
     first = live & (column == 0)
     count = tl.load(
         accepted_source + row.to(tl.int64) * accepted_stride, first, other=0
     )
     tl.store(accepted + row, count, first)
     tl.store(sequence_masks + row, True, first)
-    tl.store(query_start_loc + row, token, first)
+    tl.store(query_start_loc + row, row * QUERY_LEN, first)
     if tl.program_id(0) == 0:
-        tl.store(query_start_loc + num_reqs, num_reqs * WINDOW)
+        tl.store(query_start_loc + num_reqs, num_reqs * QUERY_LEN)
 
 
 class GDNAttentionBackend(AttentionBackend):
@@ -288,6 +291,9 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
         num_accepted_tokens: torch.Tensor | None,
         num_decode_draft_tokens_cpu: torch.Tensor | None,
     ) -> bool:
+        # Uniform at any depth up to num_spec: a batch-size depth schedule runs
+        # steps with fewer drafts than num_speculative_tokens.
+        query_len = m.num_actual_tokens // max(m.num_reqs, 1)
         return (
             self._reuse_spec_decode_inputs
             and self.use_spec_decode
@@ -297,9 +303,10 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
             and num_accepted_tokens is not None
             and num_decode_draft_tokens_cpu is not None
             and 0 < m.num_actual_tokens <= self.decode_cudagraph_max_bs
-            and m.num_actual_tokens == m.num_reqs * (self.num_spec + 1)
-            and bool(torch.all(num_decode_draft_tokens_cpu == self.num_spec))
-            and bool(torch.all(torch.diff(m.query_start_loc_cpu) == self.num_spec + 1))
+            and 2 <= query_len <= self.num_spec + 1
+            and m.num_actual_tokens == m.num_reqs * query_len
+            and bool(torch.all(num_decode_draft_tokens_cpu == query_len - 1))
+            and bool(torch.all(torch.diff(m.query_start_loc_cpu) == query_len))
             and (m.is_prefilling is None or not bool(torch.any(m.is_prefilling)))
         )
 
@@ -316,6 +323,8 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
         """
         num_reqs = m.num_reqs
         num_tokens = m.num_actual_tokens
+        query_len = num_tokens // num_reqs
+        assert num_tokens == num_reqs * query_len <= num_reqs * (self.num_spec + 1)
         source = self.mamba_aligned_state_indices
         assert source is not None
         spec_state_indices = self.spec_state_indices_tensor[:num_reqs]
@@ -324,7 +333,9 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
         spec_query_start_loc = self.spec_query_start_loc[: num_reqs + 1]
         accepted = self.num_accepted_tokens[:num_reqs]
         if source.is_cuda:
-            _fill_uniform_spec_metadata[(triton.cdiv(num_tokens, 128),)](
+            _fill_uniform_spec_metadata[
+                (triton.cdiv(num_reqs * (self.num_spec + 1), 128),)
+            ](
                 source,
                 num_accepted_tokens,
                 spec_state_indices,
@@ -336,13 +347,18 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
                 source.stride(0),
                 num_accepted_tokens.stride(0),
                 WINDOW=self.num_spec + 1,
+                QUERY_LEN=query_len,
                 BLOCK=128,
             )
         else:
             spec_state_indices.copy_(source[:num_reqs, : self.num_spec + 1])
             spec_sequence_masks.fill_(True)
             spec_token_indx.copy_(self._uniform_spec_tokens[:num_tokens])
-            spec_query_start_loc.copy_(self._uniform_spec_query_start[: num_reqs + 1])
+            spec_query_start_loc.copy_(
+                self._uniform_spec_query_start[: num_reqs + 1]
+                // (self.num_spec + 1)
+                * query_len
+            )
             accepted.copy_(num_accepted_tokens[:num_reqs])
         return GDNAttentionMetadata(
             num_prefills=0,
@@ -925,7 +941,10 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
         prefill_live_counts = getattr(self, "_b12x_prefill_live_counts", None)
         if prefill_live_counts is not None:
             live = (metadata.num_prefills, metadata.num_prefill_tokens)
-            if not envs.VLLM_GDN_UNIFORM_DECODE_META_SKIP or getattr(self, "_live_counts", None) != live:
+            if (
+                not envs.VLLM_GDN_UNIFORM_DECODE_META_SKIP
+                or getattr(self, "_live_counts", None) != live
+            ):
                 prefill_live_counts[0].fill_(live[0])
                 prefill_live_counts[1].fill_(live[1])
                 self._live_counts = live
@@ -1127,4 +1146,3 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
         num_decode_draft_tokens_cpu = (num_accepted_tokens - 1).cpu()
 
         return self.build(0, m, num_accepted_tokens, num_decode_draft_tokens_cpu)
-

@@ -114,11 +114,21 @@ def _planned_decode_counts(
                 }
             )
         )
+    # A batch-size schedule (and the MTP confidence gate's base depth) runs
+    # uniform decode at several query lengths; the graph manager captures each,
+    # so each needs its exact-M regimes here too.
+    query_lens = {query_len}
+    if spec is not None and spec.num_speculative_tokens_per_batch_size:
+        from vllm.v1.spec_decode.dynamic.utils import batch_size_schedule_depths
+
+        extra = query_len - int(speculative_tokens)
+        query_lens.update(d + extra for d in batch_size_schedule_depths(spec))
     counts = set()
-    for size in capture_sizes:
-        rounded = -(-int(size) // query_len) * query_len
-        if rounded // query_len <= max_reqs and rounded <= limit:
-            counts.add(rounded)
+    for qlen in sorted(q for q in query_lens if q > 1):
+        for size in capture_sizes:
+            rounded = -(-int(size) // qlen) * qlen
+            if rounded // qlen <= max_reqs and rounded <= limit:
+                counts.add(rounded)
     return tuple(sorted(counts))
 
 

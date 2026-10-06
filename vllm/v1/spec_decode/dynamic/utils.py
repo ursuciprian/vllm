@@ -212,3 +212,20 @@ def gated_num_spec_tokens(depth: int, base_depth: int, confident) -> int:
     if depth <= base_depth:
         return depth
     return depth if all(confident) else base_depth
+
+
+def batch_size_schedule_depths(speculative_config) -> list[int]:
+    """Draft depths a batch-size schedule can run, plus the gate's base depth.
+
+    Graph capture and the b12x weights-stage plan both enumerate these, so a
+    step at any reachable depth hits a captured graph and an exact-M plan.
+    """
+    num_spec = int(speculative_config.num_speculative_tokens)
+    depths = {
+        min(int(entry[2]), num_spec)
+        for entry in speculative_config.num_speculative_tokens_per_batch_size
+    }
+    gate = mtp_confidence_gate(speculative_config)
+    if gate is not None:
+        depths.add(gate[1])
+    return sorted(depths)
