@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import math
 from abc import ABC, abstractmethod
 from collections.abc import Sequence
 from typing import NamedTuple
@@ -687,7 +688,25 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
             and manager.supports_fine_grained_hash_lookup
             for manager in self.single_type_managers
         )
-        self.enable_partial_hash_hits = (
+        # A hash unit finer than every target group only because an EAGLE
+        # drafter group has smaller blocks (a BF16 drafter page held to the
+        # fp8 target page) is not a request for fine-grained hits: those make
+        # the scheduler stop each prefill at the prompt's last hash boundary,
+        # an extra prefill step per prompt (k62: pp2048 c1 -11%). Keep hits
+        # aligned to the scheduler block, as with equal block sizes.
+        target_block_sizes = [
+            manager.block_size
+            for manager, group in zip(
+                self.single_type_managers, kv_cache_config.kv_cache_groups
+            )
+            if group.kv_cache_spec.prefix_cacheable and not group.is_eagle_group
+        ]
+        finer_only_for_drafter = (
+            bool(target_block_sizes)
+            and math.gcd(*target_block_sizes) > hash_block_size
+            and math.gcd(*group_block_sizes) == hash_block_size
+        )
+        self.enable_partial_hash_hits = not finer_only_for_drafter and (
             has_partial_mamba_group or has_partial_attention_group
         )
         if self.enable_partial_hash_hits:

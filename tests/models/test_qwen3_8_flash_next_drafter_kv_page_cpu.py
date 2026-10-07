@@ -151,11 +151,12 @@ def test_pool_blocks_match_k57_boot_logs():
     assert sizes == (BLOCK, 1512)  # scheduler block unchanged, hash block halves
 
 
-def test_prefix_hit_with_half_block_drafter_group():
+def test_prefix_hit_with_half_block_drafter_group(monkeypatch):
     from vllm.v1.core.kv_cache_manager import KVCacheManager
 
     from ..v1.core.test_prefix_caching import make_request
 
+    monkeypatch.setenv("VLLM_PREFIX_DROP_EXACT", "1")
     init_none_hash(sha256)
     drafter = _spec("auto")
     groups = [
@@ -180,6 +181,10 @@ def test_prefix_hit_with_half_block_drafter_group():
         use_eagle=True,
         num_prefill_lookahead=1,
     )
+    # The finer hash exists only for the drafter: hits stay 3024-aligned and the
+    # exact EAGLE drop stays on, as on the shipped equal-block layout (k62).
+    assert not manager.coordinator.enable_partial_hash_hits
+    assert manager.coordinator.prefix_drop_exact
     prompt = list(range(5 * BLOCK + 100))
     request = make_request("a", prompt, 1512, sha256)
     _, hit, _ = manager.get_computed_blocks(request)
@@ -196,6 +201,31 @@ def test_prefix_hit_with_half_block_drafter_group():
     again = make_request("b", prompt, 1512, sha256)
     _, hit, _ = manager.get_computed_blocks(again)
     assert hit > 0 and hit % BLOCK == 0 and hit < len(prompt)
+
+
+@pytest.mark.parametrize("partial, first_chunk", [(True, 1512), (False, 2060)])
+def test_short_prompt_prefill_is_one_step(partial, first_chunk):
+    """k62 lost 11% on pp2048 c1: fine-grained hits stop a 2060-token prefill at
+    the 1512 hash boundary, so it takes two steps instead of one."""
+    from vllm.v1.core.sched.scheduler import Scheduler
+
+    from ..v1.core.test_prefix_caching import make_request
+
+    init_none_hash(sha256)
+    stub = SimpleNamespace(
+        cache_config=SimpleNamespace(
+            block_size=BLOCK, prefix_cache_retention_interval=None
+        ),
+        drop_last_prefix_cache_block=False,
+        use_eagle=True,
+        max_num_scheduled_tokens=8192,
+        scheduler_config=SimpleNamespace(long_prefill_token_threshold=0),
+        mamba_partial_cache_hit=partial,
+        hash_block_size=1512,
+        mamba_has_prefill_checkpoint_blocks=False,
+    )
+    request = make_request("p", list(range(2060)), 1512, sha256)
+    assert Scheduler._mamba_block_aligned_split(stub, request, 2060) == first_chunk
 
 
 def test_drafter_k_scale_env_keeps_compile_key(monkeypatch):
