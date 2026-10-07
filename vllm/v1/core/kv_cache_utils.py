@@ -2007,6 +2007,19 @@ def _get_kv_cache_groups_uniform_groups(
     return [full_mla_group, *swa_mla_groups]
 
 
+def target_block_size(kv_cache_groups: list[KVCacheGroupSpec]) -> int:
+    """Smallest block size among the target model's groups.
+
+    A draft group with smaller blocks (a BF16 MTP drafter on half-size blocks
+    next to an fp8 target) must not set ``cache_config.block_size``: the
+    scheduler aligns Mamba prefill chunks to it, so every prefill would stop
+    at the draft block boundary (k65/k68: a 2550-token prompt ran as 1512 +
+    1038, +210-250 ms TTFT for prompts with ``len % 3024 > 1512``).
+    """
+    groups = [g for g in kv_cache_groups if not g.is_draft_group] or kv_cache_groups
+    return min(g.kv_cache_spec.block_size for g in groups)
+
+
 def annotate_draft_groups(
     vllm_config: VllmConfig, kv_cache_groups: list[KVCacheGroupSpec]
 ) -> None:

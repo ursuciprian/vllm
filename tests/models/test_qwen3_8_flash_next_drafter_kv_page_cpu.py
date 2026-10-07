@@ -279,6 +279,39 @@ def test_short_prompt_prefill_is_one_step(partial, first_chunk):
     assert Scheduler._mamba_block_aligned_split(stub, request, 2060) == first_chunk
 
 
+@pytest.mark.parametrize("annotate", [False, True])
+def test_engine_block_size_ignores_the_draft_group(annotate):
+    """EngineCore sets cache_config.block_size from the groups, and the
+    scheduler aligns Mamba prefill chunks to it. With the draft group's 1512
+    it stopped a 2550-token prefill at 1512 (k68 trace: 1512 + 1038)."""
+    from vllm.v1.core.sched.scheduler import Scheduler
+
+    from ..v1.core.test_prefix_caching import make_request
+
+    init_none_hash(sha256)
+    config = _config()
+    groups = kvu.get_kv_cache_groups(config, _model_specs(_spec("auto")))
+    if annotate:
+        kvu.annotate_draft_groups(config, groups)
+    block = kvu.target_block_size(groups)
+    assert block == (BLOCK if annotate else 1512)
+    stub = SimpleNamespace(
+        cache_config=SimpleNamespace(
+            block_size=block, prefix_cache_retention_interval=None
+        ),
+        drop_last_prefix_cache_block=False,
+        use_eagle=True,
+        max_num_scheduled_tokens=8192,
+        scheduler_config=SimpleNamespace(long_prefill_token_threshold=0),
+        mamba_partial_cache_hit=False,
+        hash_block_size=1512,
+        mamba_has_prefill_checkpoint_blocks=False,
+    )
+    request = make_request("q", list(range(2550)), 1512, sha256)
+    first = Scheduler._mamba_block_aligned_split(stub, request, 2550)
+    assert first == (2550 if annotate else 1512)
+
+
 def test_drafter_k_scale_env_keeps_compile_key(monkeypatch):
     from vllm import envs
 
