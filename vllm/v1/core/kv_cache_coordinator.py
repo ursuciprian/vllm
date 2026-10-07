@@ -688,8 +688,8 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
             and manager.supports_fine_grained_hash_lookup
             for manager in self.single_type_managers
         )
-        # A hash unit finer than every target group only because an EAGLE
-        # drafter group has smaller blocks (a BF16 drafter page held to the
+        # A hash unit finer than every target group only because a draft
+        # (EAGLE/MTP) group has smaller blocks (a BF16 drafter page held to the
         # fp8 target page) is not a request for fine-grained hits: those make
         # the scheduler stop each prefill at the prompt's last hash boundary,
         # an extra prefill step per prompt (k62: pp2048 c1 -11%). Keep hits
@@ -699,7 +699,8 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
             for manager, group in zip(
                 self.single_type_managers, kv_cache_config.kv_cache_groups
             )
-            if group.kv_cache_spec.prefix_cacheable and not group.is_eagle_group
+            if group.kv_cache_spec.prefix_cacheable
+            and not (group.is_eagle_group or group.is_draft_group)
         ]
         finer_only_for_drafter = (
             bool(target_block_sizes)

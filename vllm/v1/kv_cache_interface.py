@@ -1297,6 +1297,10 @@ class KVCacheGroupSpec:
     kv_cache_spec: KVCacheSpec
     # Whether this group contains EAGLE/MTP draft attention layers.
     is_eagle_group: bool = False
+    # Whether every layer of this group belongs to the speculative draft model
+    # (layer index >= the target's layer count). Unlike ``is_eagle_group``
+    # this does not change the EAGLE drop policy.
+    is_draft_group: bool = False
 
 
 @dataclass

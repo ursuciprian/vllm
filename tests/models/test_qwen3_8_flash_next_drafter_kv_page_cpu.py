@@ -110,8 +110,23 @@ def _model_specs(drafter):
     specs["model.layers.3.ple"] = mamba(
         shapes=((7, 10240),), dtypes=(torch.bfloat16,), mamba_type="short_conv"
     )
-    specs["model.layers.48.self_attn.attn"] = drafter
+    specs["mtp.layers.48.self_attn.attn"] = drafter
     return specs
+
+
+def _config():
+    return SimpleNamespace(
+        scheduler_config=SimpleNamespace(disable_hybrid_kv_cache_manager=False),
+        speculative_config=SimpleNamespace(method="mtp"),
+        parallel_config=SimpleNamespace(
+            pipeline_parallel_size=1, decode_context_parallel_size=1
+        ),
+        model_config=SimpleNamespace(get_num_layers=lambda parallel_config: 48),
+        cache_config=SimpleNamespace(
+            enable_prefix_caching=True, prefix_match_unit=None
+        ),
+        kv_transfer_config=None,
+    )
 
 
 def _pool(drafter):
@@ -170,7 +185,7 @@ def test_prefix_hit_with_half_block_drafter_group(monkeypatch):
                 mamba_cache_mode="align",
             ),
         ),
-        KVCacheGroupSpec(["mtp"], drafter, is_eagle_group=True),
+        KVCacheGroupSpec(["mtp"], drafter, is_draft_group=True),
     ]
     manager = KVCacheManager(
         KVCacheConfig(num_blocks=400, kv_cache_tensors=[], kv_cache_groups=groups),
@@ -201,6 +216,42 @@ def test_prefix_hit_with_half_block_drafter_group(monkeypatch):
     again = make_request("b", prompt, 1512, sha256)
     _, hit, _ = manager.get_computed_blocks(again)
     assert hit > 0 and hit % BLOCK == 0 and hit < len(prompt)
+
+
+@pytest.mark.parametrize("annotate", [False, True])
+def test_model_layout_keeps_hits_scheduler_aligned(monkeypatch, annotate):
+    """The real layout as get_kv_cache_configs builds it: nothing sets
+    is_eagle_group for this model (only DeepSeek-V4 does), so the draft group
+    must be found by layer index. k65 booted with fine-grained hits on because
+    01e0702d keyed on is_eagle_group."""
+    from vllm.v1.core.kv_cache_manager import KVCacheManager
+
+    monkeypatch.setenv("VLLM_PREFIX_DROP_EXACT", "1")
+    init_none_hash(sha256)
+    config = _config()
+    groups = kvu.get_kv_cache_groups(config, _model_specs(_spec("auto")))
+    assert not any(g.is_eagle_group for g in groups)
+    if annotate:
+        kvu.annotate_draft_groups(config, groups)
+        assert [g.layer_names for g in groups if g.is_draft_group] == [
+            ["mtp.layers.48.self_attn.attn"]
+        ]
+    kv_config = KVCacheConfig(
+        num_blocks=4568, kv_cache_tensors=[], kv_cache_groups=groups
+    )
+    scheduler_block, hash_block = kvu.resolve_kv_cache_block_sizes(kv_config, config)
+    assert (scheduler_block, hash_block) == (BLOCK, 1512)
+    manager = KVCacheManager(
+        kv_config,
+        max_model_len=262144,
+        enable_caching=True,
+        hash_block_size=hash_block,
+        scheduler_block_size=scheduler_block,
+        use_eagle=True,
+        num_prefill_lookahead=1,
+    )
+    assert manager.coordinator.enable_partial_hash_hits is not annotate
+    assert manager.coordinator.prefix_drop_exact is annotate
 
 
 @pytest.mark.parametrize("partial, first_chunk", [(True, 1512), (False, 2060)])

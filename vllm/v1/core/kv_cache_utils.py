@@ -2007,6 +2007,24 @@ def _get_kv_cache_groups_uniform_groups(
     return [full_mla_group, *swa_mla_groups]
 
 
+def annotate_draft_groups(
+    vllm_config: VllmConfig, kv_cache_groups: list[KVCacheGroupSpec]
+) -> None:
+    """Flag groups whose layers all belong to the speculative draft model."""
+    if vllm_config.speculative_config is None:
+        return
+    num_target_layers = vllm_config.model_config.get_num_layers(
+        vllm_config.parallel_config
+    )
+    for group in kv_cache_groups:
+        try:
+            indices = [extract_layer_index(name) for name in group.layer_names]
+        except (AssertionError, IndexError, ValueError):
+            continue
+        if indices and min(indices) >= num_target_layers:
+            group.is_draft_group = True
+
+
 def _annotate_eagle_groups_deepseek_v4(
     vllm_config: VllmConfig,
     kv_cache_spec: dict[str, KVCacheSpec],
@@ -2432,6 +2450,7 @@ def _project_kv_cache_groups_to_worker(
                 worker_layer_names,
                 group_spec,
                 is_eagle_group=group.is_eagle_group and bool(worker_layer_names),
+                is_draft_group=group.is_draft_group and bool(worker_layer_names),
             )
         )
     return projected_groups
@@ -2513,6 +2532,7 @@ def get_kv_cache_configs(
     # hybrid models when disable_hybrid_kv_cache_manager is enabled.
     # After this call, merged_kv_cache_specs may be modified in-place.
     global_kv_cache_groups = get_kv_cache_groups(vllm_config, merged_kv_cache_specs)
+    annotate_draft_groups(vllm_config, global_kv_cache_groups)
 
     # If original_max_model_len was -1, automatically
     # determine the maximum model length that fits in available GPU memory.
