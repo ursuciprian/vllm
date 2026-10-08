@@ -69,6 +69,44 @@ def _relative_difference(layer, weight, scale, rows: int = 64) -> float:
     return float((nvfp4[:, :k] - mxfp8).norm() / mxfp8.norm())
 
 
+def _tp_shard(
+    layer: torch.nn.Module, weight: torch.Tensor, scale: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """This TP rank's slice of a whole (TP=1) MXFP8 copy, cut the way vLLM's
+    loader cuts the layer's NVFP4 weights.
+
+    Column-parallel: the rank's share of every logical output in order
+    (MergedColumnParallelLinear.output_sizes, e.g. q, k, v, z of in_proj_qkvz),
+    concatenated. Row-parallel: the rank's share of the input columns, and of
+    the E8M0 scales in 32-column blocks. TP=1 and replicated layers: unchanged.
+    """
+    from vllm.model_executor.layers.linear import (
+        ColumnParallelLinear,
+        RowParallelLinear,
+    )
+
+    tp, rank = int(getattr(layer, "tp_size", 1)), int(getattr(layer, "tp_rank", 0))
+    if tp == 1:
+        return weight, scale
+    if isinstance(layer, RowParallelLinear):
+        k = weight.shape[1] // tp
+        if weight.shape[1] % tp or k % 32:
+            raise ValueError(f"MXFP8 copy: {weight.shape[1]} input columns do not split "
+                             f"into {tp} ranks of whole 32-column scale blocks")
+        return (weight.narrow(1, rank * k, k).contiguous(),
+                scale.narrow(1, rank * k // 32, k // 32).contiguous())
+    if isinstance(layer, ColumnParallelLinear):
+        sizes = list(getattr(layer, "output_sizes", None) or [weight.shape[0]])
+        if sum(sizes) != weight.shape[0] or any(n % tp for n in sizes):
+            raise ValueError(f"MXFP8 copy: {weight.shape[0]} rows do not split into "
+                             f"outputs {sizes} over {tp} ranks")
+        starts = [sum(sizes[:i]) for i in range(len(sizes))]
+        cut = [(s + rank * n // tp, n // tp) for s, n in zip(starts, sizes)]
+        return (torch.cat([weight.narrow(0, s, n) for s, n in cut]),
+                torch.cat([scale.narrow(0, s, n) for s, n in cut]))
+    raise ValueError(f"MXFP8 copy: no TP={tp} slicing for {type(layer).__name__}")
+
+
 def load_mxfp8_large_m_copy(
     layer: torch.nn.Module, prefixes: Sequence[tuple[str, ...]],
 ) -> tuple[torch.Tensor, torch.Tensor] | None:
@@ -100,12 +138,13 @@ def load_mxfp8_large_m_copy(
     scale = torch.cat([read(f"{x}.weight_scale") for x in names])
     if weight.dtype != torch.float8_e4m3fn or scale.dtype != torch.uint8:
         raise ValueError(f"{names}: {weight.dtype}/{scale.dtype} in {path} is not MXFP8")
+    full = tuple(weight.shape)
+    weight, scale = _tp_shard(layer, weight, scale)
     expected = (int(layer.output_size_per_partition), int(layer.input_size_per_partition))
-    if tuple(weight.shape) != expected:
-        # ponytail: whole-tensor reads only; TP>1 would need per-rank slicing.
+    if tuple(weight.shape) != expected or tuple(scale.shape) != (expected[0], expected[1] // 32):
         raise ValueError(
-            f"{names}: MXFP8 copy {tuple(weight.shape)} does not match the layer "
-            f"partition {expected}; the large-M copy supports TP=1 only")
+            f"{names}: MXFP8 copy {full} (rank slice {tuple(weight.shape)}, scales "
+            f"{tuple(scale.shape)}) does not match the layer partition {expected}")
     difference = _relative_difference(layer, weight, scale)
     if not difference < 0.3:
         raise ValueError(f"{names}: MXFP8 copy differs from the NVFP4 weights "
