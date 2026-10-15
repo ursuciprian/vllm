@@ -1,10 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Mamba-aligned prefill splits as the 1x Qwen3.8 Flash Next serving recipe
-schedules them (align mode, 3024-token state blocks, MTP drops the last cached
-block, sparse retention), with VLLM_DEBUG_PREFILL_SPLITS naming each stop.
+schedules them (align mode, 3024-token state blocks, MTP reuse positions one
+block below the prompt's last boundary, sparse retention), with
+VLLM_DEBUG_PREFILL_SPLITS naming each stop.
 
-The 8192 and 9072 schedules are the ones the k81 and k88 profiles recorded.
+The 8192 and 9072 schedules are the ones the k81 and k88 profiles recorded; the
+16K/64K schedules at all three budgets match the k97 split log.
 """
 
 import logging
@@ -38,7 +40,7 @@ def _scheduler(budget, retention=0):
         cache_config=SimpleNamespace(
             block_size=BLOCK, prefix_cache_retention_interval=retention
         ),
-        drop_last_prefix_cache_block=True,
+        drop_last_prefix_cache_block=False,
         mamba_has_prefill_checkpoint_blocks=False,
         use_eagle=True,
         max_num_scheduled_tokens=budget,
@@ -102,7 +104,8 @@ def test_debug_log_names_each_stop(monkeypatch, caplog):
         for line in caplog.messages
         if line.startswith("prefill split")
     ]
-    assert reasons == ["budget", "last-cache-position", "reachable", "prompt-end"]
+    # k97 labels: budget, reuse @12096, last_cache @15120, prompt end
+    assert reasons == ["budget", "reachable", "last-cache-position", "prompt-end"]
 
 
 def test_debug_log_is_off_by_default(monkeypatch, caplog):
