@@ -552,13 +552,14 @@ class Scheduler(SchedulerInterface):
                     "instruction-boundary" if clipped < num_new_tokens else "budget",
                 )
                 return clipped
-            _log_prefill_split(
-                request,
-                start,
-                num_new_tokens,
-                start + num_new_tokens,
-                "boundary-checkpoints",
-            )
+            if start < max(request.num_prompt_tokens, request.num_tokens - 1):
+                _log_prefill_split(
+                    request,
+                    start,
+                    num_new_tokens,
+                    start + num_new_tokens,
+                    "boundary-checkpoints",
+                )
             return num_new_tokens
         # Split only during prefill: `request.num_tokens - 1` extends this to
         # resumed requests replaying their output tokens.

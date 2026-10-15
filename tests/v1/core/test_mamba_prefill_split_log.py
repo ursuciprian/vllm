@@ -95,10 +95,17 @@ def test_predicted_schedules(prompt, budget, steps):
     assert chunks(prompt, budget) == steps
 
 
+@pytest.fixture
+def caplog(caplog, monkeypatch):
+    # vLLM's root logger does not propagate; older pytest would see nothing.
+    monkeypatch.setattr(logging.getLogger("vllm"), "propagate", True)
+    return caplog
+
+
 def test_debug_log_names_each_stop(monkeypatch, caplog):
     monkeypatch.setattr(envs, "VLLM_DEBUG_PREFILL_SPLITS", True, raising=False)
     with caplog.at_level(logging.INFO, logger="vllm.v1.core.sched.scheduler"):
-        chunks(16384, 9072)
+        assert chunks(16384, 9072) == [9072, 3024, 3024, 1264]
     reasons = [
         line.split("reason=")[1].split()[0]
         for line in caplog.messages
@@ -110,7 +117,7 @@ def test_debug_log_names_each_stop(monkeypatch, caplog):
 
 def test_debug_log_is_off_by_default(monkeypatch, caplog):
     monkeypatch.setattr(envs, "VLLM_DEBUG_PREFILL_SPLITS", False, raising=False)
-    with caplog.at_level(logging.INFO):
+    with caplog.at_level(logging.INFO, logger="vllm.v1.core.sched.scheduler"):
         chunks(16384, 9072)
     assert not [
         m for m in caplog.messages if m.startswith(("prefill split", "reachable"))
