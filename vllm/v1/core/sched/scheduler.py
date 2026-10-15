@@ -8,6 +8,7 @@ from collections.abc import Iterable
 from dataclasses import replace
 from typing import Any
 
+import vllm.envs as envs
 from vllm.compilation.cuda_graph import CUDAGraphStat
 from vllm.config import KVEventsConfig, VllmConfig
 from vllm.distributed.ec_transfer.ec_connector.base import (
@@ -82,6 +83,31 @@ from vllm.v1.structured_output import StructuredOutputGrammar, StructuredOutputM
 from vllm.v1.utils import record_function_or_nullcontext
 
 logger = init_logger(__name__)
+
+
+def _log_prefill_split(
+    request: Request,
+    start: int,
+    requested: int,
+    end: int,
+    reason: str,
+    detail: dict | None = None,
+) -> None:
+    """VLLM_DEBUG_PREFILL_SPLITS: one line per Mamba-aligned prefill split."""
+    if not envs.VLLM_DEBUG_PREFILL_SPLITS:
+        return
+    logger.info(
+        "prefill split req=%s prompt=%d start=%d requested=%d scheduled=%d "
+        "end=%d reason=%s %s",
+        request.request_id,
+        request.num_prompt_tokens,
+        start,
+        requested,
+        max(end - start, 0),
+        end,
+        reason,
+        detail or {},
+    )
 
 
 def _build_kv_connector_block_state(
@@ -517,7 +543,22 @@ class Scheduler(SchedulerInterface):
             # recurrent state associated with that token prefix.
             instruction_boundary = request.recurrent_instruction_boundary
             if instruction_boundary is not None and start < instruction_boundary:
-                return min(num_new_tokens, instruction_boundary - start)
+                clipped = min(num_new_tokens, instruction_boundary - start)
+                _log_prefill_split(
+                    request,
+                    start,
+                    num_new_tokens,
+                    start + clipped,
+                    "instruction-boundary" if clipped < num_new_tokens else "budget",
+                )
+                return clipped
+            _log_prefill_split(
+                request,
+                start,
+                num_new_tokens,
+                start + num_new_tokens,
+                "boundary-checkpoints",
+            )
             return num_new_tokens
         # Split only during prefill: `request.num_tokens - 1` extends this to
         # resumed requests replaying their output tokens.
@@ -567,6 +608,7 @@ class Scheduler(SchedulerInterface):
             aligned_end = end // block_size * block_size
             if aligned_end > start or block_size <= max_prefill_tokens:
                 end = aligned_end
+        aligned = end
 
         next_block_boundary = (start // block_size + 1) * block_size
         retention_interval = getattr(
@@ -581,6 +623,13 @@ class Scheduler(SchedulerInterface):
             request.num_prompt_tokens // self.hash_block_size * self.hash_block_size
             if self.mamba_partial_cache_hit
             else 0
+        )
+        stop_names = (
+            "mid-block",
+            "retention",
+            "last-cache-position",
+            "partial-tail",
+            "shared-prefix",
         )
         stops: tuple[int, ...] = (
             # Same invariant: a chunk starting mid-block stops at the boundary
@@ -634,8 +683,34 @@ class Scheduler(SchedulerInterface):
                     if internal is not None and internal > start:
                         reuse_stops.discard(internal)
             stops = (*stops, *reuse_stops)
+            stop_names = (*stop_names, *["reachable"] * len(reuse_stops))
         # Stop at the earliest mandatory position strictly inside the chunk.
         end = min((s for s in stops if start < s < end), default=end)
+        if envs.VLLM_DEBUG_PREFILL_SPLITS:
+            reason = next(
+                (n for s, n in zip(stops, stop_names) if s == end and s < aligned),
+                "block-align"
+                if aligned < start + num_new_tokens
+                else "prompt-end"
+                if end >= prefill_end
+                else "budget",
+            )
+            _log_prefill_split(
+                request,
+                start,
+                num_new_tokens,
+                end,
+                reason,
+                dict(zip(stop_names, stops))
+                | {
+                    "reachable": sorted(
+                        s for s, n in zip(stops, stop_names) if n == "reachable"
+                    ),
+                    "block": block_size,
+                    "use_internal_checkpoint": use_internal_checkpoint,
+                    "drop_last_block": self.drop_last_prefix_cache_block,
+                },
+            )
         return max(end - start, 0)
 
     def _get_local_prefix_cache_hit(

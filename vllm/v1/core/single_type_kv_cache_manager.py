@@ -6,6 +6,8 @@ from collections import defaultdict
 from collections.abc import Sequence
 from typing import ClassVar
 
+import vllm.envs as envs
+from vllm.logger import init_logger
 from vllm.utils.math_utils import cdiv
 from vllm.v1.core.block_pool import BlockPool
 from vllm.v1.core.kv_cache_utils import (
@@ -33,6 +35,8 @@ from vllm.v1.kv_cache_interface import (
 )
 from vllm.v1.kv_cache_spec_registry import KVCacheSpecRegistry
 from vllm.v1.request import Request
+
+logger = init_logger(__name__)
 
 
 def reachable_hit_positions(
@@ -702,6 +706,17 @@ class SingleTypeKVCacheManager(ABC):
             lookup_alignment_tokens=self.hit_alignment_tokens,
             state_materialization_alignment_tokens=self.scheduler_block_size,
         )
+        if envs.VLLM_DEBUG_PREFILL_SPLITS:
+            logger.info(
+                "reachable boundaries %s -> %s (lookup alignment %d, state "
+                "alignment %d, eagle %s, lookup drops eagle block %s)",
+                list(boundaries),
+                list(positions),
+                self.hit_alignment_tokens,
+                self.scheduler_block_size,
+                self.use_eagle,
+                self.lookup_drops_eagle_block,
+            )
         return list(positions)
 
     @classmethod
