@@ -509,6 +509,7 @@ def causal_conv1d_fn(
     block_size_to_align=0,
     metadata=None,
     validate_data=False,
+    out: torch.Tensor | None = None,
 ):
     """support varlen + continuous batching when x is 2D tensor
 
@@ -559,7 +560,8 @@ def causal_conv1d_fn(
         The number of tokens already completed for each sequence
     block_size_to_align: int
         The block size to align the cached states to
-    out: same shape as `x`
+    out: same shape as `x`; optional caller buffer with the dtype of
+        `conv_states`, written in place and returned (any strides)
     """
     if isinstance(activation, bool) and activation:
         activation = "silu"
@@ -568,7 +570,10 @@ def causal_conv1d_fn(
     # Store original dtype to cast back at the end
     original_x_dtype = x.dtype
     x = x.to(conv_states.dtype)
-    out = torch.empty_like(x)
+    if out is None:
+        out = torch.empty_like(x)
+    elif out.shape != x.shape or out.dtype != x.dtype:
+        raise ValueError("causal_conv1d_fn: out must match x in shape and dtype")
     if metadata is not None:
         nums_dict = metadata.nums_dict
         args = nums_dict

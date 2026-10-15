@@ -237,6 +237,14 @@ class B12xGdnPrefill:
         self.checkpoint_offsets = staging.checkpoint_offsets
         self.num_seqs = staging.num_seqs
         self.num_tokens = staging.num_tokens
+
+    def holds(self, mixed_qkv: torch.Tensor) -> bool:
+        """``mixed_qkv`` is already the leading rows of this staging buffer."""
+        return (
+            mixed_qkv.data_ptr() == self.mixed_qkv.data_ptr()
+            and mixed_qkv.stride() == self.mixed_qkv.stride()
+        )
+
     def run(
         self,
         *,
@@ -267,7 +275,8 @@ class B12xGdnPrefill:
         capacity = next(capacity for capacity in self.capacities if rows <= capacity)
         plan = self.plans[capacity]
         (scratch,) = get_b12x_scratch_buffers(plan)
-        self.mixed_qkv[:rows].copy_(mixed_qkv)
+        if not self.holds(mixed_qkv):  # the views path convolves into the staging
+            self.mixed_qkv[:rows].copy_(mixed_qkv)
         self.a[:rows].copy_(a)
         self.b[:rows].copy_(b)
         _stage_metadata[(1,)](

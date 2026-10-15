@@ -186,7 +186,10 @@ def layer_norm_fwd(
     norm_before_gate: bool = True,
     is_rms_norm: bool = False,
     activation: str = "swish",
+    rows_per_block: int | None = None,
 ):
+    """``rows_per_block`` pins the kernel's row tile (default: from M), so a
+    caller can reproduce another call's compiled kernel bit for bit."""
     M, N = x.shape
     if group_size is None:
         group_size = N
@@ -221,7 +224,8 @@ def layer_norm_fwd(
     # heuristics for number of warps
     num_warps = min(max(BLOCK_N // 256, 1), 8)
     # Calculate rows per block based on SM count
-    rows_per_block = calc_rows_per_block(M, x.device)
+    if rows_per_block is None:
+        rows_per_block = calc_rows_per_block(M, x.device)
     # Update grid to use rows_per_block
     grid = (cdiv(M, rows_per_block), ngroups)
     layer_norm_fwd_kernel[grid](

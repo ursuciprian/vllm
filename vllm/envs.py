@@ -227,6 +227,7 @@ if TYPE_CHECKING:
     VLLM_PLE_MMAP_KEEPALIVE_MS: int = 0
     VLLM_PLE_MMAP_PREFILL_WILLNEED: bool = False
     VLLM_GDN_SHARED_PREFILL_STAGING: bool = False
+    VLLM_GDN_PREFILL_VIEWS: bool = False
     VLLM_DEEPEPLL_NVFP4_DISPATCH: bool = False
     VLLM_V1_USE_OUTLINES_CACHE: bool = False
     VLLM_TPU_USING_PATHWAYS: bool = False
@@ -1863,6 +1864,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_GDN_SHARED_PREFILL_STAGING": lambda: bool(
         int(os.getenv("VLLM_GDN_SHARED_PREFILL_STAGING", "0"))
     ),
+    # b12x mixed GDN: when a step has no speculative rows, its tokens are in batch
+    # order, so pass views instead of gathering q/k/v, a, b and the gate by token
+    # index, convolve straight into the prefill staging and write the normed output
+    # in place instead of clearing and scattering it. Same kernels and numerics,
+    # decided on the host per step. Read by qwen_gdn_linear_attn.py.
+    "VLLM_GDN_PREFILL_VIEWS": lambda: bool(
+        int(os.getenv("VLLM_GDN_PREFILL_VIEWS", "0"))
+    ),
     # Allow use of FlashInfer MxInt4 MoE kernels for fused moe ops.
     "VLLM_USE_FLASHINFER_MOE_INT4": lambda: bool(
         int(os.getenv("VLLM_USE_FLASHINFER_MOE_INT4", "0"))
@@ -2543,6 +2552,8 @@ def compile_factors() -> dict[str, object]:
         "VLLM_PLE_MMAP_PREFILL_WILLNEED",
         # Shared GDN prefill staging: buffer ownership inside a custom op, no graph change.
         "VLLM_GDN_SHARED_PREFILL_STAGING",
+        # GDN prefill views: inside a custom op, same plans, no graph change.
+        "VLLM_GDN_PREFILL_VIEWS",
         # Location-only derived paths: where a cache/config directory lives
         # cannot affect compiled artifacts, and hashing them means relocating
         # HOME or the XDG roots silently invalidates every compile cache

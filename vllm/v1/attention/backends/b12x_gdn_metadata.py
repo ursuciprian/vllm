@@ -70,6 +70,7 @@ class B12xGdnMixedMetadata:
         )
         self._num_non_spec = 0
         self._num_spec = 0
+        self._num_non_spec_tokens = 0
 
     @staticmethod
     def _copy_list(target: torch.Tensor, values: list[int], *, padding: int = 0):
@@ -132,6 +133,8 @@ class B12xGdnMixedMetadata:
             self._copy_list(indices, tokens)
             self._copy_list(row_indices, rows)
             self._copy_list(counts, [len(rows), len(tokens)])
+            if cu is self.query_start_loc:
+                self._num_non_spec_tokens = len(tokens)
 
         self.has_initial_state.zero_()
         if non_spec_rows:
@@ -191,6 +194,7 @@ class B12xGdnMixedMetadata:
             raise ValueError("GDN metadata reuse requires matching planned capacities")
         self._num_non_spec = source._num_non_spec
         self._num_spec = source._num_spec
+        self._num_non_spec_tokens = source._num_non_spec_tokens
         for destination, inputs in zip(
             self._worklists_by_dtype, source._worklists_by_dtype
         ):
@@ -216,6 +220,15 @@ class B12xGdnMixedMetadata:
             self.spec_state_indices[: self._num_spec].copy_(
                 state_indices[rows, : self.state_columns]
             )
+
+    @property
+    def identity_tokens(self) -> int | None:
+        """Host-side live token count when ``token_indices`` is the identity.
+
+        With no speculative rows every non-empty request is a non-spec row, so
+        the packed order is ``range(starts[-1])``: the batch order itself.
+        """
+        return None if self._num_spec else self._num_non_spec_tokens
 
     def convolution_metadata(self, token_capacity: int):
         programs = (token_capacity + 7) // 8 + self.max_seqs

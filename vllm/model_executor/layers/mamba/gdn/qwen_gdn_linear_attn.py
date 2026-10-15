@@ -3050,6 +3050,22 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             else self.kv_cache[0].transpose(-1, -2)
         )
         weights = self.conv1d.weight.view(self.conv1d.weight.size(0), -1)
+        live = self._b12x_prefill_views_rows(
+            attn_metadata, mixed_qkv, core_attn_out, conv_state
+        )
+        if live is not None:
+            self._forward_core_b12x_prefill_views(
+                mixed_qkv=mixed_qkv,
+                b=b,
+                a=a,
+                output_gate=output_gate,
+                core_attn_out=core_attn_out,
+                metadata=metadata,
+                conv_state=conv_state,
+                weights=weights,
+                live=live,
+            )
+            return
         non_spec_indices = metadata.token_indices[:rows]
         packed = mixed_qkv.index_select(0, non_spec_indices)
         convolved = causal_conv1d_fn(
@@ -3135,6 +3151,108 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                 WIDTH=width,
                 BLOCK=256,
             )
+
+
+    @staticmethod
+    def _b12x_prefill_views_rows(
+        attn_metadata: GDNAttentionMetadata,
+        mixed_qkv: torch.Tensor,
+        core_attn_out: torch.Tensor,
+        conv_state: torch.Tensor,
+    ) -> int | None:
+        """Live rows when this step can skip the token gathers, else None.
+
+        Host-side facts only, no device read: the staged worklist has no
+        speculative rows, so its token order is the batch order. Not while a
+        CUDA graph is captured: a captured graph replays for any batch of its
+        size, so it keeps the general gathers.
+        """
+        if not envs.VLLM_GDN_PREFILL_VIEWS or attn_metadata.num_spec_decodes:
+            return None
+        live = attn_metadata.b12x_mixed.identity_tokens
+        if (
+            not live
+            or live > mixed_qkv.shape[0]
+            or conv_state.dtype != mixed_qkv.dtype
+            or not core_attn_out.is_contiguous()
+            or torch.cuda.is_current_stream_capturing()
+        ):
+            return None
+        return live
+
+    def _forward_core_b12x_prefill_views(
+        self,
+        *,
+        mixed_qkv: torch.Tensor,
+        b: torch.Tensor,
+        a: torch.Tensor,
+        output_gate: torch.Tensor,
+        core_attn_out: torch.Tensor,
+        metadata,
+        conv_state: torch.Tensor,
+        weights: torch.Tensor,
+        live: int,
+    ) -> None:
+        """The general b12x path for a batch in token order, without the
+        gathers, the staging copy, the clear and the scatter.
+
+        The convolution reads the projection view and writes straight into the
+        prefill staging; a and b go to the staging in the runner's one copy;
+        the gated norm reads the gate view and writes the output rows in place.
+        Same kernels, same compiled norm (row tile pinned to the general call),
+        so the result is bit-identical to the general path.
+        """
+        from vllm.third_party.flash_linear_attention.ops.layernorm_guard import (
+            calc_rows_per_block,
+            layer_norm_fwd,
+        )
+
+        logger.info_once("GDN prefill views: in-order b12x step without gathers")
+        runner = self._b12x_prefill
+        rows = mixed_qkv.shape[0]
+        staged = runner.mixed_qkv[:rows]
+        causal_conv1d_fn(
+            mixed_qkv.transpose(0, 1),
+            weights,
+            self.conv1d.bias,
+            activation=self.activation,
+            conv_states=conv_state,
+            has_initial_state=metadata.has_initial_state,
+            cache_indices=metadata.state_indices,
+            query_start_loc=metadata.query_start_loc,
+            metadata=metadata.convolution_metadata(rows),
+            out=staged.transpose(0, 1),
+        )
+        runner.run(
+            mixed_qkv=staged,
+            a=a,
+            b=b,
+            query_start_loc=metadata.query_start_loc,
+            state_indices=metadata.state_indices,
+            has_initial_state=metadata.has_initial_state,
+            live_counts=metadata.live_counts,
+            checkpoint=metadata.checkpoint,
+            output=runner.output,
+            eps=self.layer_norm_epsilon,
+        )
+        heads, dim = core_attn_out.shape[-2:]
+        norm = self.norm
+        layer_norm_fwd(
+            runner.output[:live].flatten(1),
+            norm.weight.repeat(heads),
+            None if norm.bias is None else norm.bias.repeat(heads),
+            norm.eps,
+            z=output_gate[:live].flatten(1),
+            out=core_attn_out[:live].flatten(1),
+            group_size=dim if norm.group_size is None else norm.group_size,
+            norm_before_gate=norm.norm_before_gate,
+            is_rms_norm=True,
+            activation=norm.activation,
+            # the general call normalizes rows * heads rows of `dim`
+            rows_per_block=calc_rows_per_block(rows * heads, core_attn_out.device),
+        )
+        if live < rows:
+            core_attn_out[live:].zero_()
 
 
 def qwen_gdn_input_projections(
