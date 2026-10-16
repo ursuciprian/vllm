@@ -198,6 +198,7 @@ if TYPE_CHECKING:
     B12X_MOE_WM_MAX_TOKENS: int = 32
     B12X_MOE_WM_MIN_TOKENS: int = 1
     B12X_MOE_WM_SCHEDULE: Literal["item", "flint"] = "item"
+    B12X_MHC_PDL: Literal["0", "1"] = "0"
     VLLM_B12X_A16_MAX_TOKENS: int = 0
     VLLM_B12X_NVFP4_MXFP8_MIN_TOKENS: int = 0
     VLLM_B12X_NVFP4_MXFP8_CHECKPOINT: str | None = None
@@ -1719,6 +1720,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "B12X_MOE_WM_SCHEDULE": env_with_choices(
         "B12X_MOE_WM_SCHEDULE", "item", ["item", "flint"]
     ),
+    # b12x MHC (hyper-connection) kernels launched with programmatic dependent
+    # launch (b12x reads it with os.getenv at import). MUST live here: the MHC
+    # plan key and selection records include it, and torch AOT graphs hold b12x
+    # plan handles, so a warm compile cache must not be shared across values.
+    "B12X_MHC_PDL": env_with_choices("B12X_MHC_PDL", "0", ["0", "1"]),
     # b12x A16 token cutoff (b12x b4b12bcf): NVFP4 dense linears and NVFP4 MoE
     # run with BF16 activations for calls of at most this many tokens; larger
     # calls keep their configured activation precision. 0 = off. MUST live
