@@ -48,6 +48,7 @@ class NvFp4MoeBackend(Enum):
     FLASHINFER_CUTEDSL = "FLASHINFER_CUTEDSL"
     FLASHINFER_CUTEDSL_BATCHED = "FLASHINFER_CUTEDSL_BATCHED"
     FLASHINFER_B12X = "FLASHINFER_B12X"
+    FLASHINFER_SM12X_W4A4 = "FLASHINFER_SM12X_W4A4"
     VLLM_CUTLASS = "VLLM_CUTLASS"
     MARLIN = "MARLIN"
     HUMMING = "HUMMING"
@@ -178,6 +179,19 @@ def map_nvfp4_backend(runner_backend: MoEBackend) -> NvFp4MoeBackend:
 def _use_a16(backend: NvFp4MoeBackend, checkpoint_uses_a16: bool) -> bool:
     return checkpoint_uses_a16 or (
         backend == NvFp4MoeBackend.B12X and envs.VLLM_B12X_MOE_FP4_FORCE_A16
+    )
+
+
+def use_flashinfer_sm12x_w4a4(
+    config: FusedMoEConfig, prefix: str, checkpoint_uses_a16: bool
+) -> bool:
+    """k114: trunk routed experts on FlashInfer SM12x W4A4 (VLLM_FI_SM12X_W4A4_MOE=1
+    with --moe-backend b12x); MTP drafter layers keep b12x."""
+    return (
+        envs.VLLM_FI_SM12X_W4A4_MOE == "1"
+        and config.moe_backend == "b12x"
+        and not checkpoint_uses_a16
+        and "mtp" not in prefix.split(".")
     )
 
 
@@ -345,7 +359,13 @@ def convert_to_nvfp4_moe_kernel_format(
     torch.Tensor,
 ]:
     use_a16 = _use_a16(nvfp4_backend, use_a16)
-    if nvfp4_backend == NvFp4MoeBackend.B12X:
+    if nvfp4_backend == NvFp4MoeBackend.FLASHINFER_SM12X_W4A4:
+        # Logical weights stay; FlashInferSm12xW4A4Experts prepares them in place.
+        if a13_scale is None or a2_scale is None:
+            raise ValueError("FlashInfer SM12x W4A4 MoE requires activation scales")
+        if a13_scale.dim() == 2:
+            a13_scale = a13_scale.amax(dim=1)
+    elif nvfp4_backend == NvFp4MoeBackend.B12X:
         if a13_scale is None or a2_scale is None:
             if not use_a16:
                 raise ValueError("b12x NVFP4 MoE requires activation scales")

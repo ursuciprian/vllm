@@ -198,6 +198,7 @@ if TYPE_CHECKING:
     B12X_MOE_WM_MAX_TOKENS: int = 32
     B12X_MOE_WM_MIN_TOKENS: int = 1
     B12X_MOE_WM_SCHEDULE: Literal["item", "flint"] = "item"
+    VLLM_FI_SM12X_W4A4_MOE: Literal["0", "1"] = "0"
     VLLM_B12X_A16_MAX_TOKENS: int = 0
     VLLM_B12X_NVFP4_MXFP8_MIN_TOKENS: int = 0
     VLLM_B12X_NVFP4_MXFP8_CHECKPOINT: str | None = None
@@ -1726,6 +1727,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # at the cutoff, w13 kernel order), and only environment_variables entries
     # reach envs.compile_factors(). Needs a b12x with a16_max_tokens support.
     "VLLM_B12X_A16_MAX_TOKENS": lambda: int(os.getenv("VLLM_B12X_A16_MAX_TOKENS", "0")),
+    # k114: with --moe-backend b12x, the NVFP4 routed experts of the trunk run
+    # FlashInfer's SM12x CuTe DSL W4A4 MoE (flashinfer-ai/flashinfer#5863, from
+    # the side-by-side package flashinfer_k114) instead of b12x; MTP drafter
+    # layers stay on b12x. MUST live here: the trunk then declares no b12x MoE
+    # plans, and torch AOT graphs hold b12x plan handles as constants.
+    "VLLM_FI_SM12X_W4A4_MOE": env_with_choices(
+        "VLLM_FI_SM12X_W4A4_MOE", "0", ["0", "1"]
+    ),
     # W4A16 NVFP4 dense layers also hold the MXFP8 weights of the checkpoint at
     # VLLM_B12X_NVFP4_MXFP8_CHECKPOINT (a local snapshot dir) and serve calls of
     # at least this many rows with them: the W4A16 GEMM wins at decode sizes,

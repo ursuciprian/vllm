@@ -36,11 +36,13 @@ from vllm.model_executor.layers.fused_moe.oracle.mxfp8 import (
     select_mxfp8_moe_backend,
 )
 from vllm.model_executor.layers.fused_moe.oracle.nvfp4 import (
+    NvFp4MoeBackend,
     convert_to_nvfp4_moe_kernel_format,
     is_global_sf_supported_for_nvfp4_backend,
     make_nvfp4_moe_kernel,
     make_nvfp4_moe_quant_config,
     select_nvfp4_moe_backend,
+    use_flashinfer_sm12x_w4a4,
 )
 from vllm.model_executor.layers.fusion.quant_activation import (
     expose_input_quant_key,
@@ -1423,6 +1425,7 @@ class ModelOptNvFp4FusedMoE(FusedMoEMethodBase):
         self,
         quant_config: ModelOptNvFp4Config,
         moe_config: FusedMoEConfig,
+        prefix: str = "",
     ) -> None:
         super().__init__(moe_config)
         self.quant_config = quant_config
@@ -1433,11 +1436,19 @@ class ModelOptNvFp4FusedMoE(FusedMoEMethodBase):
         # activation scales in convert_to_nvfp4_moe_kernel_format, so no
         # other change is needed.
         self.use_a16 = quant_config.quant_method == "W4A16_NVFP4"
-        self.nvfp4_backend, self.experts_cls = select_nvfp4_moe_backend(
-            config=self.moe,
-            weight_key=kNvfp4Static,
-            activation_key=None if self.use_a16 else kNvfp4Dynamic,
-        )
+        if use_flashinfer_sm12x_w4a4(self.moe, prefix, self.use_a16):
+            from vllm.model_executor.layers.fused_moe.experts.flashinfer_sm12x_w4a4_moe import (  # noqa: E501
+                FlashInferSm12xW4A4Experts,
+            )
+
+            self.nvfp4_backend = NvFp4MoeBackend.FLASHINFER_SM12X_W4A4
+            self.experts_cls = FlashInferSm12xW4A4Experts
+        else:
+            self.nvfp4_backend, self.experts_cls = select_nvfp4_moe_backend(
+                config=self.moe,
+                weight_key=kNvfp4Static,
+                activation_key=None if self.use_a16 else kNvfp4Dynamic,
+            )
 
         self.use_global_sf = is_global_sf_supported_for_nvfp4_backend(
             self.nvfp4_backend
@@ -2477,6 +2488,7 @@ class ModelOptMixedPrecisionConfig(ModelOptQuantConfigBase):
                 return ModelOptNvFp4FusedMoE(
                     quant_config=self.nvfp4_config,
                     moe_config=layer.moe_config,
+                    prefix=prefix,
                 )
             if quant_algo == "W4A16_NVFP4":
                 return ModelOptNvFp4FusedMoE(
