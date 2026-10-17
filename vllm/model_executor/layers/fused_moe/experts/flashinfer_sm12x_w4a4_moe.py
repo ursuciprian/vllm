@@ -72,6 +72,7 @@ def _dequant(packed: torch.Tensor, block: torch.Tensor, gs: torch.Tensor):
     lut = torch.tensor(
         [0, .5, 1, 1.5, 2, 3, 4, 6, -0., -.5, -1, -1.5, -2, -3, -4, -6],
         device=packed.device,
+        dtype=torch.float32,
     )
     b = packed.view(torch.uint8)
     v = lut[torch.stack(((b & 0xF).long(), (b >> 4).long()), -1).reshape(b.shape[0], -1)]
@@ -151,11 +152,12 @@ class FlashInferSm12xW4A4Experts(mk.FusedMoEExpertsModular):
         gen = torch.Generator(device=w13.device).manual_seed(114)
         rows, inter = 16, w13.shape[1] // 2
         sigma = float(a1_scale.median()) * 6 * 448 / 5
-        x = (torch.randn(rows, hidden, device=w13.device, generator=gen) * sigma).to(torch.bfloat16)
+        x = (torch.randn(rows, hidden, device=w13.device, generator=gen, dtype=torch.float32) * sigma).to(torch.bfloat16)
         ids = torch.stack([torch.randperm(num_experts, device=w13.device, generator=gen)[: self.topk]
                            for _ in range(rows)]).to(torch.int32)
-        wts = torch.softmax(torch.randn(rows, self.topk, device=w13.device, generator=gen), -1)
-        ref = torch.zeros(rows, hidden, device=w13.device)
+        wts = torch.softmax(torch.randn(rows, self.topk, device=w13.device, generator=gen, dtype=torch.float32), -1)
+        # explicit fp32: vLLM sets the default dtype to the model dtype (bf16) during load
+        ref = torch.zeros(rows, hidden, device=w13.device, dtype=torch.float32)
         xf = x.float()
         for e in torch.unique(ids).tolist():
             r, k = (ids == e).nonzero(as_tuple=True)
@@ -179,7 +181,7 @@ class FlashInferSm12xW4A4Experts(mk.FusedMoEExpertsModular):
         for t in buckets:  # compile + workspace for every bucket, before KV sizing and capture
             x = torch.zeros(t, hidden, dtype=torch.bfloat16, device=dev)
             ids = (torch.arange(t * self.topk, device=dev) % num_experts).to(torch.int32).view(t, self.topk)
-            self._run(fm, x, ids, torch.full((t, self.topk), 1.0 / self.topk, device=dev))
+            self._run(fm, x, ids, torch.full((t, self.topk), 1.0 / self.topk, device=dev, dtype=torch.float32))
         x, ids, wts, ref = check
         err = float((self._run(fm, x, ids, wts).float() - ref).norm() / ref.norm().clamp_min(1e-30))
         torch.cuda.synchronize(dev)
